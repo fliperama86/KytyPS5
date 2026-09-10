@@ -5,6 +5,21 @@ This branch starts at TarkusR/KytyPS5 commit
 compatibility changes, GPU fault diagnostics, and collision tracing used during
 the Demon's Souls investigation.
 
+On September 10, 2026, the branch was merged with TarkusR's
+`demons-souls-shaders` at `f69e86d66f4bb244ae4246a73ffcd34f23bfbe94`, which
+includes official KytyPS5 `main` at
+`2e315a3c62bf036c8225d5057ada1d70cd8063f1`. This includes upstream shader,
+depth-rendering, filesystem, audio, and library updates. Upstream now carries
+the indirect-image tracking changes described below. Local collision probes,
+LDS wait handling, storage-image bounds checks, and fault diagnostics are
+retained; GPU allocation tracing uses upstream's revised image allocation data.
+The uniform-fill detector accepts retained waits only when the shader has no LDS,
+preserving image-clear recognition and LDS ordering. The filesystem test supplies
+its own SDL entry point so it can link on Windows.
+
+The Nexus observations below describe the earlier local build. The merged
+source has not yet been validated in a new game session.
+
 The collision serialization experiment reached the Nexus on Windows with
 **PPSA01342, version 01.005.000**, using a character save exported from the owner's
 PS5. The owner confirmed gameplay. Saving through the game's menu, closing the
@@ -116,8 +131,27 @@ The analyzer writes `touch-trace-analysis.json` alongside that log.
 
 ## Validation
 
+The test executables are excluded from the default build. Build them explicitly
+before running the suite so CTest uses binaries from the current source:
+
+```text
+cmake --build _Build/windows --target launcher kyty_tests --parallel
+ctest --test-dir _Build/windows --output-on-failure --timeout 60
+```
+
 The local Release build uses clang-cl, LTO, and Qt 6.10.3 on Windows. Validation
 covers the launcher build, resource-tracking tests, shader cases (including LDS
 exchange and out-of-bounds storage writes), and scheduler/stream-buffer tests.
 The runtime evidence is limited to the full-capture Nexus load and save/reload
 described above; it is not a claim of broad game compatibility.
+
+After the upstream merge, the Windows Release build and all test targets built.
+**36 of 37 CTest cases passed**, including `shader_cfg`,
+`shader_recompiler_compute`, and the image-clear/rendering cases.
+`kernel_file_system` still fails at its socket assertion
+`guest PEEK and WAITALL preserve the wake bytes`.
+The networking implementation is unchanged from the earlier fork commit and the
+imported upstream source. It forwards both flags to Winsock; Windows rejects that
+combination, as documented in
+[Microsoft's recv reference](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-recv).
+That networking limitation remains unresolved, and the test is still enabled.

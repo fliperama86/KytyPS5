@@ -1,7 +1,8 @@
 # KytyPS5
 
 This fork's `demons-souls-workaround` branch preserves the Demon's Souls
-investigation based on TarkusR's `1d6e23a`. An experimental Windows workaround
+investigation, now updated through TarkusR's `f69e86d` and official KytyPS5
+`2e315a3`. An experimental Windows workaround
 has loaded a PPSA01342 / 01.005.000 save into the Nexus, including save and reload.
 See [the setup, evidence, and limitations](docs/demons-souls-workaround.md).
 

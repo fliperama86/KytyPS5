@@ -27,7 +27,6 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -171,7 +170,12 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
 	if (Config::GetGpuIndex() >= 0) {
-		devices = {devices[Config::GetGpuIndex()]};
+		if (static_cast<size_t>(Config::GetGpuIndex()) < devices.size()) {
+			devices = {devices[Config::GetGpuIndex()]};
+		} else {
+			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
+			     Config::GetGpuIndex());
+		}
 	}
 
 	vk::PhysicalDevice  best_device       = nullptr;
@@ -647,7 +651,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		fault_features.pNext = supported_features2.pNext;
 		supported_features2.pNext = &fault_features;
 	}
+	const bool provoking_extension =
+	    HasExtension(device_extensions, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+	vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex {};
+	if (provoking_extension) {
+		provoking_vertex.pNext = supported_features2.pNext;
+		supported_features2.pNext = &provoking_vertex;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.device_fault_enabled = fault_extension && fault_features.deviceFault;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
@@ -764,6 +776,11 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	create_info.pNext = graphics.attachment_feedback_loop_enabled
 	                        ? static_cast<void*>(&feedback_layout)
 	                        : feedback_dynamic.pNext;
+	if (graphics.provoking_vertex_last_enabled) {
+		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
+		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
+		create_info.pNext = &provoking_vertex;
+	}
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1150,6 +1167,18 @@ void WindowContext::CreateVulkan() {
 
 	LOGF("Select device: %s\n", device_properties.deviceName.data());
 
+	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
+	    .format = vk::Format::eBc1RgbaUnormBlock,
+	    .type = vk::ImageType::e2D,
+	    .tiling = vk::ImageTiling::eOptimal,
+	    .usage = vk::ImageUsageFlagBits::eSampled,
+	    .flags = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+	};
+	const auto block_texel_view_props =
+	    graphic_ctx.physical_device.getImageFormatProperties2(block_texel_view_info);
+	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
+	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
+
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",
@@ -1177,6 +1206,7 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {

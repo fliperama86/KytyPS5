@@ -568,6 +568,8 @@ if(BUILD_TESTING)
 
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
+	add_test(NAME host_image_allocation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --host-image-allocation-only)
 	add_test(NAME texture_cache_image_views
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
@@ -608,6 +610,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 	)
 endif()
+
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)

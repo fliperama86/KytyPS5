@@ -532,7 +532,7 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::InstPrefetch: return true;
 		case IR::ValueOpcode::Waitcnt: {
 			if (ctx.half != 0 || ShaderWorkgroupInput(state.stage, state.input_info) == nullptr ||
-			    !std::ranges::any_of(ctx.program.memory_info, [](const auto& memory) {
+			    !std::ranges::any_of(state.program.memory_info, [](const auto& memory) {
 				    return memory.kind == IR::ResourceKind::Lds;
 			    })) {
 				return true;

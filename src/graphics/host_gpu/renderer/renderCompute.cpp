@@ -521,21 +521,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			}
 			const auto& backing = image->backing;
 			VmaAllocationInfo allocation {};
-			if (backing.memory.allocation != nullptr) {
-				vmaGetAllocationInfo(m_context.GetGraphics().allocator, backing.memory.allocation,
+			if (backing.allocation != nullptr) {
+				vmaGetAllocationInfo(m_context.GetGraphics().allocator, backing.allocation,
 				                     &allocation);
 			}
 			trace += fmt::format(
 			    "  backing={} format={} extent={}x{}x{} layers={} mips={} samples={} "
 			    "usage={} flags={} layout={} registered={} guest_range={:x}+{:x} "
-			    "memory={} offset={:x} size={:x} requirement={:x} type={}\n",
+			    "memory={} offset={:x} size={:x} type={}\n",
 			    fmt::ptr(static_cast<VkImage>(backing.image)), vk::to_string(backing.format),
 			    backing.extent.width, backing.extent.height, backing.extent.depth, backing.layers,
 			    backing.mip_levels, backing.samples, vk::to_string(backing.usage),
 			    vk::to_string(backing.flags), vk::to_string(binding.layout), image->registered,
 			    image->info.data.address, image->info.data.size, fmt::ptr(allocation.deviceMemory),
-			    allocation.offset, allocation.size, backing.memory.requirements.size,
-			    allocation.memoryType);
+			    allocation.offset, allocation.size, allocation.memoryType);
 			for (const auto& view : image->views) {
 				if (view.view != binding.image_view &&
 				    std::ranges::find(binding.mip_views, view.view) == binding.mip_views.end()) {

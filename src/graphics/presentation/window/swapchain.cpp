@@ -7,7 +7,6 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -192,24 +191,15 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 	if (dst.image != nullptr) {
 		graphics.DeleteImage(dst);
-		dst.memory = {};
 	}
-
-	dst.extent     = {extent.width, extent.height, 1};
-	dst.format     = format;
-	dst.layers     = 1;
-	dst.mip_levels = 1;
-	dst.state      = {};
-	dst.subresource_states.clear();
-	dst.memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
 
 	vk::ImageCreateInfo create {};
 	create.sType         = vk::StructureType::eImageCreateInfo;
 	create.imageType     = vk::ImageType::e2D;
-	create.extent        = {dst.extent.width, dst.extent.height, 1};
+	create.extent        = {extent.width, extent.height, 1};
 	create.mipLevels     = 1;
 	create.arrayLayers   = 1;
-	create.format        = dst.format;
+	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
@@ -217,7 +207,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	create.samples     = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, dst)) {
 		EXIT("failed to allocate prepared presentation image, extent=%ux%u format=%d\n",
-		     dst.extent.width, dst.extent.height, static_cast<int>(dst.format));
+		     extent.width, extent.height, static_cast<int>(format));
 	}
 }
 

@@ -680,8 +680,11 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
-	PipelineStaticParameters static_params {};
-	PipelineRenderingState   rendering {};
+	GraphicsPipelineKey key {};
+	key.vs_shader_id            = vs_id;
+	key.ps_shader_id            = ps_id;
+	auto& static_params         = key.static_params;
+	auto& rendering             = key.rendering;
 	rendering.color_count       = color_count;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
@@ -750,6 +753,7 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
 	static_params.face       = mc.face;
+	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
 
@@ -766,11 +770,6 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		static_params.blend_enable[i]         = bc.enable;
 		static_params.blend_bypass[i]         = rt.info.blend_bypass;
 	}
-	GraphicsPipelineKey key {};
-	key.rendering     = rendering;
-	key.vs_shader_id  = vs_id;
-	key.ps_shader_id  = ps_id;
-	key.static_params = static_params;
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
 		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||

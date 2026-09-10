@@ -26,12 +26,13 @@ namespace {
 	}
 }
 
-[[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const ImageInfo& info) {
+[[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
+                                                   const ImageInfo& info) {
 	vk::ImageCreateFlags flags {};
 	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
 		flags |= vk::ImageCreateFlagBits::eExtendedUsage;
-		if (Prospero::BlockCompressedBytesPerBlock(info.guest_format) != 0) {
+		if (info.IsBlock() && graphics.supports_block_texel_view) {
 			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
 		}
 	}
@@ -47,6 +48,10 @@ namespace {
 }
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
+	if (info.IsBlock()) {
+		return vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+		       vk::ImageUsageFlagBits::eSampled;
+	}
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
 	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
@@ -656,27 +661,17 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		return;
 	}
 
-	backing.format      = info.pixel_format;
-	backing.image_type  = HostImageType(info.type);
-	backing.extent      = info.extent;
-	backing.guest_pitch = info.pitch;
-	backing.layers      = info.IsVolume() ? 1u : info.resources.layers;
-	backing.mip_levels  = info.resources.levels;
-	backing.samples     = info.samples;
-	backing.flags       = ImageCreateFlags(info);
-	backing.usage       = ImageUsageFlags(graphics, info);
-
 	vk::ImageCreateInfo create {};
-	create.flags         = backing.flags;
-	create.imageType     = backing.image_type;
-	create.extent        = backing.extent;
-	create.mipLevels     = backing.mip_levels;
-	create.arrayLayers   = backing.layers;
-	create.format        = backing.format;
+	create.flags         = ImageCreateFlags(graphics, info);
+	create.imageType     = HostImageType(info.type);
+	create.extent        = info.extent;
+	create.mipLevels     = info.resources.levels;
+	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
+	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;
-	create.initialLayout = backing.state.layout;
-	create.usage         = backing.usage;
-	create.samples       = vulkan_sample_count(backing.samples);
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = ImageUsageFlags(graphics, info);
+	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
 	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
@@ -687,10 +682,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),
 		     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
-		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), backing.samples);
+		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	backing.memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
 	if (!graphics.CreateImage(create, backing)) {
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,

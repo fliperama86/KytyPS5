@@ -550,12 +550,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer,
 		                        &htile_fill, &htile_fill_known);
-		depth.depth_meta_clear_enable =
-		    meta_cleared && (!htile_fill_known || htile_fill_clears_depth(htile_fill));
-		depth.stencil_meta_clear_enable = meta_cleared && htile_fill_known &&
-		                                  depth.desc.info.metadata.stencil_compressed &&
+		const bool stencil_compressed = depth.desc.info.metadata.stencil_compressed;
+		const bool depth_uniform =
+		    meta_cleared && htile_fill_known && !htile_fill_clears_depth(htile_fill) &&
+		    htile_fill_depth_uniform(htile_fill, stencil_compressed);
+		const bool depth_meta_clear =
+		    meta_cleared &&
+		    (!htile_fill_known || htile_fill_clears_depth(htile_fill) || depth_uniform);
+		depth.stencil_meta_clear_enable = meta_cleared && htile_fill_known && stencil_compressed &&
 		                                  htile_fill_clears_stencil(htile_fill);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || depth.depth_meta_clear_enable;
+		if (depth_uniform) {
+			depth.depth_clear_value = htile_fill_depth_value(htile_fill, stencil_compressed);
+		}
+		depth.depth_load_clear_enable = depth.depth_clear_enable || depth_meta_clear;
 		if (meta_cleared &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
@@ -598,10 +605,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 		                       : depth_attachment_layout(depth);
-		const bool written =
-		    depth.depth_write_enable ||
-		    static_cast<bool>(depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil);
-		if (!feedback && written && image.binding.is_bound) {
+		auto writable = depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil;
+		if (depth.depth_write_enable) {
+			writable |= vk::ImageAspectFlagBits::eDepth;
+		}
+		const auto pixel_writable = feedback ? writable & ~vk::ImageAspectFlagBits::eDepth : writable;
+		if (static_cast<bool>(image.binding.pixel_sampled_aspects & pixel_writable) ||
+		    static_cast<bool>(image.binding.other_sampled_aspects & writable)) {
 			layout = vk::ImageLayout::eGeneral;
 		}
 		// The attachment store writes even when guest depth/stencil tests do not.
@@ -864,14 +874,21 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			topology = vk::PrimitiveTopology::eTriangleFan;
 			break;
-		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
+		default: {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				std::printf("Skipping draw with unknown primitive type: %u\n",
+				            static_cast<uint32_t>(ucfg.GetPrimType()));
+			}
+			return false;
+		}
 	}
 
 	return true;
 }
 
-static bool ResolvePrimitiveRestart(const CommandBuffer& buffer, vk::PrimitiveTopology topology,
-                                    uint32_t index_type_and_size) {
+static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
+                                    const DrawIndexBufferSource& source) {
 	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
 	EXIT_NOT_IMPLEMENTED((control & ~0x3u) != 0);
 	if ((control & 0x1u) == 0) {
@@ -883,35 +900,38 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer, vk::PrimitiveTo
 		case Prospero::PrimitiveType::kTriStrip: break;
 		default: return false;
 	}
-	if (topology != vk::PrimitiveTopology::eLineStrip &&
-	    topology != vk::PrimitiveTopology::eTriangleStrip &&
-	    topology != vk::PrimitiveTopology::eTriangleFan) {
-		return false;
-	}
 
-	uint32_t index_mask = 0;
-	switch (static_cast<Prospero::IndexType>(index_type_and_size)) {
-		case Prospero::IndexType::kIndex8: index_mask = 0xffu; break;
-		case Prospero::IndexType::kIndex16: index_mask = 0xffffu; break;
-		case Prospero::IndexType::kIndex32: index_mask = 0xffffffffu; break;
-		default: EXIT("unknown index_type_and_size: %u\n", index_type_and_size);
-	}
-
-	const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
+	const auto element_size = source.guest_element_size;
+	const auto index_mask   = UINT32_MAX >> ((4 - element_size) * 8);
+	const auto reset_index  = buffer.GetRegisters().GetPrimitiveResetIndex();
 	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
 		return false;
 	}
-	EXIT_NOT_IMPLEMENTED((reset_index & index_mask) != index_mask);
-	return true;
+	const auto restart_index = reset_index & index_mask;
+	if (restart_index == index_mask) {
+		// Use native restart; the 8-bit path widens its marker to 0xffff.
+		return true;
+	}
+
+	// A game can set a custom reset value without using it in the index buffer.
+	// Keep restart off in that case; fail if we actually find the value.
+	// Scan before preparing draw resources: readback can restart the command buffer.
+	EXIT_NOT_IMPLEMENTED(source.address == 0);
+	const auto* indices = reinterpret_cast<const uint8_t*>(source.address);
+	for (uint64_t offset = 0; offset < source.size; offset += element_size) {
+		uint32_t index = 0;
+		std::memcpy(&index, indices + offset, element_size);
+		EXIT_NOT_IMPLEMENTED(index == restart_index);
+	}
+	return false;
 }
 
-bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& buffer,
-                                            const DrawCallInfo& draw,
+bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
                                             bool log_setup_phases, DrawRenderState& state) {
 	auto& ctx = buffer.GetRegisters();
 
-	if (ResolveColorTargets(submit_id, buffer, render_target_slice_offset)) {
+	if (ResolveColorTargets(buffer, render_target_slice_offset)) {
 		return false;
 	}
 	if (log_setup_phases) {
@@ -920,7 +940,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
 		                  ctx.GetRenderTarget(slot).base.addr != 0)) {
-			ResolveRenderColorTarget(submit_id, buffer, state.color_info[state.color_count],
+			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
 				state.color_count++;
@@ -930,7 +950,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	if (log_setup_phases) {
 		LogDrawPhase(draw.name, "ResolveRenderDepthTarget");
 	}
-	ResolveRenderDepthTarget(submit_id, buffer, state.depth_info);
+	ResolveRenderDepthTarget(buffer, state.depth_info);
 
 	state.ps_active       = DrawHasActivePixelShader(buffer);
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
@@ -1245,7 +1265,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer)) {
+	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
 		ResetBindings();
 		return;
 	}
@@ -1280,53 +1300,41 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	vk::IndexType index_type           = vk::IndexType::eUint16;
-	uint64_t      index_size           = 0;
-	bool          expand_index8_to_u16 = false;
-	const bool    primitive_restart =
-	    ResolvePrimitiveRestart(buffer, topology, args.index_type_and_size);
-
+	DrawIndexBufferSource index_source {};
+	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
 	switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
 		case Prospero::IndexType::kIndex16:
-			index_type = vk::IndexType::eUint16;
-			index_size = 2 * static_cast<uint64_t>(args.index_count);
+			index_source.type               = vk::IndexType::eUint16;
+			index_source.guest_element_size = 2;
 			break;
 		case Prospero::IndexType::kIndex32:
-			index_type = vk::IndexType::eUint32;
-			index_size = 4 * static_cast<uint64_t>(args.index_count);
+			index_source.type               = vk::IndexType::eUint32;
+			index_source.guest_element_size = 4;
 			break;
-		// Some games use it - need vulkan extension
 		case Prospero::IndexType::kIndex8:
-			index_type           = vk::IndexType::eUint16;
-			index_size           = static_cast<uint64_t>(args.index_count);
-			expand_index8_to_u16 = true;
+			index_source.guest_element_size = 1;
 			break;
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
+	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
 
-	const DrawCallInfo    draw {"DrawIndex", CommandBufferDebugOp::DrawIndex, args.index_count,
-	                            args.instance_count, args.first_instance};
 	std::vector<uint16_t> expanded_indices;
-	if (expand_index8_to_u16) {
+	if (index_source.guest_element_size == 1) {
 		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
 		const auto* src = static_cast<const uint8_t*>(args.index_addr);
 		expanded_indices.resize(args.index_count);
 		for (uint32_t i = 0; i < args.index_count; i++) {
 			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
 		}
+		index_source.host_data = expanded_indices.data();
+		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	DrawIndexBufferSource index_source {};
-	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
-	index_source.host_data =
-	    expanded_indices.empty() ? nullptr : static_cast<const void*>(expanded_indices.data());
-	index_source.size =
-	    expanded_indices.empty() ? index_size : expanded_indices.size() * sizeof(uint16_t);
-	index_source.type = index_type;
-	index_source.guest_element_size = static_cast<uint32_t>(index_size / args.index_count);
-
+	const DrawCallInfo draw {"DrawIndex", CommandBufferDebugOp::DrawIndex, args.index_count,
+	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, true,
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, true,
 	                            state)) {
 		ResetBindings();
 		return;
@@ -1373,7 +1381,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer)) {
+	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer)) {
 		ResetBindings();
 		return;
 	}
@@ -1403,7 +1411,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(submit_id, buffer, draw, args.render_target_slice_offset, false,
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, false,
 	                            state)) {
 		ResetBindings();
 		return;
@@ -1450,8 +1458,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	ResetBindings();
 }
 
-bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buffer,
-                                         uint32_t render_target_slice_offset) {
+bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {
 	const auto& hw = buffer.GetRegisters();
 	if (hw.GetColorControl().mode != 3) {
 		return false;
@@ -1465,8 +1472,8 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 
 	RenderColorInfo src {};
 	RenderColorInfo dst {};
-	ResolveRenderColorTarget(submit_id, buffer, src, render_target_slice_offset, 0, true, true);
-	ResolveRenderColorTarget(submit_id, buffer, dst, render_target_slice_offset, 1, true, true);
+	ResolveRenderColorTarget(buffer, src, render_target_slice_offset, 0, true, true);
+	ResolveRenderColorTarget(buffer, dst, render_target_slice_offset, 1, true, true);
 	if (!src.image_id || !dst.image_id) {
 		return false;
 	}

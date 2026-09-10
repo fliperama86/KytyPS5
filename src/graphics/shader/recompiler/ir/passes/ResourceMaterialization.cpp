@@ -1098,10 +1098,16 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	std::unordered_set<uint32_t> visited;
 	uint32_t                     index = 0;
 	const Inst*                  store = nullptr;
+	const bool has_lds = std::ranges::any_of(program.memory_info, [](const auto& memory) {
+		return memory.kind == ResourceKind::Lds;
+	});
 	for (;;) {
 		if (!visited.insert(index).second) return {};
 		for (const auto& inst: *program.blocks[index]) {
 			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
+			// Retained waits without LDS only complete the loads/stores already checked
+			// by this proof. LDS waits carry the subgroup ordering used by the emitter.
+			if (inst.GetOpcode() == ValueOpcode::Waitcnt && !has_lds) continue;
 			if (!inst.MayHaveSideEffects()) continue;
 			if (store != nullptr || (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write &&
 			                         inst.GetOpcode() != ValueOpcode::ImageWrite))

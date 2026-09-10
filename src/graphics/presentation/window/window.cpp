@@ -30,7 +30,6 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -1017,7 +1016,7 @@ void WindowContext::UpdateTitle() {
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);

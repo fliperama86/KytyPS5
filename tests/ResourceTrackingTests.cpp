@@ -449,13 +449,43 @@ void TestInvariantIndirectImageMaterialization() {
             malformed->program.descriptor_sources.empty(),
         "malformed indirect image pattern was partially accepted");
 
-  auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
-  BuildSrtPlan(wrapped_immediate->program);
-  CheckFatal([&] { TrackResources(wrapped_immediate->program); },
-             "not a valid runtime value",
-             "wrapped scalar immediate entered the invariant image proof");
-  Check(!wrapped_immediate->program.resource_tracking_complete,
-        "wrapped scalar immediate entered the invariant image proof");
+  auto immediate_fixture = MakeIndirectImageFixture(false, 4u);
+  immediate_fixture->PlanAndTrack();
+  auto immediate_plan = ExtractResourcePlan(immediate_fixture->program);
+  Check(immediate_fixture->program.resource_tracking_complete &&
+            std::ranges::any_of(immediate_plan.descriptor_sources,
+                                [](const DescriptorSource &source) {
+                                  return source.indirect_image.has_value() &&
+                                         source.indirect_image->selector_immediate == 4u;
+                                }),
+        "material key immediate was not carried into the indirect image source");
+  LinearTestMemory immediate_memory;
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    immediate_memory.words[(0x2000u - immediate_memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    immediate_memory.words[(0x2020u - immediate_memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  immediate_memory.words[(0x2020u - immediate_memory.base) / 4u] ^= 1u;
+  SrtRuntime immediate_runtime{.user_data = user_data,
+                               .userdata = &immediate_memory,
+                               .read_specialization_memory = ReadLinearTestMemory};
+  immediate_memory.words[(0x1000u - immediate_memory.base + 36u) / 4u] = 1u;
+  ResourceSnapshot unshifted_snapshot;
+  ResourceSpecialization unshifted_specialization;
+  Check(MaterializeResources(immediate_plan, immediate_runtime, unshifted_snapshot,
+                             unshifted_specialization) &&
+            unshifted_snapshot.images.size() == 1,
+        "material key immediate was applied to the wrapped dynamic offset");
+  immediate_memory.words[(0x1000u - immediate_memory.base + 36u) / 4u] = 0u;
+  immediate_memory.words[(0x1000u - immediate_memory.base + 40u) / 4u] = 1u;
+  ResourceSnapshot shifted_snapshot;
+  ResourceSpecialization shifted_specialization;
+  Check(MaterializeResources(immediate_plan, immediate_runtime, shifted_snapshot,
+                             shifted_specialization) &&
+            shifted_snapshot.images.size() == 2 &&
+            shifted_specialization.images.size() == 2,
+        "material key immediate did not select the record field after the wrapped offset");
 }
 
 void TestComputeBufferFill() {
@@ -1617,7 +1647,143 @@ void TestLoopBoundedDenseIndirectImage() {
         "a loop bound past the enumeration cap was accepted");
 }
 
-void TestReadLaneProbeIndirectImage() {
+void TestFindLsbDenseIndirectImage() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *header = fixture.AddBlock();
+  auto *body = fixture.AddBlock();
+  auto *latch = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  entry->AddBranch(header);
+  header->AddBranch(body);
+  header->AddBranch(exit);
+  body->AddBranch(latch);
+  latch->AddBranch(header);
+  const auto block_id = [&](Block *block) {
+    return static_cast<uint32_t>(
+        std::ranges::find(fixture.program.blocks, block) -
+        fixture.program.blocks.begin());
+  };
+  const auto terminate = [&](Block *block, Block *taken, Block *not_taken,
+                             Value condition) {
+    auto &info = fixture.program.block_info[block_id(block)];
+    using Kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+    info.terminator.kind =
+        not_taken != nullptr ? Kind::ConditionalBranch : Kind::Branch;
+    info.terminator.true_block = block_id(taken);
+    if (not_taken != nullptr) {
+      info.terminator.false_block = block_id(not_taken);
+    }
+    info.condition = condition;
+  };
+
+  const auto low = fixture.UserData(0);
+  const auto high = fixture.UserData(1);
+  const auto initial = fixture.UserData(5);
+  auto *phi = &header->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+  const auto mask = Value(phi);
+  const auto nonzero =
+      fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), mask}, 0, header);
+  const auto leave = fixture.Emit(ValueOpcode::LogicalNot, {nonzero}, 0, header);
+  fixture.Emit(ValueOpcode::Reference, {leave}, 0, header);
+  terminate(entry, header, nullptr, Value());
+  terminate(header, exit, body, leave);
+  terminate(body, latch, nullptr, Value());
+  terminate(latch, header, nullptr, Value());
+
+  const auto key = fixture.Emit(ValueOpcode::FindILsb32, {mask}, 0, body);
+  const auto scaled =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}, 0, body);
+  const auto table = fixture.Address(low, high, 0x29c);
+  std::array<Value, 8> dwords{};
+  for (uint32_t index = 0; index < dwords.size(); index++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarAddress;
+    word.offset = 0x6b0u + index * sizeof(uint32_t);
+    dwords[index] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, scaled, Value(0u), Value(true)},
+                                 fixture.AddMemory(word, 0x29c), body);
+  }
+  const auto image_handle =
+      fixture.Emit(ValueOpcode::GetImageResource,
+                   {dwords[0], dwords[1], dwords[2], dwords[3], dwords[4],
+                    dwords[5], dwords[6], dwords[7]},
+                   MemoryFlags{0, 0x29c}, body);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image_handle,
+                fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)},
+                                0x29c),
+                fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x29c), body);
+  const auto bit = fixture.Emit(
+      ValueOpcode::ShiftLeftLogical32,
+      {Value(1u), fixture.Emit(ValueOpcode::BitwiseAnd32, {key, Value(31u)}, 0, latch)},
+      0, latch);
+  const auto next = fixture.Emit(ValueOpcode::BitwiseXor32, {mask, bit}, 0, latch);
+  phi->AddPhiOperand(entry, initial);
+  phi->AddPhiOperand(latch, next);
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.images.size() == 1,
+        "lsb-keyed dense image was not tracked as one image");
+  const auto &source = fixture.program
+                           .descriptor_sources[fixture.program.info.images[0].source];
+  Check(source.indirect_image.has_value() &&
+            source.indirect_image->key_bound == 32u &&
+            source.indirect_image->table_offset == 0x6b0u &&
+            source.indirect_image->bound_source ==
+                DescriptorSource::IndirectImage::NoBoundSource,
+        "find-lsb key was not planned as a 32-entry dense table");
+
+  LinearTestMemory memory_image;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x40u;
+  descriptor[1] =
+      static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm)
+      << 20u;
+  descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  for (uint32_t entry_index = 0; entry_index < 32u; entry_index++) {
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      const auto at = (0x6b0u + entry_index * 32u) / 4u + dword;
+      memory_image.words[at] = descriptor[dword];
+    }
+    memory_image.words[(0x6b0u + entry_index * 32u) / 4u] += entry_index;
+  }
+  std::array<uint32_t, 8> user_data{static_cast<uint32_t>(memory_image.base),
+                                    0u, 0u, 0u, 0u, 5u, 0u, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory_image,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "lsb-keyed dense table did not materialize");
+  const auto mapping = specialization.images.empty()
+                           ? UINT32_MAX
+                           : specialization.images[0].indirect_mapping_offset;
+  Check(specialization.images.size() == 32u && snapshot.images.size() == 32u &&
+            mapping != UINT32_MAX &&
+            mapping + 1u + 32u * 2u <= snapshot.flattened_srt.size() &&
+            snapshot.flattened_srt[mapping] == 32u,
+        "lsb-keyed dense table did not enumerate all 32 bit positions");
+  for (uint32_t entry_index = 0; entry_index < 32u; entry_index++) {
+    const auto offset = mapping + 1u + entry_index * 2u;
+    Check(snapshot.flattened_srt[offset] == entry_index &&
+              snapshot.images[snapshot.flattened_srt[offset + 1u]].dwords[0] ==
+                  0x40u + entry_index,
+          "lsb-keyed dense table read the wrong entry");
+  }
+}
+
+void TestReadLaneProbeIndirectImageWith(ValueOpcode readlane) {
   Fixture fixture;
   const auto low = fixture.UserData(0);
   const auto high = fixture.UserData(1);
@@ -1650,7 +1816,8 @@ void TestReadLaneProbeIndirectImage() {
   const auto lane = fixture.Emit(
       ValueOpcode::BitwiseAnd32,
       {fixture.Emit(ValueOpcode::FindILsb32, {fixture.UserData(5)}), Value(63u)});
-  const auto key = fixture.Emit(ValueOpcode::ReadLane, {per_lane, lane});
+  const auto key = fixture.Emit(
+      readlane, {per_lane, readlane == ValueOpcode::ReadLane ? lane : Value(true)});
   const auto scaled =
       fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
   const auto based = fixture.Emit(ValueOpcode::IAdd32, {scaled, Value(0x20e0u)});
@@ -1741,6 +1908,14 @@ void TestReadLaneProbeIndirectImage() {
                   0x40u + key_value,
           "address probe read the wrong table entry for a key");
   }
+}
+
+void TestReadLaneProbeIndirectImage() {
+  TestReadLaneProbeIndirectImageWith(ValueOpcode::ReadLane);
+}
+
+void TestReadFirstLaneProbeIndirectImage() {
+  TestReadLaneProbeIndirectImageWith(ValueOpcode::ReadFirstLane);
 }
 
 void TestWaterfallDescriptorMatch() {
@@ -2518,6 +2693,8 @@ int main() {
     Run("dense indirect images", TestDenseIndirectImageMaterialization);
     Run("loop-bounded dense images", TestLoopBoundedDenseIndirectImage);
     Run("readlane probe images", TestReadLaneProbeIndirectImage);
+    Run("readfirstlane probe images", TestReadFirstLaneProbeIndirectImage);
+    Run("lsb-keyed dense images", TestFindLsbDenseIndirectImage);
     Run("waterfall descriptor match", TestWaterfallDescriptorMatch);
     Run("waterfall near misses", TestWaterfallNearMissesRejected);
     Run("waterfall rewrite", TestWaterfallRewriteDescalarizes);

@@ -352,6 +352,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
+		m_graphics.RecordShaderCheckpoint(command, 0xffff000000001000ull + dispatch.pipeline_slot);
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
@@ -597,6 +598,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.slice_bytes = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
+			m_graphics.RecordShaderCheckpoint(command, 0xffff000000000002ull);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
 			row += rows;
 		}
@@ -671,6 +673,7 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	push.width    = pixels;
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	m_graphics.RecordShaderCheckpoint(command, 0xffff000000000003ull);
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;

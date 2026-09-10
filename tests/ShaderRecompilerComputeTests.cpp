@@ -21651,6 +21651,48 @@ TestCase DsBpermuteWave64UsesIndependentHalves() {
   return test;
 }
 
+TestCase WaveWaitcntLdsExchange(u32 wave_size) {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0));
+  code.push_back(EncodeVop2(0x1d, 3, InlineU32(wave_size - 1), 0));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 3));
+  // Exchange with another lane using the guest's wave-local wait, without an
+  // S_BARRIER. Also finish the reads before the next iteration overwrites LDS.
+  for (u32 iteration = 0; iteration < 4; iteration++) {
+    code.push_back(EncodeDs0(0x0d));
+    code.push_back(EncodeDs1(0, 1, 2));
+    code.push_back(EncodeSopp(0x0c, 0xc07f)); // s_waitcnt lgkmcnt(0)
+    code.push_back(EncodeDs0(0x36));
+    code.push_back(EncodeDs1(1, 0, 3));
+    code.push_back(EncodeSopp(0x0c, 0xc07f));
+    code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 1));
+  }
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 32 ? "Wave32WaitcntLdsExchange" : "Wave64WaitcntLdsExchange";
+  test.code = std::move(code);
+  test.initial.resize(wave_size * 2);
+  for (u32 lane = 0; lane < wave_size * 2; lane++) {
+    test.expected.push_back(104 + lane);
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::V_XOR_B32, O::DS_WRITE_B32, O::S_WAITCNT,
+                  O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpControlBarrier"};
+  test.compute_info.threads_num[0] = wave_size * 2;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Wave64CrossHalfLaneAndLds() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -23003,6 +23045,22 @@ TestCase ImageStoreVariants() {
   return test;
 }
 
+TestCase ImageStoreOutOfBoundsDiscard() {
+  auto test = ImageStoreVariants();
+  test.name = "ImageStoreOutOfBoundsDiscard";
+  test.code.pop_back(); // S_ENDPGM
+  for (const auto [x, y] : std::array<std::pair<u32, u32>, 5>{
+           {{UINT32_MAX, 1}, {4, 1}, {1, 4}, {1, UINT32_MAX}, {UINT32_MAX, UINT32_MAX}}}) {
+    AppendVMovLiteral(&test.code, 20, x);
+    AppendVMovLiteral(&test.code, 21, y);
+    test.code.push_back(EncodeMimg0(0x08, 0xf));
+    test.code.push_back(EncodeMimg1(0, 20));
+  }
+  AppendEnd(&test.code);
+  test.required_spirv = {"OpImageQuerySize", "OpULessThan"};
+  return test;
+}
+
 TestCase ImageD16StoreUnpacksHalfPairs() {
   using O = ShaderOpcode;
 
@@ -24282,6 +24340,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(Wave64CrossHalfLaneAndLds);
+  AddCase([] { return WaveWaitcntLdsExchange(32); });
+  AddCase([] { return WaveWaitcntLdsExchange(64); });
   AddCase(Wave64RawMasksAndScalarBranch);
   AddCase(Wave64PartialMultidimensionalWorkgroup);
   AddCase(Wave64AppendConsumeHighHalf);
@@ -24318,6 +24378,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
+  AddCase(ImageStoreOutOfBoundsDiscard);
   AddCase(ImageD16StoreUnpacksHalfPairs);
   AddCase(ImageStoreMipSelectsPpsa01340Descriptor);
   AddCase(ImageStoreRgbOneUsesInverseSwizzle);
@@ -28513,6 +28574,12 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--lds-waitcnt-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WaveWaitcntLdsExchange(32));
+    RunCase(&vulkan, WaveWaitcntLdsExchange(64));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());

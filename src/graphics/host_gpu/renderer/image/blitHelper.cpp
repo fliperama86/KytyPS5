@@ -204,6 +204,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                            {destination_info.extent.width, destination_info.extent.height}};
 	command.setViewport(0, 1, &viewport);
 	command.setScissor(0, 1, &scissor);
+	m_graphics.RecordShaderCheckpoint(command, 0xffff000000000004ull);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
 }

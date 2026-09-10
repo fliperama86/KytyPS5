@@ -1199,6 +1199,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
+		m_context.GetGraphics().RecordShaderCheckpoint(
+		    vk_buffer, state.ps_active ? state.ps_input_info.stage.program->shader_hash
+		                               : state.vs_input_info.stage.program->shader_hash);
 		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 	}
 

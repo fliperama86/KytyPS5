@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuFaultTrace.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -28,12 +29,14 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
@@ -489,6 +492,64 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	m_context.GetGraphics().RecordShaderCheckpoint(vk_buffer, program.shader_hash);
+	if (GpuFaultTrace::Enabled() &&
+	    (program.shader_hash == 0xdf890e8a1a32c65aull ||
+	     program.shader_hash == 0x92760f03dce9b80dull)) {
+		auto trace = fmt::format(
+		    "shader={:016x} frame={} tick={} groups={}x{}x{} local={}x{}x{} indirect={:016x}\n",
+		    program.shader_hash, frame_num, m_context.GetCommandScheduler().CurrentTick(),
+		    thread_group_x, thread_group_y, thread_group_z, input_info.threads_num[0],
+		    input_info.threads_num[1], input_info.threads_num[2], indirect_args);
+		for (uint32_t i = 0; i < bindings.images.size(); ++i) {
+			const auto& binding = bindings.images[i];
+			// RenderExecutor is already a cache friend; avoid changing LRU state for logging.
+			const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+			const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+			const auto& resource = program.info.images[i];
+			trace += fmt::format(
+			    " image[{}] source={} class={} written={} dimension={} mip_mode={} id={}:{} "
+			    "guest={:010x} raw={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}\n",
+			    i, resource.source, static_cast<uint32_t>(resource.resource_class), resource.written,
+			    static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+			    binding.image_id.index, binding.image_id.generation, descriptor.Base40(),
+			    descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			    descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+			if (image == nullptr) {
+				trace += "  MISSING backing image\n";
+				continue;
+			}
+			const auto& backing = image->backing;
+			VmaAllocationInfo allocation {};
+			if (backing.memory.allocation != nullptr) {
+				vmaGetAllocationInfo(m_context.GetGraphics().allocator, backing.memory.allocation,
+				                     &allocation);
+			}
+			trace += fmt::format(
+			    "  backing={} format={} extent={}x{}x{} layers={} mips={} samples={} "
+			    "usage={} flags={} layout={} registered={} guest_range={:x}+{:x} "
+			    "memory={} offset={:x} size={:x} requirement={:x} type={}\n",
+			    fmt::ptr(static_cast<VkImage>(backing.image)), vk::to_string(backing.format),
+			    backing.extent.width, backing.extent.height, backing.extent.depth, backing.layers,
+			    backing.mip_levels, backing.samples, vk::to_string(backing.usage),
+			    vk::to_string(backing.flags), vk::to_string(binding.layout), image->registered,
+			    image->info.data.address, image->info.data.size, fmt::ptr(allocation.deviceMemory),
+			    allocation.offset, allocation.size, backing.memory.requirements.size,
+			    allocation.memoryType);
+			for (const auto& view : image->views) {
+				if (view.view != binding.image_view &&
+				    std::ranges::find(binding.mip_views, view.view) == binding.mip_views.end()) {
+					continue;
+				}
+				trace += fmt::format(
+				    "  view={} format={} type={} aspect={} mip={}/{} layer={}/{}\n",
+				    fmt::ptr(static_cast<VkImageView>(view.view)), vk::to_string(view.info.format),
+				    vk::to_string(view.info.type), vk::to_string(view.info.aspect),
+				    view.info.base_level, view.info.level_count, view.info.base_layer, view.info.layer_count);
+			}
+		}
+		GpuFaultTrace::Record(std::move(trace));
+	}
 	if (indirect_args != 0) {
 		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 		    indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
@@ -514,6 +575,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	static const bool serialize_dispatch = std::getenv("KYTY_DEBUG_SERIALIZE_DISPATCH") != nullptr;
+	if (serialize_dispatch) {
+		m_context.GetCommandScheduler().FlushAndWait();
+	}
 }
 
 } // namespace Libs::Graphics

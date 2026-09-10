@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#if defined(TRACY_ENABLE)
+#include "common/profiler.h"
+#endif
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -340,6 +343,9 @@ bool MaterializeDenseIndirectImage(const DescriptorSource::IndirectImage& indire
                                    const DescriptorValue& heap_value,
                                    const DescriptorValue* bound_value, const SrtRuntime& runtime,
                                    IndirectImage& result, std::string* reason) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("MaterializeDenseIndirectImage");
+#endif
 	const auto note = [reason](const char* why) {
 		if (reason != nullptr) {
 			*reason = why;
@@ -407,6 +413,9 @@ bool MaterializeAddressProbeIndirectImage(const DescriptorSource::IndirectImage&
                                           const DescriptorValue&                 heap_value,
                                           const SrtRuntime& runtime, IndirectImage& result,
                                           std::string* reason) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("MaterializeAddressProbeIndirectImage");
+#endif
 	const auto note = [reason](const char* why) {
 		if (reason != nullptr) {
 			*reason = why;
@@ -479,6 +488,9 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
                               const ImageResource& image, const DescriptorValue& material_value,
                               const DescriptorValue& heap_value, const SrtRuntime& runtime,
                               IndirectImage& result, std::string* reason) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("MaterializeIndirectImage");
+#endif
 	const auto note = [reason](const char* why) {
 		if (reason != nullptr) {
 			*reason = why;
@@ -560,6 +572,9 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 
 static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& runtime,
                                 MaterializedSnapshot& snapshot, MaterializeReport* report) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("MaterializeSnapshot");
+#endif
 	const auto fail = [report](const char* why) {
 		if (report != nullptr) {
 			report->reason = why;
@@ -699,6 +714,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
                                         ResourceSnapshot&       specialized_snapshot,
                                         ResourceSpecialization& specialization,
                                         MaterializeReport*      report) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("BuildResourceSpecialization");
+#endif
 	auto                   next_snapshot = std::move(snapshot.resources);
 	ResourceSpecialization next_specialization;
 	next_specialization.buffers.reserve(program.info.buffers.size());

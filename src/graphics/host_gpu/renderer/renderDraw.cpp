@@ -745,6 +745,7 @@ struct PreparedVertexBuffers {
 
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
@@ -929,6 +930,7 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
                                             bool log_setup_phases, DrawRenderState& state) {
+	KYTY_PROFILER_FUNCTION();
 	auto& ctx = buffer.GetRegisters();
 
 	if (ResolveColorTargets(buffer, render_target_slice_offset)) {
@@ -964,6 +966,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
+	KYTY_PROFILER_BLOCK("Draw::RefreshShaders");
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -989,6 +992,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
+	KYTY_PROFILER_FUNCTION();
 	PreparedIndexBuffer prepared;
 	if (source.size == 0) {
 		return prepared;
@@ -1103,6 +1107,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
                                          bool primitive_restart_enable, bool log_pipeline_phase,
                                          bool set_bind_debug, bool set_auto_debug) {
+	KYTY_PROFILER_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
@@ -1252,7 +1257,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	{
+		KYTY_PROFILER_BLOCK("DrawIndex::PendingOperations");
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1260,7 +1268,9 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
+	KYTY_PROFILER_BLOCK("DrawIndex::ContextLockWait");
 	Common::LockGuard lock(m_context.GetMutex());
+	KYTY_PROFILER_END_BLOCK;
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return;
 	}

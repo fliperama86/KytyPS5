@@ -292,7 +292,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_z, uint32_t mode,
                                     uint64_t indirect_args) {
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations();
+	{
+		KYTY_PROFILER_BLOCK("RenderCompute::PopPendingOperations");
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -300,7 +303,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
+	KYTY_PROFILER_BLOCK("RenderCompute::ContextLockWait");
 	Common::LockGuard lock(m_context.GetMutex());
+	KYTY_PROFILER_END_BLOCK;
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -336,8 +341,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	KYTY_PROFILER_BLOCK("RenderCompute::GetComputeProgram");
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	KYTY_PROFILER_END_BLOCK;
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -349,15 +356,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
-	if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
-	                                                     thread_group_y, thread_group_z, mode)) {
-		ResetBindings();
-		return;
-	}
-	if (indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
-	                                                      thread_group_y, thread_group_z, mode)) {
-		ResetBindings();
-		return;
+	{
+		KYTY_PROFILER_BLOCK("RenderCompute::DetectClear");
+		if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
+		                                                     thread_group_y, thread_group_z,
+		                                                     mode)) {
+			ResetBindings();
+			return;
+		}
+		if (indirect_args == 0 &&
+		    TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+		                                thread_group_z, mode)) {
+			ResetBindings();
+			return;
+		}
 	}
 	const auto sampled_images = std::count_if(
 	    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -463,20 +475,28 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
+	KYTY_PROFILER_BLOCK("RenderCompute::CreatePipeline");
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
+	KYTY_PROFILER_END_BLOCK;
+	KYTY_PROFILER_BLOCK("RenderCompute::PrepareBindings");
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
+		KYTY_PROFILER_BLOCK("RenderCompute::PrepareBda");
 		m_context.GetGpuResources().PrepareBda();
 	}
 	RebindBuffers(bindings);
 	RebindImages(bindings);
+	KYTY_PROFILER_END_BLOCK;
 
 	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
+	{
+		KYTY_PROFILER_BLOCK("RenderCompute::CommitBindings");
+		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+		               std::span {&descriptor_stage, 1u});
+	}
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -549,26 +569,30 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		GpuFaultTrace::Record(std::move(trace));
 	}
-	if (indirect_args != 0) {
-		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-		    indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
-		vk::BufferMemoryBarrier args_barrier {};
-		args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
-		args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
-		                             vk::AccessFlagBits::eTransferWrite |
-		                             vk::AccessFlagBits::eMemoryWrite;
-		args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
-		args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		args_barrier.buffer              = args_buffer->Handle();
-		args_barrier.offset              = args_offset;
-		args_barrier.size                = 3u * sizeof(uint32_t);
-		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                          vk::PipelineStageFlagBits::eDrawIndirect,
-		                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
-		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
-	} else {
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	{
+		KYTY_PROFILER_BLOCK("RenderCompute::RecordDispatch");
+		if (indirect_args != 0) {
+			auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+			    indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
+			vk::BufferMemoryBarrier args_barrier {};
+			args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
+			args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+			                             vk::AccessFlagBits::eTransferWrite |
+			                             vk::AccessFlagBits::eMemoryWrite;
+			args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+			args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			args_barrier.buffer              = args_buffer->Handle();
+			args_barrier.offset              = args_offset;
+			args_barrier.size                = 3u * sizeof(uint32_t);
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                          vk::PipelineStageFlagBits::eDrawIndirect,
+			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,
+			                          nullptr);
+			vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		} else {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		}
 	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.

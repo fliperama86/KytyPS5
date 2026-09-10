@@ -313,12 +313,14 @@ struct PipelineCache::ProgramCache {
 			default: EXIT("invalid pipeline shader stage\n");
 		}
 
+		KYTY_PROFILER_BLOCK("ProgramCache::FindSource");
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		KYTY_PROFILER_END_BLOCK;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -329,19 +331,25 @@ struct PipelineCache::ProgramCache {
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
-			ReportMaterialization(label, stage, params.hash, report,
-			                      ShaderRecompiler::IR::MaterializeResources(
-			                          entry->second.resource_plan, runtime, resources,
-			                          specialization, &report));
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			{
+				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
+				ReportMaterialization(label, stage, params.hash, report,
+				                      ShaderRecompiler::IR::MaterializeResources(
+				                          entry->second.resource_plan, runtime, resources,
+				                          specialization, &report));
+			}
+			const auto permutation = [&] {
+				KYTY_PROFILER_BLOCK("ProgramCache::FindPermutation");
+				return std::ranges::find_if(
+				    entry->second.permutations, [&](const Permutation& candidate) {
+					    const auto& layout = candidate.program.bindings;
+					    return layout.push_data_start_dword ==
+					               ShaderRecompiler::IR::PushData::StartFor(
+					                   push_data_cursor, layout.ShaderDataDwords()) &&
+					           candidate.specialization == specialization;
+				    });
+			}();
+			if (permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = std::move(resources)};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);

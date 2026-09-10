@@ -181,6 +181,13 @@ struct BufferCacheTestAccess {
   }
 };
 
+struct GpuResourceManagerTestAccess {
+  static bool BdaScanRequired(const GpuResourceManager &resources) {
+    return resources.BdaScanRequired(resources.m_buffer_cache.BdaGeneration(),
+                                     resources.m_mapped_generation);
+  }
+};
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
@@ -4297,6 +4304,167 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckBdaGenerationCaching() {
+    constexpr const char *name = "BdaGenerationCaching";
+    constexpr uintptr_t base = 0x0000000203e00000ull;
+    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t initial_value = 0x10293847u;
+    constexpr uint32_t updated_value = 0xa1b2c3d4u;
+    constexpr uint64_t second_offset = 0x10000;
+    constexpr uint32_t second_value = 0x55667788u;
+    constexpr uint32_t gpu_value = 0xdeadbeefu;
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "BDA-generation direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 && mapped == reinterpret_cast<void *>(base),
+            "BDA-generation fixed direct-memory mapping failed");
+    std::memcpy(mapped, &initial_value, sizeof(initial_value));
+    std::memcpy(static_cast<uint8_t *>(mapped) + second_offset, &second_value,
+                sizeof(second_value));
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      resources.MapMemory(base, allocation_size);
+      auto &cache = resources.GetBufferCache();
+      auto allocation = cache.ObtainBuffer(base, 0x4004, false, false);
+      Require(name, "buffer allocation",
+              allocation.first != nullptr && cache.IsRegionRegistered(base, 0x4004),
+              "BDA-generation buffer allocation failed");
+      const auto ReadNativeValue = [&](
+                                       const std::pair<Libs::Graphics::Buffer *, uint64_t> &native) {
+        auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                         vk::BufferUsageFlagBits::eTransferDst, {0});
+        vk::BufferMemoryBarrier source_barrier{};
+        source_barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        source_barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        source_barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        source_barrier.buffer = native.first->Handle();
+        source_barrier.offset = native.second;
+        source_barrier.size = sizeof(uint32_t);
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
+            &source_barrier, 0, nullptr);
+        const vk::BufferCopy copy{native.second, 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(native.first->Handle(),
+                                                readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+            {}, 0, nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        const auto value = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+        return value;
+      };
+      Require(name, "initial materialization", ReadNativeValue(allocation) == initial_value,
+              "initial CPU buffer contents were not uploaded");
+      Require(name, "initial scan required",
+              GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "initial BDA scan was incorrectly cached");
+      resources.PrepareBda();
+      Require(name, "clean scan cached",
+              !GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "completed BDA scan was not cached");
+      resources.PrepareBda();
+      Require(name, "clean repeat skipped",
+              !GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "unchanged BDA state unexpectedly required another scan");
+      Require(name, "CPU invalidation",
+              resources.InvalidateMemory(base, sizeof(updated_value)),
+              "mapped CPU write was not accepted by the resource manager");
+      std::memcpy(mapped, &updated_value, sizeof(updated_value));
+      Require(name, "CPU page dirty", cache.IsRegionCpuModified(base, sizeof(updated_value)),
+              "CPU invalidation did not mark the buffer page dirty");
+      Require(name, "dirty scan required",
+              GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "CPU dirty state did not invalidate the BDA scan cache");
+      resources.PrepareBda();
+      Require(name, "updated upload", ReadNativeValue(allocation) == updated_value,
+              "BDA scan did not upload updated CPU buffer contents");
+      Require(name, "updated scan cached",
+              !GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "updated BDA scan was not cached");
+
+      auto second = cache.ObtainBuffer(base + second_offset, 0x4004, false, false);
+      Require(name, "second registration",
+              second.first != nullptr &&
+                  cache.IsRegionRegistered(base + second_offset, 0x4004) &&
+                  ReadNativeValue(second) == second_value &&
+                  GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "new buffer registration did not upload bytes and invalidate the BDA cache");
+      resources.PrepareBda();
+      Require(name, "registration scan cached",
+              !GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "new buffer registration scan was not cached");
+
+      auto gpu_owned = cache.ObtainBuffer(base + second_offset, sizeof(gpu_value),
+                                          true, false);
+      Require(name, "GPU write ownership", gpu_owned.first != nullptr,
+              "failed to mark the second buffer GPU-owned");
+      cache.FillBuffer(base + second_offset, sizeof(gpu_value), gpu_value, false);
+      Require(name, "GPU write remains cached",
+              !GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "GPU-only dirty state unnecessarily invalidated the BDA upload cache");
+      resources.PrepareBda();
+      Require(name, "GPU dirty preservation", ReadNativeValue(gpu_owned) == gpu_value,
+              "skipped BDA preparation overwrote GPU-owned buffer bytes");
+      cache.ReadMemory(base + second_offset, sizeof(gpu_value));
+      uint32_t downloaded = 0;
+      std::memcpy(&downloaded, static_cast<uint8_t *>(mapped) + second_offset,
+                  sizeof(downloaded));
+      Require(name, "GPU dirty download", downloaded == gpu_value,
+              "GPU-owned bytes were not preserved through CPU readback");
+      resources.UnmapMemory(base, allocation_size);
+      resources.MapMemory(base, allocation_size);
+      Require(name, "mapping change invalidates",
+              GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "mapped-range topology change did not invalidate the BDA cache");
+      resources.PrepareBda();
+      Require(name, "mapping scan cached",
+              !GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "mapped-range BDA scan was not cached");
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "BDA-generation direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "BDA-generation direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -30039,6 +30207,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-generation-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaGenerationCaching();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {

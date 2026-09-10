@@ -142,9 +142,10 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	// Initialization order is explicit; destruction is automatic and reversed.
 	subsystems.Initialize<Loader::Timer::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
-	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+	// Reserve guest address ranges before Tracy starts allocating on worker threads.
+	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
 	subsystems.Initialize<Libs::Audio::Lifecycle>();

@@ -1,13 +1,19 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#if defined(TRACY_ENABLE)
+#include "common/profiler.h"
+#endif
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cstddef>
 #include <cmath>
 #include <cstring>
 #include <fmt/format.h>
+#include <memory_resource>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -540,10 +546,11 @@ private:
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
-	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
+	          std::pmr::memory_resource* memory, std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()), m_cache(memory),
+	      m_visiting(memory) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -579,8 +586,11 @@ private:
 			return false;
 		}
 		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
+			// Small descriptor expressions and nested active-mask evaluators often visit
+			// only a fraction of the plan. Grow on demand instead of allocating for the
+			// entire shader in every evaluator; the visiting stack tracks depth only.
+			m_cache.reserve(std::min<size_t>(m_program.value_storage.size(), 64));
+			m_visiting.reserve(std::min<size_t>(m_program.value_storage.size(), 16));
 			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
@@ -733,8 +743,8 @@ private:
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 			case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 			case ValueOpcode::ReadFirstLane: {
-				Evaluator active(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
-				                 inst.Arg(1));
+				Evaluator active(m_program, m_runtime, m_cache.get_allocator().resource(),
+				                 m_clean_flat_slots, m_clean_evaluator, inst.Arg(1));
 				return active.EvaluateWide(inst.Arg(0), result);
 			}
 			case ValueOpcode::BitCastU32F32:
@@ -1070,8 +1080,8 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<const Inst*>                  m_visiting;
+	std::pmr::unordered_map<const Inst*, uint64_t> m_cache;
+	std::pmr::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
 };
 
@@ -1087,6 +1097,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots,
                                 std::vector<uint8_t>& active_sources) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("EvaluateRuntimeSourcesImpl");
+#endif
 	if (!program.srt_plan_complete) {
 		return false;
 	}
@@ -1096,8 +1109,11 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	}
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
-	Evaluator            clean_evaluator(program, clean_runtime);
-	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
+	std::array<std::byte, 4096> evaluator_storage;
+	std::pmr::monotonic_buffer_resource evaluator_memory(
+	    evaluator_storage.data(), evaluator_storage.size(), std::pmr::new_delete_resource());
+	Evaluator clean_evaluator(program, clean_runtime, &evaluator_memory);
+	Evaluator evaluator(program, runtime, &evaluator_memory, clean_flat_slots, &clean_evaluator);
 	std::vector<uint8_t> active;
 	if (evaluate_flat) {
 		active.assign(program.descriptor_sources.size(), 1u);
@@ -1195,6 +1211,9 @@ void BuildSrtPlan(Program& program) {
 
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
                             const SrtRuntime& runtime, std::span<uint32_t> results) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("EvaluateUniformValues");
+#endif
 	if (values.size() != results.size()) {
 		return false;
 	}
@@ -1202,7 +1221,10 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 	clean.read_memory = runtime.read_specialization_memory != nullptr
 	                        ? runtime.read_specialization_memory
 	                        : +[](void*, uint64_t, uint32_t*) { return false; };
-	Evaluator evaluator(program, clean);
+	std::array<std::byte, 4096> evaluator_storage;
+	std::pmr::monotonic_buffer_resource evaluator_memory(
+	    evaluator_storage.data(), evaluator_storage.size(), std::pmr::new_delete_resource());
+	Evaluator evaluator(program, clean, &evaluator_memory);
 	for (size_t i = 0; i < values.size(); ++i) {
 		if (!evaluator.Evaluate(values[i], results[i])) {
 			return false;

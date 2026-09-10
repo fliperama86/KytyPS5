@@ -1,0 +1,52 @@
+[
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\_Build\\cpu-fault-investigation.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\investigations\\cpu-fault-investigation.md",
+        "sha256":  "DE563573C99C994F3CEAF227C1085FFEAF70B9521451D6B65E0FE29F50426D45"
+    },
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\_Build\\demons-souls-touch-race-report.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\investigations\\demons-souls-touch-race-report.md",
+        "sha256":  "DE25DE6B7438818308D21C7C4BFEB2645FE959E75EA3A5804223D3638F1F58B2"
+    },
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\_Build\\demons-souls-crash-report.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\investigations\\demons-souls-crash-report.md",
+        "sha256":  "1C09691CC0C52427E982EBC25EB7FF73CC21283759D454C5BD4AC6F96E7C7014"
+    },
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\_Build\\nv-fault-details-outcome.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\investigations\\nv-fault-details-outcome.md",
+        "sha256":  "DB1A787D7823FF51F87774E1E451EDC7FF2BAF15ECF443AC504C31868CDBF718"
+    },
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\_Build\\github-research-20260910\\findings.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\investigations\\github-reddit-research-2026-09-10.md",
+        "sha256":  "251497F2B582E707267642E9970C799195EEC8055ADB75EE5232481800802DDA"
+    },
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\_Build\\savedata-investigation.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\investigations\\savedata-investigation.md",
+        "sha256":  "9E50457528C7B8D5CE841473BDF25E26EDE12E8AE2615F67493397ADCCA8C087"
+    },
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS\\_Build\\debugging-notes.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\investigations\\early-debugging-notes.md",
+        "sha256":  "4F0CE715A6A00A036849A9305D5CA81C9085CBDBC78F305DAF7BE36D35A071D8"
+    },
+    {
+        "source":  "E:\\Emulation\\PS5\\KytyPS5\\README.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\local-runtime.md",
+        "sha256":  "2B57A3B854ED6921399C19A87E760ACF0159ACBDA8640857200F7B392553DF13"
+    },
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\_Build\\releases\\des-experimental-2026-09-10-7be5d03\\release-notes.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\releases\\des-experimental-2026-09-10-7be5d03.md",
+        "sha256":  "E7B3A8892118AB03B399AA6902A5C3AF3FB8EFC36E937EFB152FA183F72E9653"
+    },
+    {
+        "source":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\_Build\\releases\\des-experimental-2026-09-10-fffb4ce\\release-notes.md",
+        "target":  "C:\\Users\\dudu\\Projects\\KytyPS5-DeS-1d6e23a\\docs\\releases\\des-experimental-2026-09-10-fffb4ce.md",
+        "sha256":  "4EE9BFCB011D96BF2257FB3C33E5168B114623F8C5729CFF9F4266B2931DD11B"
+    }
+]

@@ -743,6 +743,7 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
+	KYTY_PROFILER_BLOCK("Shader::PrepareProgram(VS)");
 	const auto& sh     = context.GetShaderRegisters();
 	const auto data = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	auto        params = GetShaderParams(
@@ -810,6 +811,7 @@ ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
+	KYTY_PROFILER_BLOCK("Shader::PrepareProgram(PS)");
 	const auto data = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	return GetShaderParams(
@@ -819,6 +821,7 @@ ShaderParams PrepareProgram(
 
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& info) {
+	KYTY_PROFILER_BLOCK("Shader::PrepareProgram(CS)");
 	const auto data = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
 	return GetShaderParams(

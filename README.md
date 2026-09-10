@@ -4,7 +4,9 @@ This fork's `demons-souls-workaround` branch preserves the Demon's Souls
 investigation, now updated through TarkusR's `f69e86d` and official KytyPS5
 `2e315a3`. An experimental Windows workaround
 has loaded a PPSA01342 / 01.005.000 save into the Nexus, including save and reload.
-See [the setup, evidence, and limitations](docs/demons-souls-workaround.md).
+See [the setup, evidence, and limitations](docs/demons-souls-workaround.md),
+[performance results](docs/demons-souls-performance.md), and the
+[complete documentation index](docs/README.md).
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)

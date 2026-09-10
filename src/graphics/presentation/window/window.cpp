@@ -981,6 +981,9 @@ void WindowContext::UpdateIcon() {
 }
 
 void WindowContext::UpdateTitle() {
+	if (tracy::ProfilerAvailable()) {
+		FrameMark;
+	}
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];

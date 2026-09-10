@@ -1,0 +1,93 @@
+# Demon's Souls performance investigation ? September 10, 2026
+
+## Test conditions
+
+- Game: own dump of PPSA01342, version 01.005.000, stationary character in the Nexus, same camera and save for each run.
+- Source baseline: `fffb4cef55c9e537095093bb796ee4509e899c03`, Release, clang-cl 22.1.6, Windows.
+- Hardware: Ryzen 9 9950X3D and GeForce RTX 5090.
+- Collision serialization remains enabled throughout. Full and light capture were compared separately.
+- One runtime directory: `E:\Emulation\PS5\KytyPS5`. Experimental binaries use `kyty_emulator-profile.exe`; the previous working executable is preserved.
+- Cold startup/shader compilation is excluded. No builds or tests ran during the clean measurement windows.
+- FPS comes from the change in presented frame count divided by wall time, not the rounded window-title FPS. CPU is process CPU time divided by wall time, expressed as fully occupied logical cores. GPU readings are device-wide `nvidia-smi` samples.
+
+Local evidence is under `_Diagnostics/perf-20260910-141256` in the runtime directory. Traces use vendored Tracy 0.13.1 / protocol 76.
+
+## Baseline results
+
+| Run | Duration | Presented frames | FPS | CPU core equivalents | Mean GPU utilization |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Release, full collision capture | 29.45 s | 124 | 4.2104 | 13.284 | 15.87% |
+| Same release, light collision capture | 29.45 s | 124 | 4.2106 | 13.291 | 15.87% |
+| Initial profiling scopes, light | 29.43 s | 124 | 4.2132 | 13.349 | 14.47% |
+| Shader resource scopes, light | 29.41 s | 123 | 4.1825 | 13.329 | 14.00% |
+| BDA scan cache | 29.41 s | 187 | 6.3575 | 13.110 | 17.17% |
+| BDA cache + capped evaluator reserves | 29.40 s | 180 | 6.1218 | 13.034 | 18.10% |
+| BDA cache + capped reserves + temporary arena | 29.42 s | 222 | 7.5462 | 12.941 | 20.63% |
+| Combined optimizations, confirmation | 44.62 s | 334 | 7.4853 | 12.982 | 19.89% |
+
+The release binary SHA-256 is `eab650d0064b916dde8aa95523fed6ce7bfffe04c62a31ab773100165ed53fc5`. The last baseline with shader resource scopes is `c6545b66ef7ad80da8a0f8bd9d6494cbe83d57bebac62df57bed03c73dcf4bb3`; its precise source diff is `materialize-source.patch` beside the trace.
+
+Removing per-node collision diagnostics did not produce a measurable gain in this scene. The lighter mode also loaded the save and completed save/exit successfully. This does not establish that the serialization workaround itself is free.
+
+`materialize-steady.tracy` contains 20.12 seconds and 87 frame markers. Excluding synthetic/preconnection intervals and incomplete edge intervals leaves 83 complete intervals: median 233.58 ms, mean 239.33 ms, p95 267.60 ms, maximum 279.45 ms. These are short, stationary-scene measurements, not a whole-game benchmark.
+
+## Measured CPU hot paths
+
+Self times below exclude nested zones; percentages divide by the 20.12-second capture window. Do not use the CSV export's `total_perc`, which includes a preconnection span in its denominator. Template instantiations with the same zone name are aggregated where indicated.
+
+| Scope | Self time | Share of capture | Calls |
+| --- | ---: | ---: | ---: |
+| `RenderCompute::PrepareBda` | 6.130 s | 30.5% | 29,573 |
+| `ProgramCache::MaterializeResources` (all stages) | 8.168 s | 40.6% | 1,701,465 |
+| `CpOpDispatchIndirect::SyncArguments` | 0.379 s | 1.9% | 20,586 |
+
+The BDA preparation walks every mapped guest range and synchronizes overlapping cached buffers before each applicable compute dispatch. Its cost is repeated synchronization preparation, not necessarily actual data uploads.
+
+The shader cache hits rebuild resource snapshots and specialization state. Shader source lookup and permutation matching are small after separating this work from the original broad shader-preparation scope. Further zones split resource evaluation, indirect image probing, and specialization construction.
+
+The initial broad trace attributed substantial time to indirect dispatch. The refined trace showed that argument synchronization itself accounts for less than 2%; a native-indirect draft was archived and removed without running it. That route is not the current optimization target.
+
+## Instrumentation and limits
+
+Frame markers are emitted after successful presentation. Graphics/compute preparation, cache lookup, materialization, and BDA synchronization have named CPU zones. Profiler initialization now follows guest address-space reservation: initializing Tracy earlier caused two profiled starts to fail while reserving guest memory; later starts with the new order succeeded.
+
+Tracy captured no CPU callstack samples or context switches in this non-administrator session. The zones identify instrumented rendering paths, not all guest-worker CPU activity. There are no Vulkan GPU timestamp zones yet. Low device utilization and expensive CPU preparation justify investigating the CPU paths first, but do not by themselves prove the absence of GPU stalls.
+
+All current gameplay comparisons use the Nexus scene. Other levels, extended gameplay, other drivers, and other machines remain unmeasured. A prior mixed loading measurement and a window overlapping an analyzer build are excluded from the baseline table.
+
+## Optimization validation
+
+The first experiment caches completed BDA synchronization using a buffer generation and a mapped-range generation. CPU invalidation, CPU-dirty readback, buffer registration/removal, and mapping changes invalidate the snapshot. The buffer generation is acquired before scanning; only that captured value is published afterward, so a concurrent invalidation still requires a later scan. Fault processing remains pending even when the scan is skipped.
+
+The Release emulator and production test executable build successfully. The focused `bda_generation_cache` test passes with actual mapped guest memory and Vulkan buffers: initial materialization, unchanged repeated preparation, explicit CPU invalidation/write followed by updated native-buffer readback, new buffer registration, mapped-range changes, and preservation/download of GPU-owned data. Existing `buffer_cache_dirty_gc` and Windows `buffer_cache_ranges` regressions also pass. This is production cache-boundary coverage, not an end-to-end emulated game dispatch test.
+
+The first optimized runtime binary SHA-256 is `366602383081b23ae709e65fcf3c51fc37126cba7071c15807795b10491203dd`; its source snapshot is `bda-cache-source.patch`. In the same stationary Nexus scene, the clean 29.41-second measurement produced 187 presented frames: **6.3575 FPS**, versus 4.2106 FPS for the release baseline (**51.0% higher**). CPU use was 13.110 core equivalents, average GPU utilization 17.17%, and average GPU power 100.54 W. This is one short optimized window; performance in other scenes has not been compared. Saving/exiting completed normally.
+
+`bda-cache-steady.tracy` captured 20.09 seconds. Only 1,204 BDA scans ran across graphics and compute, taking 0.710 seconds total. Compute alone called preparation 42,423 times; its inclusive preparation time fell to 0.381 seconds despite processing more frames. `EvaluateRuntimeSourcesImpl` became the largest remaining self-time scope: 10.951 seconds (54.5%) over 2,523,172 calls. This motivates the next shader-evaluation allocation experiment.
+
+Capping the evaluator's initial cache/recursion-stack reservations at 64/16 entries passed the resource tracking and materialization suites, but its first 29.40-second window measured only 6.1218 FPS. This did not beat the 6.3575 FPS BDA-only result. A follow-up experiment retains the cap while using a 4 KiB per-call temporary arena (with heap fallback) for separate normal/clean/active-mask evaluator containers; the two resource suites pass. Its first clean 29.42-second game window produced 222 presented frames: **7.5462 FPS**, with 12.941 CPU core equivalents and 20.63% mean GPU utilization. That is **79.2% above** the release baseline and **18.7% above** the BDA-only result. The longer 44.62-second confirmation produced 334 frames at **7.4853 FPS** (77.8% above baseline). The two clean windows support approximately **7.5 FPS / 78% improvement** in this scene. No shader resource values are shared between evaluations.
+
+The final `srt-pmr-steady.tracy` capture is **excluded from the stationary comparison**: the user moved the player, new shaders compiled, and a subsequent screenshot showed a different camera/position. It contains 6.282 seconds in compute pipeline creation and cannot provide a steady-state percentage for the final optimized build. The subsequent `srt-pmr-post-trace-clean` sample is also excluded despite its filename (3.9423 FPS across movement/compilation). The two earlier clean windows above are the reported comparison. Re-establish the same position/camera and allow compilation to settle before another comparison.
+
+The combined runtime binary SHA-256 is `8a7c7dd79b01b8d22ff8952d61e6e6d821d054b4ecaebd7a9bbb9c384bae0881`, with source snapshot `srt-pmr-source.patch`. Launch it using `Play Demon's Souls - performance.cmd` in the existing runtime directory. The prior working `kyty_emulator.exe` is preserved.
+
+## Reproducing a capture
+
+Build the vendored tools in a Visual Studio developer shell (matching Tracy versions is required):
+
+```powershell
+cmake -S 3rdparty/tracy/capture -B _Build/profiling-tools/capture -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build _Build/profiling-tools/capture --parallel 12
+cmake -S 3rdparty/tracy/csvexport -B _Build/profiling-tools/csvexport -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build _Build/profiling-tools/csvexport --parallel 12
+```
+
+Launch the experimental executable with the collision variables from the workaround document and `--profiler-direction Network`. Advance to the save, leave the camera unchanged, and wait for loading/compilation to finish. Capture from the source directory, choosing a new output path:
+
+```powershell
+& .\_Build\profiling-tools\capture\tracy-capture.exe -a 127.0.0.1 -p 8086 -s 20 -o capture.tracy
+& .\_Build\profiling-tools\csvexport\tracy-csvexport.exe -e capture.tracy > self.csv
+& .\_Build\profiling-tools\csvexport\tracy-csvexport.exe capture.tracy > total.csv
+```
+
+Disconnect the capture client for the independent FPS measurement. This investigation's local helper is `_Build/measure-des-performance.ps1 -ProcessId <pid> -OutputPrefix <new-prefix> -Seconds 30`; it saves raw samples, per-thread CPU totals, and a JSON summary. Keep builds and tests stopped throughout the measurement. The original save is backed up as `save-before` beside the trace files.

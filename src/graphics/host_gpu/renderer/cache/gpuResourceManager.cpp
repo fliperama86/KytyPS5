@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 namespace Libs::Graphics {
@@ -48,6 +49,7 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
+		++m_mapped_generation;
 	}
 }
 
@@ -67,6 +69,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		++m_mapped_generation;
 	};
 	if (m_gpu == nullptr) {
 		unmap();
@@ -77,10 +80,28 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void GpuResourceManager::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	const auto buffer_generation = m_buffer_cache.BdaGeneration();
+	const auto mapped_generation = m_mapped_generation;
+	if (!BdaScanRequired(buffer_generation, mapped_generation)) {
+		m_fault_process_pending = true;
+		return;
+	}
+	KYTY_PROFILER_BLOCK("GpuResourceManager::SynchronizeBdaBuffers");
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 	});
+	// Publish the generations captured before the scan. A concurrent buffer invalidation
+	// may have advanced the live generation while scanning and must force the next call
+	// to scan again.
+	m_last_bda_buffer_generation = buffer_generation;
+	m_last_bda_mapped_generation = mapped_generation;
 	m_fault_process_pending = true;
+}
+
+bool GpuResourceManager::BdaScanRequired(uint64_t buffer_generation,
+                                         uint64_t mapped_generation) const noexcept {
+	return buffer_generation != m_last_bda_buffer_generation ||
+	       mapped_generation != m_last_bda_mapped_generation;
 }
 
 void GpuResourceManager::RunGarbageCollector() {

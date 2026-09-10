@@ -94,6 +94,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
+	InvalidateBdaGeneration();
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
@@ -244,6 +245,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	InvalidateBdaGeneration();
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -289,6 +291,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	}
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		InvalidateBdaGeneration();
 	}
 }
 

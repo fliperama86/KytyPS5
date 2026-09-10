@@ -17,8 +17,13 @@ The uniform-fill detector accepts retained waits only when the shader has no LDS
 preserving image-clear recognition and LDS ordering. The filesystem test supplies
 its own SDL entry point so it can link on Windows.
 
-The Nexus observations below describe the earlier local build. The merged
-source has not yet been validated in a new game session.
+The merged source was subsequently validated in the Nexus on September 10, 2026.
+Full and lighter collision capture both loaded the same save and completed
+save/exit. See [the performance investigation](demons-souls-performance.md) for
+the measured baseline and current profiling results. The local BDA synchronization
+cache and shader temporary-allocation changes measured approximately 7.5 FPS
+versus 4.21 FPS in the same stationary Nexus scene; this performance build remains
+experimental and has not been released.
 
 The collision serialization experiment reached the Nexus on Windows with
 **PPSA01342, version 01.005.000**, using a character save exported from the owner's
@@ -64,12 +69,11 @@ At the opening cinematic, hold Cross for about four seconds. Choose Continue,
 then Continue Offline. Cross maps to J on the default keyboard layout. Initial
 level shader compilation can take several minutes.
 
-The successful executable predates the optional lighter capture mode now in this
-source. Setting `KYTY_DEBUG_DES_TOUCH_FULL_CAPTURE=1` retains the full tracing
-behavior; the current source has also been built with the lighter mode available.
-Omitting that variable while serialization is enabled removes three per-node
-probes and the initial list snapshots. That lighter mode has not been tested in
-the game, and no performance improvement is established.
+Setting `KYTY_DEBUG_DES_TOUCH_FULL_CAPTURE=1` retains the full tracing behavior.
+Setting it to `0` while serialization is enabled removes three per-node probes
+and the initial list snapshots. Both modes were tested in the Nexus on the merged
+source and measured approximately 4.21 FPS; no performance gain was established
+from disabling full capture.
 
 ## Collision failure and evidence
 

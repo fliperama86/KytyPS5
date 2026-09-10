@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <map>
 #include <span>
 #include <utility>
@@ -70,6 +71,9 @@ public:
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	[[nodiscard]] uint64_t BdaGeneration() const noexcept {
+		return m_bda_generation.load(std::memory_order_acquire);
+	}
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -108,6 +112,9 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	void InvalidateBdaGeneration() noexcept {
+		m_bda_generation.fetch_add(1, std::memory_order_release);
+	}
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -129,6 +136,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	std::atomic_uint64_t m_bda_generation {0};
 };
 
 } // namespace Libs::Graphics

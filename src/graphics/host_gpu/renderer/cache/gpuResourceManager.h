@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include <cstdint>
+#include <limits>
 #include <shared_mutex>
 
 namespace Libs::Graphics {
@@ -34,6 +35,9 @@ public:
 	void               RunGarbageCollector();
 
 private:
+	friend struct GpuResourceManagerTestAccess;
+	[[nodiscard]] bool BdaScanRequired(uint64_t buffer_generation,
+	                                   uint64_t mapped_generation) const noexcept;
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;
@@ -42,6 +46,9 @@ private:
 	RangeSet                  m_mapped_ranges;
 	GuestGpu*                 m_gpu = nullptr;
 	bool                      m_fault_process_pending = false;
+	uint64_t                  m_mapped_generation = 0;
+	uint64_t m_last_bda_buffer_generation = std::numeric_limits<uint64_t>::max();
+	uint64_t m_last_bda_mapped_generation = std::numeric_limits<uint64_t>::max();
 };
 
 } // namespace Libs::Graphics

@@ -1341,18 +1341,25 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 		uint32_t   mode      = buffer[2];
 
 		EXIT_NOT_IMPLEMENTED(args_addr == 0);
-		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
-			static std::atomic<uint32_t> sync_fallback_logs {0};
-			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
-				     " (image-owned range, reading guest memory)\n",
-				     args_addr);
+		{
+			KYTY_PROFILER_BLOCK("CpOpDispatchIndirect::SyncArguments");
+			if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
+			        args_addr, sizeof(DispatchIndirectArgs))) {
+				static std::atomic<uint32_t> sync_fallback_logs {0};
+				if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("DispatchIndirect: failed to synchronise indirect arguments at "
+					     "0x%016" PRIx64 " (image-owned range, reading guest memory)\n",
+					     args_addr);
+				}
 			}
 		}
 		DispatchIndirectArgs args {};
 		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
-		cp.DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode,
-		                  args_addr);
+		{
+			KYTY_PROFILER_BLOCK("CpOpDispatchIndirect::Dispatch");
+			cp.DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode,
+			                  args_addr);
+		}
 
 		return 3;
 	}

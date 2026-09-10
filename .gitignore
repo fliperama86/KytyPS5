@@ -4,5 +4,6 @@
 build/
 _Build/vscode-clang/
 _Build/
+_Runtime/
 cmake-build-debug/
 _PipelineCache/

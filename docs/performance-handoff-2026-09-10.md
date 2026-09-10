@@ -15,22 +15,22 @@ The user requested all project notes in the repository and then requested this h
 
 | Item | Location / value |
 | --- | --- |
-| Active fork source | `C:/Users/dudu/Projects/KytyPS5-DeS-1d6e23a` |
+| Project folder | `C:/Users/dudu/Projects/KytyPS5` (source, `_Build`, `_Runtime`) |
 | Branch | `demons-souls-workaround` |
 | HEAD at handoff | `fffb4cef55c9e537095093bb796ee4509e899c03` |
 | Fork remote | `fliperama86` ? `https://github.com/fliperama86/KytyPS5.git` |
 | Official remote | `origin` ? `https://github.com/KytyPS5/KytyPS5.git` |
 | TarkusR remote | `upstream` ? `https://github.com/TarkusR/KytyPS5.git` |
-| Single runtime folder | `E:/Emulation/PS5/KytyPS5` |
+| Runtime folder | `C:/Users/dudu/Projects/KytyPS5/_Runtime` |
 | Game | `E:/Emulation/PS5/Games/DemonsSouls-PPSA01342-dump` |
 | Title/version | `PPSA01342 / 01.005.000` |
 | Runtime save | `_SaveData/PPSA01342/SAVEDATA0PlayerProfile0/USR-DATA` |
-| Build tree | active source `_Build/windows` |
-| Current run record | active source `_Build/active-profile.json` |
+| Build tree | `_Build/windows`; dependencies in `_Build/deps` |
+| Current run record | `_Build/active-profile.json` |
 
-The environment's original working directory `C:/Users/dudu/Projects/KytyPS5` is an older official checkout at `0b4e78c`, with its own pre-existing `runtimeLinker.cpp` modification. **Do the current work in the active fork above.** Source checkouts were not consolidated because their build trees have absolute paths; the user's single-folder preference is honored for the emulator runtime.
+Everything except the game dump now lives in `C:/Users/dudu/Projects/KytyPS5`. It previously spanned three source checkouts plus a runtime folder on `E:`; the other two checkouts were linked git worktrees sharing this repository's object store, and are retired under `C:/Users/dudu/Projects/_retired` together with patches of the uncommitted work found in them. The emulation drive keeps only `E:/Emulation/PS5/Games/DemonsSouls-PPSA01342-dump`. Sections below and the notes in `docs/investigations/` were written before the consolidation and still quote the older paths.
 
-The BDA cache, evaluator arena, profiler zones and these documents are committed on `demons-souls-workaround`; the descriptor evaluation memo described below is a second commit on top. Nothing has been pushed. Preserve the unrelated modification in the older `C:/Users/dudu/Projects/KytyPS5` checkout.
+The BDA cache, evaluator arena, profiler zones and these documents are commit `dfd97b5`; the descriptor evaluation memo described below is `c3012c9` on top. Both are pushed to the `fliperama86` fork only, never to `origin` or `upstream`.
 
 ## Running build and user control
 

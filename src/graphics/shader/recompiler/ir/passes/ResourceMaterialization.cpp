@@ -1239,6 +1239,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+		// Number clones densely so runtime evaluation can memo by index instead of by pointer hash.
+		target.SetPlanIndex(plan.value_count++);
 		cloned.emplace(source, &target);
 		if (source->GetOpcode() == ValueOpcode::Phi) {
 			for (size_t index = 0; index < source->NumArgs(); index++) {

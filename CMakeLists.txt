@@ -441,6 +441,18 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_materialization_tests fmt::fmt)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
+# Developer microbenchmark for the per-draw SRT evaluation hot path. Not registered with CTest:
+# it reports timings rather than asserting behaviour.
+add_executable(srt_evaluator_bench EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SrtEvaluatorBench.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+)
+target_link_libraries(srt_evaluator_bench fmt::fmt)
+target_include_directories(srt_evaluator_bench PRIVATE ${inc_headers})
+
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"

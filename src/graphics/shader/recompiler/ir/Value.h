@@ -122,6 +122,13 @@ public:
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
 
+	// Dense position inside an extracted ResourcePlan's value storage. Runtime evaluation keys
+	// its memo table on this index instead of hashing the pointer; instructions that do not
+	// belong to a plan keep NoPlanIndex.
+	static constexpr uint32_t NoPlanIndex = UINT32_MAX;
+	[[nodiscard]] uint32_t    PlanIndex() const { return plan_index; }
+	void                      SetPlanIndex(uint32_t index) { plan_index = index; }
+
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
@@ -150,6 +157,7 @@ private:
 	void ClearArgs();
 
 	ValueOpcode         opcode;
+	uint32_t            plan_index = NoPlanIndex;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;

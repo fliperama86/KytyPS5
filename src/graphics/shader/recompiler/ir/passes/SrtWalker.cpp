@@ -543,14 +543,63 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+// Per-thread memo storage for runtime evaluation. Instructions of an extracted plan carry dense
+// indices, so results live in a flat array stamped with a per-evaluator epoch: no hashing, no
+// per-node allocation and no clearing between draws. Epochs are 64-bit and never wrap, so a stamp
+// left by an earlier evaluator can never be mistaken for a live one.
+class ValueMemo {
+public:
+	// stamp == epoch marks a memoized result; stamp == Busy(epoch) marks an evaluation in progress,
+	// which is how cycles are detected. Epochs stay below the busy bit, so the two never collide.
+	struct Slot {
+		uint64_t value = 0;
+		uint64_t stamp = 0;
+	};
+
+	static constexpr uint64_t BusyBit = uint64_t {1} << 63u;
+	static constexpr uint64_t Busy(uint64_t epoch) { return epoch | BusyBit; }
+
+	static ValueMemo& Thread() {
+		static thread_local ValueMemo memo;
+		return memo;
+	}
+
+	// Grows to the plan and hands out a private epoch. Nested evaluators of the same plan share the
+	// storage; distinct epochs keep their memoized values apart.
+	uint64_t Open(uint32_t count) {
+		if (m_slots.size() < count) {
+			m_slots.resize(count);
+		}
+		EXIT_IF(m_epoch >= BusyBit);
+		return ++m_epoch;
+	}
+
+	Slot& At(uint32_t index) { return m_slots[index]; }
+
+private:
+	std::vector<Slot> m_slots;
+	uint64_t          m_epoch = 0;
+};
+
+// Result buffers reused across draws. A successful evaluation swaps them into the caller's
+// vectors, which hands the caller's previous buffers back here for the next call, so the steady
+// state allocates nothing. Failure leaves the destinations untouched, preserving the transaction.
+struct SourceScratch {
+	std::vector<DescriptorValue> evaluated;
+	std::vector<uint32_t>        flattened;
+	std::vector<uint8_t>         active;
+	bool                         in_use = false;
+};
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::pmr::memory_resource* memory, std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr,
 	          Value active_mask = {})
 	    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
-	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()), m_cache(memory),
-	      m_visiting(memory) {}
+	      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+	      m_memo(ValueMemo::Thread()), m_epoch(m_memo.Open(program.value_count)),
+	      m_indexed_count(program.value_count), m_cache(memory), m_visiting(memory) {}
 
 	bool Evaluate(Value value, uint32_t& result) {
 		uint64_t wide = 0;
@@ -585,33 +634,65 @@ private:
 		if (inst == nullptr) {
 			return false;
 		}
-		if (!m_reserved) {
-			// Small descriptor expressions and nested active-mask evaluators often visit
-			// only a fraction of the plan. Grow on demand instead of allocating for the
-			// entire shader in every evaluator; the visiting stack tracks depth only.
-			m_cache.reserve(std::min<size_t>(m_program.value_storage.size(), 64));
-			m_visiting.reserve(std::min<size_t>(m_program.value_storage.size(), 16));
-			m_reserved = true;
-		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
+		const auto index = inst->PlanIndex();
+		if (index < m_indexed_count) {
+			return EvaluateIndexed(*inst, index, result);
+		}
+		return EvaluateMapped(*inst, result);
+	}
+
+	// Extracted plans number every instruction, so memoization and cycle detection are both direct
+	// array accesses.
+	bool EvaluateIndexed(const Inst& inst, uint32_t index, uint64_t& result) {
+		{
+			const auto& slot = m_memo.At(index);
+			if (slot.stamp == m_epoch) {
+				result = slot.value;
+				return true;
+			}
+			if (slot.stamp == ValueMemo::Busy(m_epoch)) {
+				return false;
+			}
+		}
+		m_memo.At(index).stamp = ValueMemo::Busy(m_epoch);
+		uint64_t out = 0;
+		const bool evaluated = EvaluateInst(inst, out);
+		// A nested evaluator may have grown the shared storage, so re-address the slot instead of
+		// holding a reference across the recursive call.
+		auto& slot = m_memo.At(index);
+		if (!evaluated) {
+			slot.stamp = 0;
+			return false;
+		}
+		slot.stamp = m_epoch;
+		slot.value = out;
+		result = out;
+		return true;
+	}
+
+	// Programs that were never extracted into a plan carry no dense indices; only unit fixtures
+	// evaluate those, so they keep the original pointer-keyed memo.
+	bool EvaluateMapped(const Inst& inst, uint64_t& result) {
+		const auto* key = &inst;
+		if (const auto found = m_cache.find(key); found != m_cache.end()) {
 			result = found->second;
 			return true;
 		}
-		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
+		if (std::ranges::find(m_visiting, key) != m_visiting.end()) {
 			return false;
 		}
-		m_visiting.push_back(inst);
+		m_visiting.push_back(key);
 		uint64_t out = 0;
-		const bool evaluated = EvaluateInst(*inst, out);
+		const bool evaluated = EvaluateInst(inst, out);
 		m_visiting.pop_back();
 		if (!evaluated) {
 			return false;
 		}
-		m_cache.emplace(inst, out);
+		m_cache.emplace(key, out);
 		result = out;
 		return true;
 	}
@@ -1080,9 +1161,11 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
+	ValueMemo&                                m_memo;
+	uint64_t                                  m_epoch = 0;
+	uint32_t                                  m_indexed_count = 0;
 	std::pmr::unordered_map<const Inst*, uint64_t> m_cache;
 	std::pmr::vector<const Inst*>                  m_visiting;
-	bool                                      m_reserved = false;
 };
 
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
@@ -1103,8 +1186,8 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	if (!program.srt_plan_complete) {
 		return false;
 	}
-	if (std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; }) &&
-	    runtime.read_specialization_memory == nullptr) {
+	if (runtime.read_specialization_memory == nullptr &&
+	    std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; })) {
 		return false;
 	}
 	SrtRuntime clean_runtime  = runtime;
@@ -1114,7 +1197,20 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	    evaluator_storage.data(), evaluator_storage.size(), std::pmr::new_delete_resource());
 	Evaluator clean_evaluator(program, clean_runtime, &evaluator_memory);
 	Evaluator evaluator(program, runtime, &evaluator_memory, clean_flat_slots, &clean_evaluator);
-	std::vector<uint8_t> active;
+	// Nested use cannot happen today (materialization calls this sequentially), but fall back to
+	// local buffers rather than aliasing the scratch if that ever changes.
+	static thread_local SourceScratch thread_scratch;
+	SourceScratch                     local_scratch;
+	const bool     reuse   = !thread_scratch.in_use;
+	SourceScratch& scratch = reuse ? thread_scratch : local_scratch;
+	scratch.in_use         = true;
+	const struct ScratchGuard {
+		SourceScratch& owned;
+		~ScratchGuard() { owned.in_use = false; }
+	} guard {scratch};
+
+	auto& active = scratch.active;
+	active.clear();
 	if (evaluate_flat) {
 		active.assign(program.descriptor_sources.size(), 1u);
 	}
@@ -1124,8 +1220,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 				active.at(source) = 0u;
 			}
 		}
-		std::vector<uint8_t>  visited(program.control_flow.size());
-		std::vector<uint32_t> pending {0};
+		std::pmr::vector<uint8_t>  visited(program.control_flow.size(), &evaluator_memory);
+		std::pmr::vector<uint32_t> pending(&evaluator_memory);
+		pending.push_back(0);
 		while (!pending.empty()) {
 			const auto index = pending.back();
 			pending.pop_back();
@@ -1147,7 +1244,8 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			}
 		}
 	}
-	std::vector<DescriptorValue> evaluated;
+	auto& evaluated = scratch.evaluated;
+	evaluated.clear();
 	evaluated.reserve(sources.size());
 	for (const auto source_index: sources) {
 		const auto* source = Source(program, source_index);
@@ -1165,7 +1263,8 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		}
 		evaluated.push_back(value);
 	}
-	std::vector<uint32_t> flattened;
+	auto& flattened = scratch.flattened;
+	flattened.clear();
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
@@ -1178,10 +1277,11 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			}
 		}
 	}
-	results = std::move(evaluated);
-	active_sources = std::move(active);
+	// Swapping rather than moving keeps the caller's old buffers alive in the scratch for reuse.
+	results.swap(evaluated);
+	active_sources.swap(active);
 	if (evaluate_flat) {
-		flat = std::move(flattened);
+		flat.swap(flattened);
 	}
 	return true;
 }

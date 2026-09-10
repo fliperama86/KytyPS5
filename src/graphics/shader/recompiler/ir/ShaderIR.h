@@ -528,6 +528,9 @@ struct ResourcePlan {
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
 	std::list<Inst>                     value_storage;
+	// Number of instructions in value_storage, each carrying its dense Inst::PlanIndex().
+	// Runtime evaluation sizes its memo table from this.
+	uint32_t                            value_count = 0;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;

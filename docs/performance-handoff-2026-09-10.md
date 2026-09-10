@@ -30,7 +30,7 @@ The user requested all project notes in the repository and then requested this h
 
 The environment's original working directory `C:/Users/dudu/Projects/KytyPS5` is an older official checkout at `0b4e78c`, with its own pre-existing `runtimeLinker.cpp` modification. **Do the current work in the active fork above.** Source checkouts were not consolidated because their build trees have absolute paths; the user's single-folder preference is honored for the emulator runtime.
 
-The source changes are uncommitted. Documentation is staged in Git; source/test/CMake changes are unstaged. No profiling changes have been pushed. Preserve this work and the unrelated older checkout modification.
+The BDA cache, evaluator arena, profiler zones and these documents are committed on `demons-souls-workaround`; the descriptor evaluation memo described below is a second commit on top. Nothing has been pushed. Preserve the unrelated modification in the older `C:/Users/dudu/Projects/KytyPS5` checkout.
 
 ## Running build and user control
 
@@ -118,9 +118,72 @@ The vendored tools are `_Build/profiling-tools/capture/tracy-capture.exe`, `csve
 
 For a fresh run, the user previously authorized automated navigation: Cross is J/VK74, hold about 4.5 seconds during the opening cinematic, then advance Press Any Button ? Continue ? Continue Offline with short Cross presses. The existing helper is `C:/Users/dudu/Projects/KytyPS5-DeS/_Build/des-window.ps1`; use `-Show` for reliable focused input and inspect screenshots. This does not authorize disrupting the user's current active play session.
 
+## Follow-up: descriptor evaluation memo
+
+`EvaluateRuntimeSourcesImpl` remained the largest zone after the arena change, at
+2,011,523 calls with a 3,135 ns self-time mean. The plan is walked once per shader stage
+per draw, so shader translation caching does not help it: only the per-call cost or the
+call count can move. Three changes reduce the per-call cost.
+
+- `Inst` carries a dense `PlanIndex()`, assigned to every clone in `ExtractResourcePlan`,
+  and `ResourcePlan::value_count` records the total.
+- The evaluator memo is a per-thread flat array addressed by that index and stamped with a
+  64-bit per-evaluator epoch, replacing `std::pmr::unordered_map`. No hashing, no per-node
+  allocation, no clearing between draws. The stamp's high bit marks an evaluation in
+  progress, which also makes cycle detection constant time. Programs never extracted into a
+  plan carry no index and keep the pointer-keyed map; only unit fixtures reach that path.
+- Descriptor, flat-SRT and active-source result buffers are reused per thread and swapped
+  into the caller's vectors on success, so the steady state allocates nothing while failure
+  still leaves every destination unchanged.
+
+`tests/SrtEvaluatorBench.cpp` builds target `srt_evaluator_bench`, deliberately not a CTest
+entry because it reports timings rather than asserting behaviour. Run
+`srt_evaluator_bench [--iterations=N] [--only=NAME] [--sweep]`. Its checksum is
+deterministic and is the regression signal for further evaluator work.
+
+| Shape | Flat slots | Before ns/call | After ns/call |
+| --- | --- | --- | --- |
+| `small-vs` | 8 | 841 | 531 |
+| `typical-ps` | 80 | 12045 | 7218 |
+| `heavy-ps` | 160 | 34739 | 21114 |
+| `chained-cs` | 64 | 9879 | 6200 |
+| `control-flow-ps` | 80 | 12138 | 7290 |
+| `waterfall-ps` | 80 | 12726 | 8062 |
+
+**These are synthetic-plan numbers and the change has never run in the emulator.** Do not
+quote a frame-rate figure for it until a stationary Nexus capture exists.
+
+### Corrections to the earlier analysis
+
+- Evaluation cost is linear, not superlinear: roughly 36 ns per SRT slot plus 21 ns per IR
+  instruction, flat across 40, 80 and 160 slots. An earlier reading of rising per-slot cost
+  came from comparing shapes whose per-slot instruction counts also differed.
+- `clean_flat_slots` is populated only for shaders with indirect images, so the clean reader
+  is hot only for bindless-heap shaders and resource control-flow conditions. Every other
+  raw read is a direct `memcpy` from guest memory.
+- `ReadShaderGuestMemory` reaches `TextureCache::IsRegionGpuModified`, which takes the
+  texture-cache mutex and runs a page-table region search for every four-byte word. That
+  cost is invisible in the traces because it is charged to `EvaluateRuntimeSourcesImpl` self
+  time.
+
 ## Next useful work
 
-1. Re-establish a controlled stationary scene on the combined build and capture after shaders settle. The final trace from this task was contaminated by user movement, so do not use it to rank the new steady-state bottlenecks.
-2. If resource evaluation remains dominant, investigate repeated instruction evaluation/hash lookup and nested active-mask evaluators. Preserve clean-reader semantics, per-call mutable guest descriptors, active masks, and transactional failure. Do not cache resource snapshots across draws without proven invalidation.
-3. Measure moving gameplay separately from cold shader compilation. The current dirty-build startup cache behavior is a separate issue from steady performance.
-4. Before a release, review/commit the local source and staged documentation, build the actual committed release binary, validate it, then package/publish through the existing workflow. No new release was requested or created during this profiling task.
+1. Capture a stationary Nexus benchmark for the evaluation memo. It is the only unmeasured
+   change on the branch, and the earlier final trace was contaminated by user movement and
+   cold shader compilation.
+2. The remaining evaluation cost is IR walking, about 21 ns per instruction across
+   `std::list<Inst>` nodes holding `std::vector` operands. Compiling the plan into a
+   contiguous instruction array at extraction time is the next structural step. Preserve
+   clean-reader semantics, per-call mutable guest descriptors, active masks and
+   transactional failure. Do not cache resource snapshots across draws without proven
+   invalidation.
+3. If bindless shaders prove hot, memoize the clean reader's GPU-dirty verdict per page for
+   the duration of one materialization instead of per four-byte word. Keep it conservative:
+   only a whole-page clean verdict may skip the per-word check, because a partially dirty
+   page must still be tested word by word.
+4. The disk Vulkan pipeline cache is disabled for dirty builds, so every fresh run
+   recompiles all 633 compute shaders. That is a startup cost separate from steady state,
+   and it contaminated the previous task's final capture.
+5. Measure moving gameplay separately from cold shader compilation.
+6. Before a release, build the actual committed release binary, validate it, then package
+   and publish through the existing workflow.

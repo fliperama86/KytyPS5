@@ -1309,6 +1309,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			                   plan.clean_flat_slots);
 		}
 	}
+	CompileSrtPlan(plan);
 	return plan;
 }
 

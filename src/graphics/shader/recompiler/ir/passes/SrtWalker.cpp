@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <fmt/format.h>
+#include <initializer_list>
 #include <memory_resource>
 #include <unordered_map>
 #include <unordered_set>
@@ -588,6 +589,9 @@ struct SourceScratch {
 	std::vector<DescriptorValue> evaluated;
 	std::vector<uint32_t>        flattened;
 	std::vector<uint8_t>         active;
+	// Control-flow walk state for the flat evaluator; the IR walker keeps its own on its arena.
+	std::vector<uint8_t>         visited;
+	std::vector<uint32_t>        pending;
 	bool                         in_use = false;
 };
 
@@ -1175,21 +1179,755 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	return &program.descriptor_sources[source];
 }
 
-bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uint32_t> sources,
-                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                                std::vector<uint32_t>& flat, bool evaluate_flat,
-                                std::span<const uint8_t> clean_flat_slots,
-                                std::vector<uint8_t>& active_sources) {
-#if defined(TRACY_ENABLE)
-	KYTY_PROFILER_BLOCK("EvaluateRuntimeSourcesImpl");
-#endif
-	if (!program.srt_plan_complete) {
+// Flat program -------------------------------------------------------------------------------
+//
+// The walk above is exact but pays per draw for work that depends only on the plan: resolving
+// identities, probing the memo, fetching operands out of std::vector and recursing. Extracted
+// plans are immutable, so FlatCompiler performs that walk once, at extraction, and records it as
+// a straight-line program that FlatMachine replays per draw. The lowering mirrors Evaluator step
+// for step, including the context a value is evaluated under (clean reader or not, active EXEC
+// mask), so values and failures agree with the walker. Anything the walker rejects structurally
+// (unsupported opcode, cycle, malformed operand) becomes a root that fails before running.
+
+constexpr uint32_t FlatFailed     = UINT32_MAX;
+constexpr uint32_t FlatUnassigned = UINT32_MAX - 1u;
+
+class FlatCompiler {
+public:
+	explicit FlatCompiler(ResourcePlan& plan): m_plan(plan) {}
+
+	void Run() {
+		auto& out       = m_plan.flat;
+		out             = {};
+		out.value_count = m_plan.value_count;
+		m_contexts.clear();
+		m_state.clear();
+		const auto normal = Context(false, {});
+		const auto clean  = Context(true, {});
+		EXIT_IF(normal != NormalContext || clean != CleanContext);
+
+		out.sources.resize(m_plan.descriptor_sources.size());
+		for (size_t index = 0; index < m_plan.descriptor_sources.size(); index++) {
+			const auto& source = m_plan.descriptor_sources[index];
+			auto&       root   = out.sources[index];
+			bool        ok     = source.dword_count <= root.results.size();
+			for (uint32_t dword = 0; ok && dword < source.dword_count; dword++) {
+				root.results[dword] = Flatten(source.dwords[dword], NormalContext);
+				ok                  = root.results[dword] != FlatFailed;
+			}
+			if (ok) {
+				Schedule(root, std::span<const uint32_t>(root.results).first(source.dword_count));
+			}
+		}
+		out.flat_reads.resize(m_plan.srt_reads.size());
+		out.clean_flat_reads.resize(m_plan.srt_reads.size());
+		for (size_t index = 0; index < m_plan.srt_reads.size(); index++) {
+			const auto& read = m_plan.srt_reads[index];
+			ValueRoot(out.flat_reads[index], read.value, NormalContext);
+			if (IsCleanSlot(read.flat_offset)) {
+				ValueRoot(out.clean_flat_reads[index], read.value, CleanContext);
+			}
+		}
+		out.conditions.resize(m_plan.control_flow.size());
+		for (size_t index = 0; index < m_plan.control_flow.size(); index++) {
+			const auto& condition = m_plan.control_flow[index].condition;
+			if (!condition.IsEmpty()) {
+				ValueRoot(out.conditions[index], condition, CleanContext);
+			}
+		}
+		const auto& fill = m_plan.uniform_fill;
+		for (uint32_t index = 0; index < fill.fill.words && index < out.uniform_values.size();
+		     index++) {
+			ValueRoot(out.uniform_values[index], fill.values[index], CleanContext);
+		}
+		out.compiled = m_supported;
+	}
+
+private:
+	static constexpr uint32_t NormalContext = 0;
+	static constexpr uint32_t CleanContext  = 1;
+
+	// Evaluation context. The clean context reads memory through the specialization reader and
+	// never routes ReadConst through the clean table; a non-empty mask is the active EXEC mask
+	// inside a ReadFirstLane, which short-circuits selects on that mask.
+	struct FlatContext {
+		bool  clean = false;
+		Value mask;
+	};
+
+	struct Slot {
+		uint32_t reg      = FlatUnassigned;
+		bool     visiting = false;
+	};
+
+	bool IsCleanSlot(uint32_t slot) const {
+		return slot < m_plan.clean_flat_slots.size() && m_plan.clean_flat_slots[slot] != 0u;
+	}
+
+	uint32_t Context(bool clean, Value mask) {
+		for (uint32_t index = 0; index < m_contexts.size(); index++) {
+			if (m_contexts[index].clean == clean && m_contexts[index].mask == mask) {
+				return index;
+			}
+		}
+		m_contexts.push_back({clean, mask});
+		m_state.emplace_back(m_plan.value_count);
+		return static_cast<uint32_t>(m_contexts.size() - 1u);
+	}
+
+	uint32_t Emit(SrtFlatOp op, std::initializer_list<uint32_t> args, uint64_t imm = 0,
+	              bool clean = false) {
+		SrtFlatInst inst;
+		inst.op    = op;
+		inst.imm   = imm;
+		inst.clean = clean ? 1u : 0u;
+		for (const auto arg: args) {
+			if (arg == FlatFailed) {
+				return FlatFailed;
+			}
+			inst.args[inst.arg_count++] = arg;
+		}
+		m_plan.flat.insts.push_back(inst);
+		return static_cast<uint32_t>(m_plan.flat.insts.size() - 1u);
+	}
+
+	uint32_t Imm(uint64_t bits) {
+		if (const auto found = m_immediates.find(bits); found != m_immediates.end()) {
+			return found->second;
+		}
+		const auto reg = Emit(SrtFlatOp::Imm, {}, bits);
+		m_immediates.emplace(bits, reg);
+		return reg;
+	}
+
+	void ValueRoot(SrtFlatValueRoot& root, Value value, uint32_t context) {
+		root.result = Flatten(value, context);
+		if (root.result != FlatFailed) {
+			Schedule(root, std::span<const uint32_t>(&root.result, 1));
+		}
+	}
+
+	// Lists the closure of the results in dependency order. Each root carries its whole closure,
+	// so callers may evaluate any subset of roots in any order.
+	void Schedule(SrtFlatRoot& root, std::span<const uint32_t> results) {
+		auto& out = m_plan.flat;
+		m_marks.resize(out.insts.size(), 0u);
+		m_mark_epoch++;
+		root.first = static_cast<uint32_t>(out.schedule.size());
+		for (const auto result: results) {
+			Visit(result);
+		}
+		root.count = static_cast<uint32_t>(out.schedule.size()) - root.first;
+		root.valid = true;
+	}
+
+	void Visit(uint32_t index) {
+		if (m_marks[index] == m_mark_epoch) {
+			return;
+		}
+		m_marks[index]   = m_mark_epoch;
+		const auto& inst = m_plan.flat.insts[index];
+		for (uint32_t arg = 0; arg < inst.arg_count; arg++) {
+			Visit(inst.args[arg]);
+		}
+		m_plan.flat.schedule.push_back(index);
+	}
+
+	uint32_t Arg(const Inst& inst, size_t index, uint32_t context) {
+		return index < inst.NumArgs() ? Flatten(inst.Arg(index), context) : FlatFailed;
+	}
+
+	uint32_t Flatten(Value value, uint32_t context) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			switch (value.GetType()) {
+				case Type::U1: return Imm(value.U1() ? 1u : 0u);
+				case Type::U8: return Imm(value.U8());
+				case Type::U16: return Imm(value.U16());
+				case Type::U32: return Imm(value.U32());
+				case Type::U64: return Imm(value.U64());
+				case Type::F32: return Imm(std::bit_cast<uint32_t>(value.F32Value()));
+				default: return FlatFailed;
+			}
+		}
+		auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return FlatFailed;
+		}
+		const auto op = inst->GetOpcode();
+		{
+			// Copied: nested contexts may grow m_contexts during the recursion below.
+			const auto mask = m_contexts[context].mask;
+			if (!mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
+			    inst->Arg(0).Resolve() == mask) {
+				return Flatten(inst->Arg(1), context);
+			}
+		}
+		const auto index = inst->PlanIndex();
+		if (index >= m_plan.value_count) {
+			// Only extracted plans number their instructions; anything else keeps the walker.
+			m_supported = false;
+			return FlatFailed;
+		}
+		{
+			const auto& slot = m_state[context][index];
+			if (slot.reg != FlatUnassigned) {
+				return slot.reg;
+			}
+			if (slot.visiting) {
+				// A cycle, which the walker detects through its busy stamp.
+				return FlatFailed;
+			}
+		}
+		m_state[context][index].visiting = true;
+		const auto reg = FlattenInst(*inst, context);
+		auto& slot     = m_state[context][index];
+		slot.visiting  = false;
+		slot.reg       = reg;
+		return reg;
+	}
+
+	uint32_t FlattenExtract(const Inst& inst, uint32_t context) {
+		if (inst.NumArgs() != 2) {
+			return FlatFailed;
+		}
+		const auto index = inst.Arg(1).Resolve();
+		if (!index.IsImmediate() || index.GetType() != Type::U32) {
+			return FlatFailed;
+		}
+		const auto component = index.U32();
+		if (component >= 2u) {
+			return FlatFailed;
+		}
+		if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
+			return Emit(SrtFlatOp::ExtractU64, {Arg(inst, 0, context)}, component);
+		}
+		const auto* source = inst.Arg(0).Resolve().TryInstruction();
+		if (source == nullptr) {
+			return FlatFailed;
+		}
+		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
+			return Arg(*source, component, context);
+		}
+		if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
+			const auto lhs = Arg(*source, 0, context);
+			if (lhs == FlatFailed) {
+				return FlatFailed;
+			}
+			return Emit(SrtFlatOp::AddCarry, {lhs, Arg(*source, 1, context)}, component);
+		}
+		return FlatFailed;
+	}
+
+	uint32_t FlattenRawRead(const Inst& inst, uint32_t context) {
+		const auto flags = inst.Flags<MemoryFlags>();
+		if (flags.index >= m_plan.memory_info.size() || inst.NumArgs() < 2) {
+			return FlatFailed;
+		}
+		const auto& mem    = m_plan.memory_info[flags.index];
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->NumArgs() < 2) {
+			return FlatFailed;
+		}
+		const auto low = Arg(*handle, 0, context);
+		if (low == FlatFailed) {
+			return FlatFailed;
+		}
+		const auto high = Arg(*handle, 1, context);
+		if (high == FlatFailed) {
+			return FlatFailed;
+		}
+		const auto offset = Arg(inst, 1, context);
+		if (offset == FlatFailed) {
+			return FlatFailed;
+		}
+		const bool clean     = m_contexts[context].clean;
+		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
+			if (handle->NumArgs() != 4u) {
+				return FlatFailed;
+			}
+			const auto records = Arg(*handle, 2, context);
+			if (records == FlatFailed) {
+				return FlatFailed;
+			}
+			// Word 3 is evaluated for its failure only; it is listed so its ops are scheduled.
+			const auto word3 = Arg(*handle, 3, context);
+			if (word3 == FlatFailed || immediate < 0) {
+				return FlatFailed;
+			}
+			return Emit(SrtFlatOp::ReadBuffer, {low, high, records, offset, word3},
+			            static_cast<uint64_t>(immediate), clean);
+		}
+		return Emit(SrtFlatOp::ReadAddress, {low, high, offset},
+		            std::bit_cast<uint64_t>(immediate), clean);
+	}
+
+	uint32_t FlattenInst(const Inst& inst, uint32_t context) {
+		const auto unary = [&](SrtFlatOp op) { return Emit(op, {Arg(inst, 0, context)}); };
+		const auto binary = [&](SrtFlatOp op) {
+			const auto a = Arg(inst, 0, context);
+			if (a == FlatFailed) {
+				return FlatFailed;
+			}
+			return Emit(op, {a, Arg(inst, 1, context)});
+		};
+		const auto ternary = [&](SrtFlatOp op) {
+			const auto a = Arg(inst, 0, context);
+			if (a == FlatFailed) {
+				return FlatFailed;
+			}
+			const auto b = Arg(inst, 1, context);
+			if (b == FlatFailed) {
+				return FlatFailed;
+			}
+			return Emit(op, {a, b, Arg(inst, 2, context)});
+		};
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::GetUserData: {
+				if (inst.NumArgs() != 1 || inst.Arg(0).GetType() != Type::ScalarReg) {
+					return FlatFailed;
+				}
+				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+				if (reg < m_plan.user_data_base) {
+					return FlatFailed;
+				}
+				return Emit(SrtFlatOp::UserData, {}, reg - m_plan.user_data_base);
+			}
+			case ValueOpcode::GetShaderBase: return Emit(SrtFlatOp::ShaderBase, {});
+			case ValueOpcode::Phi: {
+				const auto invariant =
+				    ResolveInvariantPhi(m_plan, Value(const_cast<Inst*>(&inst)));
+				return invariant.IsEmpty() ? FlatFailed : Flatten(invariant, context);
+			}
+			case ValueOpcode::ReadFirstLane: {
+				if (inst.NumArgs() != 2) {
+					return FlatFailed;
+				}
+				const auto nested = Context(m_contexts[context].clean, inst.Arg(1).Resolve());
+				return Flatten(inst.Arg(0), nested);
+			}
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32: return Arg(inst, 0, context);
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeExtractU32x2: return FlattenExtract(inst, context);
+			case ValueOpcode::CompositeConstructU64: return binary(SrtFlatOp::ConstructU64);
+			case ValueOpcode::ReadConst: {
+				if (inst.NumArgs() != 2) {
+					return FlatFailed;
+				}
+				const auto slot = inst.Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= m_plan.srt_reads.size()) {
+					return FlatFailed;
+				}
+				const bool routed = !m_contexts[context].clean && IsCleanSlot(slot.U32());
+				return Flatten(m_plan.srt_reads[slot.U32()].value,
+				               routed ? CleanContext : context);
+			}
+			case ValueOpcode::LoadAddressU32:
+			case ValueOpcode::ReadConstBuffer:
+				return IsRawRead(m_plan, inst) ? FlattenRawRead(inst, context) : FlatFailed;
+			case ValueOpcode::IAdd32: return binary(SrtFlatOp::IAdd32);
+			case ValueOpcode::IAdd64: return binary(SrtFlatOp::IAdd64);
+			case ValueOpcode::ISub32: return binary(SrtFlatOp::ISub32);
+			case ValueOpcode::ISub64: return binary(SrtFlatOp::ISub64);
+			case ValueOpcode::IMul32: return binary(SrtFlatOp::IMul32);
+			case ValueOpcode::IMul64: return binary(SrtFlatOp::IMul64);
+			case ValueOpcode::UMin32: return binary(SrtFlatOp::UMin32);
+			case ValueOpcode::ConvertF32U32: return unary(SrtFlatOp::ConvertF32U32);
+			case ValueOpcode::ConvertU32F32: return unary(SrtFlatOp::ConvertU32F32);
+			case ValueOpcode::FPMul32: return binary(SrtFlatOp::FPMul32);
+			case ValueOpcode::FPTrunc32: return unary(SrtFlatOp::FPTrunc32);
+			case ValueOpcode::FPIsNan32: return unary(SrtFlatOp::FPIsNan32);
+			case ValueOpcode::FPOrdLessThanEqual32: return binary(SrtFlatOp::FPOrdLessThanEqual32);
+			case ValueOpcode::FPOrdGreaterThanEqual32:
+				return binary(SrtFlatOp::FPOrdGreaterThanEqual32);
+			case ValueOpcode::BitwiseAnd32: return binary(SrtFlatOp::BitwiseAnd32);
+			case ValueOpcode::BitwiseAnd64: return binary(SrtFlatOp::BitwiseAnd64);
+			case ValueOpcode::BitwiseOr32: return binary(SrtFlatOp::BitwiseOr32);
+			case ValueOpcode::BitwiseXor32: return binary(SrtFlatOp::BitwiseXor32);
+			case ValueOpcode::BitwiseNot32: return unary(SrtFlatOp::BitwiseNot32);
+			case ValueOpcode::BitCount32: return unary(SrtFlatOp::BitCount32);
+			case ValueOpcode::FindILsb32: return unary(SrtFlatOp::FindILsb32);
+			case ValueOpcode::FindUMsb32: return unary(SrtFlatOp::FindUMsb32);
+			case ValueOpcode::ShiftLeftLogical32: return binary(SrtFlatOp::ShiftLeftLogical32);
+			case ValueOpcode::ShiftLeftLogical64: return binary(SrtFlatOp::ShiftLeftLogical64);
+			case ValueOpcode::ShiftRightLogical32: return binary(SrtFlatOp::ShiftRightLogical32);
+			case ValueOpcode::ShiftRightLogical64: return binary(SrtFlatOp::ShiftRightLogical64);
+			case ValueOpcode::ShiftRightArithmetic32:
+				return binary(SrtFlatOp::ShiftRightArithmetic32);
+			case ValueOpcode::ShiftRightArithmetic64:
+				return binary(SrtFlatOp::ShiftRightArithmetic64);
+			case ValueOpcode::BitFieldUExtract: return ternary(SrtFlatOp::BitFieldUExtract);
+			case ValueOpcode::BitFieldSExtract: return ternary(SrtFlatOp::BitFieldSExtract);
+			case ValueOpcode::BitFieldInsert: {
+				const auto a = Arg(inst, 0, context);
+				if (a == FlatFailed) {
+					return FlatFailed;
+				}
+				const auto b = Arg(inst, 1, context);
+				if (b == FlatFailed) {
+					return FlatFailed;
+				}
+				const auto c = Arg(inst, 2, context);
+				if (c == FlatFailed) {
+					return FlatFailed;
+				}
+				return Emit(SrtFlatOp::BitFieldInsert, {a, b, c, Arg(inst, 3, context)});
+			}
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectF32: return ternary(SrtFlatOp::Select);
+			case ValueOpcode::IEqual32: return binary(SrtFlatOp::IEqual32);
+			case ValueOpcode::INotEqual32: return binary(SrtFlatOp::INotEqual32);
+			case ValueOpcode::ULessThan32: return binary(SrtFlatOp::ULessThan32);
+			case ValueOpcode::UGreaterThan32: return binary(SrtFlatOp::UGreaterThan32);
+			case ValueOpcode::LogicalAnd: return binary(SrtFlatOp::LogicalAnd);
+			case ValueOpcode::LogicalOr: return binary(SrtFlatOp::LogicalOr);
+			case ValueOpcode::LogicalXor: return binary(SrtFlatOp::LogicalXor);
+			case ValueOpcode::LogicalNot: return unary(SrtFlatOp::LogicalNot);
+			default: return FlatFailed;
+		}
+	}
+
+	ResourcePlan&                          m_plan;
+	std::vector<FlatContext>               m_contexts;
+	std::vector<std::vector<Slot>>         m_state;
+	std::unordered_map<uint64_t, uint32_t> m_immediates;
+	std::vector<uint32_t>                  m_marks;
+	uint32_t                               m_mark_epoch = 0;
+	bool                                   m_supported  = true;
+};
+
+// Per-thread register file for FlatMachine. Registers are stamped with the epoch of the run that
+// wrote them, so nothing is cleared between draws and the file only grows to the largest plan.
+struct FlatRegisters {
+	std::vector<uint64_t> values;
+	std::vector<uint64_t> stamps;
+	uint64_t              epoch  = 0;
+	bool                  in_use = false;
+
+	static FlatRegisters& Thread() {
+		static thread_local FlatRegisters registers;
+		return registers;
+	}
+};
+
+class FlatMachine {
+public:
+	FlatMachine(const SrtFlatProgram& program, const SrtRuntime& runtime, FlatRegisters& registers)
+	    : m_program(program), m_runtime(runtime) {
+		const auto count = program.insts.size();
+		if (registers.values.size() < count) {
+			registers.values.resize(count);
+			registers.stamps.resize(count);
+		}
+		EXIT_IF(registers.epoch == UINT64_MAX);
+		m_epoch  = ++registers.epoch;
+		m_values = registers.values.data();
+		m_stamps = registers.stamps.data();
+	}
+
+	[[nodiscard]] uint32_t Result(uint32_t reg) const { return static_cast<uint32_t>(m_values[reg]); }
+
+	// Computes every register the root needs. Registers already produced in this run are skipped,
+	// so shared work between roots is done once; a failure leaves earlier registers valid.
+	bool Run(const SrtFlatRoot& root) {
+		if (!root.valid) {
+			return false;
+		}
+		const auto* schedule = m_program.schedule.data() + root.first;
+		for (uint32_t step = 0; step < root.count; step++) {
+			const auto index = schedule[step];
+			if (m_stamps[index] == m_epoch) {
+				continue;
+			}
+			uint64_t result = 0;
+			if (!Execute(m_program.insts[index], result)) {
+				return false;
+			}
+			m_values[index] = result;
+			m_stamps[index] = m_epoch;
+		}
+		return true;
+	}
+
+private:
+	static float Float32(uint64_t bits) {
+		return std::bit_cast<float>(static_cast<uint32_t>(bits));
+	}
+
+	static uint64_t Float32Bits(float value) { return std::bit_cast<uint32_t>(value); }
+
+	bool Read(const SrtFlatInst& inst, uint64_t address, uint64_t& result) const {
+		uint32_t word = 0;
+		if (inst.clean != 0u) {
+			if (m_runtime.read_specialization_memory == nullptr ||
+			    !m_runtime.read_specialization_memory(m_runtime.userdata, address, &word)) {
+				return false;
+			}
+		} else if (m_runtime.read_memory != nullptr) {
+			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
+				return false;
+			}
+		} else {
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		}
+		result = word;
+		return true;
+	}
+
+	bool Execute(const SrtFlatInst& inst, uint64_t& result) const {
+		const auto arg = [&](size_t index) { return m_values[inst.args[index]]; };
+		switch (inst.op) {
+			case SrtFlatOp::Imm: result = inst.imm; return true;
+			case SrtFlatOp::UserData:
+				if (inst.imm >= m_runtime.user_data.size()) {
+					return false;
+				}
+				result = m_runtime.user_data[inst.imm];
+				return true;
+			case SrtFlatOp::ShaderBase: result = m_runtime.shader_base; return true;
+			case SrtFlatOp::ReadAddress: {
+				const auto low       = arg(0);
+				const auto high      = arg(1);
+				const auto offset    = arg(2);
+				const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+				const auto immediate = static_cast<int64_t>(inst.imm);
+				const auto relative  = (immediate & ~int64_t {3}) +
+				                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+				uint64_t address = 0;
+				if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+					return false;
+				}
+				return Read(inst, address, result);
+			}
+			case SrtFlatOp::ReadBuffer: {
+				const auto low         = arg(0);
+				const auto high        = arg(1);
+				const auto records     = arg(2);
+				const auto offset      = arg(3);
+				const auto base        = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+				const auto byte_offset = inst.imm + static_cast<uint32_t>(offset);
+				const auto aligned     = byte_offset & ~uint64_t {3};
+				const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+				const auto size        = stride == 0u
+				                             ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+				                             : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+				if (aligned > size || size - aligned < sizeof(uint32_t)) {
+					return false;
+				}
+				const auto address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+				return Read(inst, address, result);
+			}
+			case SrtFlatOp::ExtractU64:
+				result = static_cast<uint32_t>(arg(0) >> (inst.imm * 32u));
+				return true;
+			case SrtFlatOp::AddCarry: {
+				const auto sum = static_cast<uint64_t>(static_cast<uint32_t>(arg(0))) +
+				                 static_cast<uint32_t>(arg(1));
+				result = inst.imm == 0u ? static_cast<uint32_t>(sum)
+				                        : static_cast<uint32_t>(sum >> 32u);
+				return true;
+			}
+			case SrtFlatOp::ConstructU64:
+				result = static_cast<uint32_t>(arg(0)) |
+				         (static_cast<uint64_t>(static_cast<uint32_t>(arg(1))) << 32u);
+				return true;
+			case SrtFlatOp::IAdd32: result = static_cast<uint32_t>(arg(0) + arg(1)); return true;
+			case SrtFlatOp::IAdd64: result = arg(0) + arg(1); return true;
+			case SrtFlatOp::ISub32: result = static_cast<uint32_t>(arg(0) - arg(1)); return true;
+			case SrtFlatOp::ISub64: result = arg(0) - arg(1); return true;
+			case SrtFlatOp::IMul32: result = static_cast<uint32_t>(arg(0) * arg(1)); return true;
+			case SrtFlatOp::IMul64: result = arg(0) * arg(1); return true;
+			case SrtFlatOp::UMin32:
+				result = std::min(static_cast<uint32_t>(arg(0)), static_cast<uint32_t>(arg(1)));
+				return true;
+			case SrtFlatOp::ConvertF32U32:
+				result = Float32Bits(static_cast<float>(static_cast<uint32_t>(arg(0))));
+				return true;
+			case SrtFlatOp::ConvertU32F32: {
+				const auto value = Float32(arg(0));
+				if (!std::isfinite(value) || value < 0.0f ||
+				    static_cast<double>(value) > UINT32_MAX) {
+					return false;
+				}
+				result = static_cast<uint32_t>(value);
+				return true;
+			}
+			case SrtFlatOp::FPMul32:
+				result = Float32Bits(Float32(arg(0)) * Float32(arg(1)));
+				return true;
+			case SrtFlatOp::FPTrunc32: result = Float32Bits(std::trunc(Float32(arg(0)))); return true;
+			case SrtFlatOp::FPIsNan32: result = std::isnan(Float32(arg(0))) ? 1u : 0u; return true;
+			case SrtFlatOp::FPOrdLessThanEqual32:
+				result = Float32(arg(0)) <= Float32(arg(1)) ? 1u : 0u;
+				return true;
+			case SrtFlatOp::FPOrdGreaterThanEqual32:
+				result = Float32(arg(0)) >= Float32(arg(1)) ? 1u : 0u;
+				return true;
+			case SrtFlatOp::BitwiseAnd32: result = static_cast<uint32_t>(arg(0) & arg(1)); return true;
+			case SrtFlatOp::BitwiseAnd64: result = arg(0) & arg(1); return true;
+			case SrtFlatOp::BitwiseOr32: result = static_cast<uint32_t>(arg(0) | arg(1)); return true;
+			case SrtFlatOp::BitwiseXor32: result = static_cast<uint32_t>(arg(0) ^ arg(1)); return true;
+			case SrtFlatOp::BitwiseNot32: result = ~static_cast<uint32_t>(arg(0)); return true;
+			case SrtFlatOp::BitCount32:
+				result = static_cast<uint32_t>(std::popcount(static_cast<uint32_t>(arg(0))));
+				return true;
+			case SrtFlatOp::FindILsb32: {
+				const auto bits = static_cast<uint32_t>(arg(0));
+				result = bits == 0u ? UINT32_MAX : static_cast<uint32_t>(std::countr_zero(bits));
+				return true;
+			}
+			case SrtFlatOp::FindUMsb32: {
+				const auto bits = static_cast<uint32_t>(arg(0));
+				result          = bits == 0u ? UINT32_MAX
+				                             : static_cast<uint32_t>(31 - std::countl_zero(bits));
+				return true;
+			}
+			case SrtFlatOp::ShiftLeftLogical32:
+				result = static_cast<uint32_t>(arg(0)) << (arg(1) & 31u);
+				return true;
+			case SrtFlatOp::ShiftLeftLogical64: result = arg(0) << (arg(1) & 63u); return true;
+			case SrtFlatOp::ShiftRightLogical32:
+				result = static_cast<uint32_t>(arg(0)) >> (arg(1) & 31u);
+				return true;
+			case SrtFlatOp::ShiftRightLogical64: result = arg(0) >> (arg(1) & 63u); return true;
+			case SrtFlatOp::ShiftRightArithmetic32:
+				result = static_cast<uint32_t>(
+				    std::bit_cast<int32_t>(static_cast<uint32_t>(arg(0))) >> (arg(1) & 31u));
+				return true;
+			case SrtFlatOp::ShiftRightArithmetic64:
+				result = static_cast<uint64_t>(std::bit_cast<int64_t>(arg(0)) >> (arg(1) & 63u));
+				return true;
+			case SrtFlatOp::BitFieldUExtract: {
+				const auto offset = static_cast<uint32_t>(arg(1));
+				const auto width  = static_cast<uint32_t>(arg(2));
+				if (offset > 32u || width > 32u - offset) {
+					return false;
+				}
+				const auto mask = width == 32u  ? UINT32_MAX
+				                  : width == 0u ? 0u
+				                                : (uint32_t {1} << width) - 1u;
+				result = width == 0u ? 0u : (static_cast<uint32_t>(arg(0)) >> offset) & mask;
+				return true;
+			}
+			case SrtFlatOp::BitFieldSExtract: {
+				const auto offset = static_cast<uint32_t>(arg(1));
+				const auto width  = static_cast<uint32_t>(arg(2));
+				if (offset > 32u || width > 32u - offset) {
+					return false;
+				}
+				if (width == 0u) {
+					result = 0;
+					return true;
+				}
+				const auto mask = width == 32u ? UINT32_MAX : (uint32_t {1} << width) - 1u;
+				auto       bits = (static_cast<uint32_t>(arg(0)) >> offset) & mask;
+				if (width < 32u && (bits & (uint32_t {1} << (width - 1u))) != 0u) {
+					bits |= ~mask;
+				}
+				result = bits;
+				return true;
+			}
+			case SrtFlatOp::BitFieldInsert: {
+				const auto offset = static_cast<uint32_t>(arg(2));
+				const auto width  = static_cast<uint32_t>(arg(3));
+				if (offset > 32u || width > 32u - offset) {
+					return false;
+				}
+				if (width == 0u) {
+					result = static_cast<uint32_t>(arg(0));
+					return true;
+				}
+				const auto mask =
+				    width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
+				result = (static_cast<uint32_t>(arg(0)) & ~mask) |
+				         ((static_cast<uint32_t>(arg(1)) << offset) & mask);
+				return true;
+			}
+			case SrtFlatOp::Select: result = arg(0) != 0u ? arg(1) : arg(2); return true;
+			case SrtFlatOp::IEqual32:
+				result = static_cast<uint32_t>(arg(0)) == static_cast<uint32_t>(arg(1)) ? 1u : 0u;
+				return true;
+			case SrtFlatOp::INotEqual32:
+				result = static_cast<uint32_t>(arg(0)) != static_cast<uint32_t>(arg(1)) ? 1u : 0u;
+				return true;
+			case SrtFlatOp::ULessThan32:
+				result = static_cast<uint32_t>(arg(0)) < static_cast<uint32_t>(arg(1)) ? 1u : 0u;
+				return true;
+			case SrtFlatOp::UGreaterThan32:
+				result = static_cast<uint32_t>(arg(0)) > static_cast<uint32_t>(arg(1)) ? 1u : 0u;
+				return true;
+			case SrtFlatOp::LogicalAnd: result = (arg(0) != 0u) && (arg(1) != 0u) ? 1u : 0u; return true;
+			case SrtFlatOp::LogicalOr: result = (arg(0) != 0u) || (arg(1) != 0u) ? 1u : 0u; return true;
+			case SrtFlatOp::LogicalXor: result = (arg(0) != 0u) != (arg(1) != 0u) ? 1u : 0u; return true;
+			case SrtFlatOp::LogicalNot: result = arg(0) == 0u ? 1u : 0u; return true;
+		}
 		return false;
 	}
-	if (runtime.read_specialization_memory == nullptr &&
-	    std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; })) {
+
+	const SrtFlatProgram& m_program;
+	const SrtRuntime&     m_runtime;
+	uint64_t*             m_values = nullptr;
+	uint64_t*             m_stamps = nullptr;
+	uint64_t              m_epoch  = 0;
+};
+
+// The compiled normal context routes ReadConst through the plan's own clean table, so a caller
+// asking for a different clean set must take the walker.
+bool SameCleanSet(std::span<const uint8_t> requested, std::span<const uint8_t> compiled) {
+	const auto count = std::max(requested.size(), compiled.size());
+	for (size_t index = 0; index < count; index++) {
+		const bool wanted = index < requested.size() && requested[index] != 0u;
+		const bool have   = index < compiled.size() && compiled[index] != 0u;
+		if (wanted != have) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool FlatPlanUsable(const ResourcePlan& program, std::span<const uint8_t> clean_flat_slots) {
+	const auto& flat = program.flat;
+	return flat.compiled && flat.value_count == program.value_count &&
+	       flat.sources.size() == program.descriptor_sources.size() &&
+	       flat.flat_reads.size() == program.srt_reads.size() &&
+	       flat.conditions.size() == program.control_flow.size() &&
+	       SameCleanSet(clean_flat_slots, program.clean_flat_slots);
+}
+
+bool FlatUniformValuesUsable(const ResourcePlan& program, std::span<const Value> values) {
+	const auto& flat = program.flat;
+	const auto& fill = program.uniform_fill;
+	if (!flat.compiled || flat.value_count != program.value_count ||
+	    values.size() > fill.fill.words || values.size() > flat.uniform_values.size()) {
 		return false;
 	}
+	for (size_t index = 0; index < values.size(); index++) {
+		if (!(values[index] == fill.values[index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+struct FlatRegistersLease {
+	FlatRegisters  local;
+	FlatRegisters& registers;
+
+	FlatRegistersLease(): registers(FlatRegisters::Thread().in_use ? local : FlatRegisters::Thread()) {
+		registers.in_use = true;
+	}
+	~FlatRegistersLease() { registers.in_use = false; }
+	FlatRegistersLease(const FlatRegistersLease&)            = delete;
+	FlatRegistersLease& operator=(const FlatRegistersLease&) = delete;
+};
+
+bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> sources,
+                        const SrtRuntime& runtime, bool evaluate_flat,
+                        std::span<const uint8_t> clean_flat_slots, SourceScratch& scratch) {
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
 	std::array<std::byte, 4096> evaluator_storage;
@@ -1197,17 +1935,6 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	    evaluator_storage.data(), evaluator_storage.size(), std::pmr::new_delete_resource());
 	Evaluator clean_evaluator(program, clean_runtime, &evaluator_memory);
 	Evaluator evaluator(program, runtime, &evaluator_memory, clean_flat_slots, &clean_evaluator);
-	// Nested use cannot happen today (materialization calls this sequentially), but fall back to
-	// local buffers rather than aliasing the scratch if that ever changes.
-	static thread_local SourceScratch thread_scratch;
-	SourceScratch                     local_scratch;
-	const bool     reuse   = !thread_scratch.in_use;
-	SourceScratch& scratch = reuse ? thread_scratch : local_scratch;
-	scratch.in_use         = true;
-	const struct ScratchGuard {
-		SourceScratch& owned;
-		~ScratchGuard() { owned.in_use = false; }
-	} guard {scratch};
 
 	auto& active = scratch.active;
 	active.clear();
@@ -1277,11 +2004,135 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 			}
 		}
 	}
-	// Swapping rather than moving keeps the caller's old buffers alive in the scratch for reuse.
-	results.swap(evaluated);
-	active_sources.swap(active);
+	return true;
+}
+
+// Same contract as EvaluateWithWalker over the compiled program: same activity walk, same
+// per-source and per-slot evaluation order, same transactional failure.
+bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32_t> sources,
+                             const SrtRuntime& runtime, bool evaluate_flat,
+                             std::span<const uint8_t> clean_flat_slots, SourceScratch& scratch) {
+	const auto&        flat = program.flat;
+	FlatRegistersLease lease;
+	FlatMachine        machine(flat, runtime, lease.registers);
+
+	auto& active = scratch.active;
+	active.clear();
 	if (evaluate_flat) {
-		flat.swap(flattened);
+		active.assign(program.descriptor_sources.size(), 1u);
+	}
+	if (evaluate_flat && !program.control_flow.empty()) {
+		for (const auto& block: program.control_flow) {
+			for (const auto source: block.sources) {
+				active.at(source) = 0u;
+			}
+		}
+		auto& visited = scratch.visited;
+		auto& pending = scratch.pending;
+		visited.assign(program.control_flow.size(), 0u);
+		pending.clear();
+		pending.push_back(0);
+		while (!pending.empty()) {
+			const auto index = pending.back();
+			pending.pop_back();
+			if (visited.at(index)) {
+				continue;
+			}
+			visited[index]    = 1u;
+			const auto& block = program.control_flow[index];
+			for (const auto source: block.sources) {
+				active[source] = 1u;
+			}
+			const auto& condition = flat.conditions[index];
+			if (!block.condition.IsEmpty() && runtime.read_specialization_memory != nullptr &&
+			    machine.Run(condition)) {
+				const auto taken = machine.Result(condition.result) != 0u;
+				pending.push_back(block.successors[taken ? 0u : 1u]);
+			} else {
+				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+			}
+		}
+	}
+	auto& evaluated = scratch.evaluated;
+	evaluated.clear();
+	evaluated.reserve(sources.size());
+	for (const auto source_index: sources) {
+		const auto* source = Source(program, source_index);
+		if (source == nullptr) {
+			return false;
+		}
+		DescriptorValue value;
+		value.dword_count = source->dword_count;
+		if (!evaluate_flat || active[source_index]) {
+			const auto& root = flat.sources[source_index];
+			if (!machine.Run(root)) {
+				return false;
+			}
+			for (uint32_t index = 0; index < source->dword_count; index++) {
+				value.dwords[index] = machine.Result(root.results[index]);
+			}
+		}
+		evaluated.push_back(value);
+	}
+	auto& flattened = scratch.flattened;
+	flattened.clear();
+	if (evaluate_flat) {
+		flattened.resize(program.srt_reads.size());
+		for (size_t index = 0; index < program.srt_reads.size(); index++) {
+			const auto& read  = program.srt_reads[index];
+			const bool  clean = read.flat_offset < clean_flat_slots.size() &&
+			                   clean_flat_slots[read.flat_offset] != 0u;
+			const auto& root = clean ? flat.clean_flat_reads[index] : flat.flat_reads[index];
+			if (read.flat_offset >= flattened.size() || !machine.Run(root)) {
+				return false;
+			}
+			flattened[read.flat_offset] = machine.Result(root.result);
+		}
+	}
+	return true;
+}
+
+bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uint32_t> sources,
+                                const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
+                                std::vector<uint32_t>& flat, bool evaluate_flat,
+                                std::span<const uint8_t> clean_flat_slots,
+                                std::vector<uint8_t>& active_sources) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("EvaluateRuntimeSourcesImpl");
+#endif
+	if (!program.srt_plan_complete) {
+		return false;
+	}
+	if (runtime.read_specialization_memory == nullptr &&
+	    std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; })) {
+		return false;
+	}
+	// Nested use cannot happen today (materialization calls this sequentially), but fall back to
+	// local buffers rather than aliasing the scratch if that ever changes.
+	static thread_local SourceScratch thread_scratch;
+	SourceScratch                     local_scratch;
+	const bool     reuse   = !thread_scratch.in_use;
+	SourceScratch& scratch = reuse ? thread_scratch : local_scratch;
+	scratch.in_use         = true;
+	const struct ScratchGuard {
+		SourceScratch& owned;
+		~ScratchGuard() { owned.in_use = false; }
+	} guard {scratch};
+
+	const bool evaluated =
+	    FlatPlanUsable(program, clean_flat_slots)
+	        ? EvaluateWithFlatProgram(program, sources, runtime, evaluate_flat, clean_flat_slots,
+	                                  scratch)
+	        : EvaluateWithWalker(program, sources, runtime, evaluate_flat, clean_flat_slots,
+	                             scratch);
+	if (!evaluated) {
+		return false;
+	}
+	// Swapping rather than moving keeps the caller's old buffers alive in the scratch for reuse.
+	results.swap(scratch.evaluated);
+	active_sources.swap(scratch.active);
+	if (evaluate_flat) {
+		flat.swap(scratch.flattened);
 	}
 	return true;
 }
@@ -1309,6 +2160,10 @@ void BuildSrtPlan(Program& program) {
 	program.srt_plan_complete = true;
 }
 
+void CompileSrtPlan(ResourcePlan& program) {
+	FlatCompiler(program).Run();
+}
+
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
                             const SrtRuntime& runtime, std::span<uint32_t> results) {
 #if defined(TRACY_ENABLE)
@@ -1321,6 +2176,18 @@ bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> v
 	clean.read_memory = runtime.read_specialization_memory != nullptr
 	                        ? runtime.read_specialization_memory
 	                        : +[](void*, uint64_t, uint32_t*) { return false; };
+	if (FlatUniformValuesUsable(program, values)) {
+		FlatRegistersLease lease;
+		FlatMachine        machine(program.flat, clean, lease.registers);
+		for (size_t i = 0; i < values.size(); ++i) {
+			const auto& root = program.flat.uniform_values[i];
+			if (!machine.Run(root)) {
+				return false;
+			}
+			results[i] = machine.Result(root.result);
+		}
+		return true;
+	}
 	std::array<std::byte, 4096> evaluator_storage;
 	std::pmr::monotonic_buffer_resource evaluator_memory(
 	    evaluator_storage.data(), evaluator_storage.size(), std::pmr::new_delete_resource());

@@ -51,6 +51,11 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
              std::vector<uint32_t>& flat);
 
+// Lowers the plan's runtime values into ResourcePlan::flat. Call once the plan is final: every
+// descriptor source, SRT read, control-flow condition and uniform-fill value is compiled against
+// the plan's current shape, and evaluation falls back to the IR walker if that shape changes.
+void CompileSrtPlan(ResourcePlan& program);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SRTWALKER_H_ */

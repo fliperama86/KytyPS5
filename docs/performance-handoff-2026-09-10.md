@@ -7,6 +7,10 @@ Two implemented optimizations raised the measured stationary Nexus result from *
 1. Cache completed BDA buffer synchronization until CPU dirtiness, cached-buffer topology, or mapped ranges change.
 2. Use a per-call temporary memory arena for shader resource evaluators, preserving distinct normal, clean, and active-mask caches.
 
+Three follow-ups documented at the end of this file (evaluation memo, pooled bindings, flat SRT
+program) took the same scene to **10.20 FPS**, about 2.4x the starting point. Steady state at each
+step: 4.21, 6.36 (BDA cache), 7.55 (arena), 7.88 (memo), 8.20 (pooling), 10.20 (flat program).
+
 Both changes are built and tested. The experimental executable is running. This is a local experimental build, not a new published release. It remains slow, and the results do not establish performance in other areas or broad game stability.
 
 The user requested all project notes in the repository and then requested this handoff. Ten authored documents were moved out of ignored build/old-checkout/runtime folders into `docs/`. Use [the documentation index](README.md) and [the performance report](demons-souls-performance.md). Add future notes here.
@@ -170,25 +174,97 @@ is preserved in the runtime folder if a controlled comparison is wanted.
   cost is invisible in the traces because it is charged to `EvaluateRuntimeSourcesImpl` self
   time.
 
+## Follow-up: pooled bindings
+
+Commit `956b062`. `RenderExecutor::PrepareBindings` used to return a fresh `PreparedBindings` by
+value for every draw and every stage; each owned five vectors plus a `mip_views` vector per texture
+binding, which the whole-process profile had put at about 3% of samples in heap traffic. The
+executor now keeps one object per stage (`m_vertex_bindings`, `m_pixel_bindings`,
+`m_compute_bindings`) and fills it in place through `PreparedBindings::Reset`, which clears every
+container while retaining capacity, so the steady state allocates nothing. `GraphicsBindings` hands
+out pointers to the pooled objects.
+
+Measured on the parked Nexus scene: **8.1998 FPS against the 7.8826 FPS memo build, about 4%**
+(`pooled-check/pooled-steady-clean.json`). The runs are from different sessions, not a back-to-back
+A/B.
+
+`tests/ShaderRecompilerComputeTests.cpp` was left calling the old by-value API by that commit and
+did not build until the flat-program work below adapted it; all its cases pass again.
+
+## Follow-up: flat SRT program
+
+The evaluator memo had removed hashing and allocation, but each value still cost a `Resolve`, a
+memo probe, a `std::vector` operand fetch and a recursive call, about 21 ns per IR instruction. That
+work depends only on the plan, and extracted plans are immutable, so it now happens once.
+
+- `graphics/shader/recompiler/ir/SrtFlatProgram.h` defines `SrtFlatProgram`: one contiguous
+  instruction array (`SrtFlatInst`, 40 bytes, up to five register operands plus an immediate), a
+  register per instruction, and a root per descriptor source, flat SRT slot, resource control-flow
+  condition and uniform-fill word. Each root lists its whole dependency closure in operand-first
+  order, so callers may evaluate any subset of roots in any order.
+- `CompileSrtPlan` (in `SrtWalker.cpp`) lowers a plan into `ResourcePlan::flat`. `ExtractResourcePlan`
+  calls it as its last step. The lowering mirrors `Evaluator` step for step and is specialised per
+  evaluation context: normal, clean (specialization reader, no clean-table routing) and one context
+  per `ReadFirstLane` mask, because the active mask changes which operand a select takes. Whatever
+  the walker rejects structurally (unsupported opcode, cycle, malformed operand, non-invariant phi)
+  becomes a root that fails before running; whatever it rejects at run time (memory read, address
+  overflow, user-data bounds, float conversion range) fails in the same op.
+- At run time `FlatMachine` replays a root as a linear loop over a per-thread register file whose
+  entries are stamped with the epoch of the call that wrote them. Shared work between roots is done
+  once per call and nothing is cleared between draws. The control-flow activity walk, the source
+  loop and the flat-slot loop are the same as the walker's, so transactional failure is unchanged.
+- The walker stays as the fallback and is still the reference: it runs for programs that were never
+  extracted (unit fixtures), for a caller whose clean-slot set differs from the one compiled into
+  the plan, and for a plan whose shape changed after compilation.
+
+`srt_evaluator_bench` now measures both evaluators on every shape and aborts if their checksums
+differ, which is the equivalence check for the lowering. Idle machine, 100,000 iterations:
+
+| Shape | Flat slots | Walker ns/call | Flat ns/call | Speed-up |
+| --- | --- | --- | --- | --- |
+| `small-vs` | 8 | 558 | 116 | 4.8x |
+| `typical-ps` | 80 | 7780 | 1013 | 7.7x |
+| `heavy-ps` | 160 | 22896 | 2423 | 9.5x |
+| `chained-cs` | 64 | 6480 | 926 | 7.0x |
+| `control-flow-ps` | 80 | 7906 | 1050 | 7.5x |
+| `waterfall-ps` | 80 | 8595 | 1044 | 8.2x |
+
+The `--sweep` puts the marginal cost at about **1.2 ns per IR instruction** (was 22.7) and about
+**9 ns per flat slot** (was 37); the slot cost is now dominated by the guest read itself.
+
+Measured in the emulator on the parked Nexus scene, same protocol as the earlier rows (intro skipped
+with a 2 s Cross hold at frame 700, twelve Cross presses, 100 s warm-up, 30 s sample):
+**10.1974 FPS against the 8.1998 FPS pooled build, about 24%**, at 12.612 CPU core-equivalents and
+25.1% GPU (`flat-plan/flat-steady-clean.json`, screenshot `flat-plan/after-nav.png`). Different
+sessions, not a back-to-back A/B. The gain matches the zone data below: evaluation was about 39%
+of the GPU thread, and the compiled program cuts its per-call cost by roughly half in the shapes
+that dominate in-game, where the guest reads that remain are now the larger part of each call.
+
+The memo section above says evaluation was "about 15% of the render critical path". That figure
+came from callstack samples, which this LTO build mis-attributes. Zone timing from the same trace
+(`memo-steady.tracy`, exact self time) puts `EvaluateRuntimeSourcesImpl` at **38.8%** of the GPU
+thread's instrumented time, over 3,033,624 calls; it was the largest zone by a factor of six. That
+trace also fixes the frame anatomy: 149 frames, 1,389,903 draws and 240,463 direct plus 41,847
+indirect dispatches, i.e. about **9,300 draws and 1,900 dispatches per frame** at a 133 ms median.
+
 ## Next useful work
 
 Read [the whole-process CPU profile](investigations/cpu-profile-2026-09-10.md) first. It establishes
 that whole-process CPU share is the wrong metric to steer by, that the render critical path is still
-the lever, and that individual symbol names inside this LTO build are not trustworthy.
+the lever, and that individual symbol names inside this LTO build are not trustworthy. Steer by
+zone self time, not by sample attribution.
 
-1. Pool `PreparedBindings` per executor and reuse it across draws. `RenderExecutor::PrepareBindings`
-   currently returns a fresh object by value for every draw and every stage, and each one owns five
-   vectors plus a `mip_views` vector per texture binding. Heap traffic is about 3% of samples in both
-   captures. `clear()` retains capacity, so a pooled object would allocate nothing in the steady
-   state. Cheap and contained; do this before the larger evaluation work.
-2. Compile the resource plan into a contiguous instruction array at extraction time. The remaining
-   evaluation cost is IR walking, about 21 ns per instruction across `std::list<Inst>` nodes holding
-   `std::vector` operands. Preserve clean-reader semantics, per-call mutable guest descriptors,
-   active masks and transactional failure. Do not cache resource snapshots across draws without
-   proven invalidation.
-3. Exit the emulator cleanly at least once so the disk Vulkan pipeline cache persists. It is enabled
-   now that the tree is committed and clean, but every profiling session so far ended in a forced
-   termination, so the cache on disk is stale and each run still recompiles 633 compute shaders cold.
+1. Skip descriptor evaluation for draws whose inputs did not change. Consecutive draws mostly share
+   shaders and most of their SRT; the compiled program makes the input set explicit (user-data
+   registers, shader base, the guest words each `ReadAddress`/`ReadBuffer` touched). A cache keyed on
+   those inputs could remove most of the remaining evaluation cost, but it needs proven
+   invalidation of the guest words between draws. Do not cache without it.
+2. Exit the emulator cleanly at least once so the disk Vulkan pipeline cache persists. It is enabled
+   only for a committed, clean tree, and every profiling session so far ended in a forced
+   termination, so the cache on disk is stale and each run still recompiles the compute shaders cold.
+3. The long tail on the GPU thread from the memo trace: `FlipQueue::Flip` 6.6%, `RebindBuffers`
+   6.4%, `SynchronizeBdaBuffers` 4.9%, `ExecutePreparedDraw` 4.8%, `CommandProcessor::Process`
+   3.8%, `SyncArguments` 2.7%. None is large alone; the per-draw ones add up across 9,300 draws.
 4. If bindless shaders prove hot, memoize the clean reader's GPU-dirty verdict per page for the
    duration of one materialization instead of per four-byte word. Keep it conservative: only a
    whole-page clean verdict may skip the per-word check, because a partially dirty page must still be

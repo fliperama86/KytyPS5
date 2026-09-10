@@ -101,7 +101,8 @@ Heap traffic corroborates across both captures: `RtlAllocateHeap` plus `RtlFreeH
 Tracy samples, and `ntdll` plus `ucrtbase` is **2.9%** exclusive in the WPR profile.
 
 Pooling the objects per executor and reusing them across draws would remove this; `clear()` retains
-capacity, so the steady state would allocate nothing. Not yet implemented.
+capacity, so the steady state would allocate nothing. Implemented in `956b062`; see the pooled
+bindings section of [the performance handoff](../performance-handoff-2026-09-10.md).
 
 ## Reproducing
 

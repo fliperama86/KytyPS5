@@ -194,6 +194,8 @@ BuiltPlan BuildPlan(const PlanShape& shape) {
 		}
 	}
 	built.plan.clean_flat_slots.assign(built.plan.srt_reads.size(), 0u);
+	// The plan was patched after extraction, so lower it again.
+	CompileSrtPlan(built.plan);
 
 	built.sources.resize(built.plan.descriptor_sources.size());
 	for (uint32_t index = 0; index < built.sources.size(); index++) {
@@ -216,7 +218,9 @@ struct Result {
 	uint64_t calls       = 0;
 };
 
-Result Measure(const BuiltPlan& built, uint64_t iterations) {
+// use_flat selects the compiled program or the IR walker; both must produce the same values.
+Result Measure(BuiltPlan& built, uint64_t iterations, bool use_flat) {
+	built.plan.flat.compiled = use_flat;
 	const SrtRuntime runtime {
 	    .user_data   = built.user_data,
 	    .shader_base = 0,
@@ -327,7 +331,8 @@ int main(int argc, char** argv) {
 	if (sweep) {
 		// Varying the per-slot instruction count separates the fixed per-slot cost (the guest read
 		// plus the memo and descriptor stores) from the marginal cost of one more IR instruction.
-		std::printf("%-10s %12s %10s %10s\n", "shape", "flat_slots", "ops/slot", "ns/call");
+		std::printf("%-10s %12s %10s %12s %12s\n", "shape", "flat_slots", "ops/slot",
+		            "walker_ns", "flat_ns");
 		for (const uint32_t slots: {40u, 80u, 160u}) {
 			for (uint32_t ops = 0; ops <= 6u; ops += 2u) {
 				PlanShape shape {};
@@ -335,26 +340,33 @@ int main(int argc, char** argv) {
 				shape.buffers        = slots / 4u;
 				shape.arithmetic_ops = ops;
 				auto       built  = BuildPlan(shape);
-				const auto result = Measure(built, iterations);
-				checksum += result.checksum;
-				std::printf("%-10s %12zu %10u %10.1f\n", "sweep",
-				            built.plan.srt_reads.size(), ops, result.ns_per_call);
+				const auto walker = Measure(built, iterations, false);
+				const auto flat   = Measure(built, iterations, true);
+				Check(walker.checksum == flat.checksum, "flat program disagrees with walker");
+				checksum += flat.checksum;
+				std::printf("%-10s %12zu %10u %12.1f %12.1f\n", "sweep",
+				            built.plan.srt_reads.size(), ops, walker.ns_per_call,
+				            flat.ns_per_call);
 			}
 		}
 		std::printf("checksum %llu\n", static_cast<unsigned long long>(checksum));
 		return 0;
 	}
 
-	std::printf("%-18s %10s %12s %10s\n", "shape", "sources", "flat_slots", "ns/call");
+	std::printf("%-18s %10s %12s %12s %12s %8s\n", "shape", "sources", "flat_slots",
+	            "walker_ns", "flat_ns", "speedup");
 	for (const auto& shape: Shapes) {
 		if (!only.empty() && only != shape.name) {
 			continue;
 		}
 		auto       built  = BuildPlan(shape);
-		const auto result = Measure(built, iterations);
-		checksum += result.checksum;
-		std::printf("%-18s %10zu %12zu %10.1f\n", shape.name, built.sources.size(),
-		            built.plan.srt_reads.size(), result.ns_per_call);
+		const auto walker = Measure(built, iterations, false);
+		const auto flat   = Measure(built, iterations, true);
+		Check(walker.checksum == flat.checksum, "flat program disagrees with walker");
+		checksum += flat.checksum;
+		std::printf("%-18s %10zu %12zu %12.1f %12.1f %7.2fx\n", shape.name,
+		            built.sources.size(), built.plan.srt_reads.size(), walker.ns_per_call,
+		            flat.ns_per_call, walker.ns_per_call / flat.ns_per_call);
 	}
 	std::printf("checksum %llu\n", static_cast<unsigned long long>(checksum));
 	return 0;

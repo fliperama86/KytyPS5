@@ -15,8 +15,8 @@ Tracy can also sample call stacks through ETW, but Windows grants ETW stack and 
 tracing only to an elevated process. Earlier runs were not elevated, so the traces contained
 **0 callstack samples and 0 context switches**, and knew of only two threads.
 
-`_Build/start-des-profile-elevated.ps1` launches the staged profile build with Administrator rights
-and otherwise matches `start-des-profile.ps1`. With it, the same capture yielded **369,969 callstack
+`_Build/start-des-profile-elevated.ps1` launches the build with Administrator rights and
+otherwise matches `start-des-profile.ps1`. With it, the same capture yielded **369,969 callstack
 samples** and **184,886 context switches**.
 
 ## What the CPU is doing
@@ -110,7 +110,7 @@ Tooling lives in the ignored `_Build` folder alongside the existing profiling sc
 
 | Script | Purpose |
 | --- | --- |
-| `start-des-profile-elevated.ps1` | Launch the staged profile build elevated so ETW sampling works. `-Restart` stops a running instance first; `-NoTouchSerialize` / `-NoTouchTrace` control the collision probes. |
+| `start-des-profile-elevated.ps1` | Launch `_Build/windows/kyty_emulator.exe` elevated so ETW sampling works. `-Restart` stops a running instance first; `-NoTouchSerialize` / `-NoTouchTrace` control the collision probes. |
 | `capture-wpr.ps1` | Record a WPR CPU trace of the running emulator. |
 | `des-navigate.ps1` | Drive the intro to gameplay with Cross presses. Paces off the window title's frame counter; `-Presses`/`-GapSeconds` paces by wall clock instead, which menu animations need. |
 | `des-window.ps1` | Locate, focus, screenshot the game window. |
@@ -119,10 +119,12 @@ Tooling lives in the ignored `_Build` folder alongside the existing profiling sc
 
 Elevation has two consequences worth knowing before repeating this. A medium-integrity session
 cannot send input to, raise, or terminate the elevated emulator, because Windows UIPI blocks it —
-`des-navigate.ps1` self-elevates for exactly this reason. And PerfView's headless mode fails here:
-symbol matching raises a WPF resource error in a non-interactive session, because the executable is
-named `kyty_emulator-profile.exe` while its embedded PDB name is `kyty_emulator.pdb`, which triggers
-a trust prompt that cannot be rendered. Use the PerfView GUI to read the trace.
+`des-navigate.ps1` self-elevates for exactly this reason. And PerfView's headless mode failed here:
+symbol matching raised a WPF resource error in a non-interactive session, because the executable was
+then named `kyty_emulator-profile.exe` while its embedded PDB name is `kyty_emulator.pdb`, and that
+mismatch triggers a trust prompt that cannot be rendered. The single `kyty_emulator.exe` matches its
+PDB name, so the prompt should no longer occur, but headless mode was not retried. Use the PerfView
+GUI to read the trace.
 
 The disk Vulkan pipeline cache only persists across a **clean** exit. Every session recorded here
 ended in a forced termination, so the cache on disk is still stale and each run recompiled shaders

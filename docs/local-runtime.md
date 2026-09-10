@@ -9,24 +9,23 @@ Everything except the game dump lives in one project folder: `C:/Users/dudu/Proj
 | `C:/Users/dudu/Projects/KytyPS5/_Runtime` | Emulator install: executables, Qt runtime, `_SaveData`, `_PipelineCache`, `_Diagnostics` |
 | `E:/Emulation/PS5/Games/DemonsSouls-PPSA01342-dump` | The game dump, the only part kept on the emulation drive |
 
-Start with **`_Runtime/Play Demon's Souls.cmd`**. It uses the confirmed collision-workaround build and the
-current character save. Each launcher sets its own working directory, so they run from wherever the
-`_Runtime` folder sits.
+Start with **`Play Demon's Souls.cmd`** at the repository root. There is one emulator binary,
+`_Build/windows/kyty_emulator.exe`, the one CMake writes; the launcher runs it in place with
+`_Runtime` as the working directory and on PATH, so whatever was built last is what runs. Nothing is
+copied or staged. `Play Demon's Souls.cmd profile` runs the same binary with the Tracy profiler
+listening; it is on-demand and costs nothing until a capture client connects.
 
-- `kyty_emulator.exe`: main executable; `CURRENT-BUILD.json` records its hash and validation status.
+`_Runtime` holds only data and the Qt DLLs:
+
+- `Kyty.ini`: launcher configuration.
 - `_SaveData`: current saves.
 - `_PipelineCache`: driver pipeline cache. Release builds with a clean tree use it; dirty builds
   disable it and recompile every shader on each run.
 - `_Diagnostics`: current and previous run logs, traces and benchmark evidence.
-- `Play Demon's Souls - performance.cmd`: the performance experiment with lighter collision tracing
-  and Tracy network capture available.
-- `kyty_emulator-profile.exe`: profiling/optimization experiment. See
-  [performance results](demons-souls-performance.md) for its measurements.
-- `Play Demon's Souls - lighter workaround.cmd`: older staged variant.
 
 ## Building
 
-`_Build/build-demons-souls.ps1 -Phase Configure|Build|Test|Install` resolves the source from its own
+`_Build/build-demons-souls.ps1 -Phase Configure|Build|Test` resolves the source from its own
 location, so it needs no editing if the folder moves. It expects the Visual Studio Build Tools,
 LLVM at `C:/Program Files/LLVM/bin`, and `_Build/deps`.
 

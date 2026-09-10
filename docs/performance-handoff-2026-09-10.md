@@ -30,6 +30,8 @@ The user requested all project notes in the repository and then requested this h
 | Title/version | `PPSA01342 / 01.005.000` |
 | Runtime save | `_SaveData/PPSA01342/SAVEDATA0PlayerProfile0/USR-DATA` |
 | Build tree | `_Build/windows`; dependencies in `_Build/deps` |
+| Emulator binary | `_Build/windows/kyty_emulator.exe`, the only one; nothing is copied or staged |
+| Launcher | root `Play Demon's Souls.cmd`, which runs that binary in place with `_Runtime` as the working directory and on PATH; the `profile` argument enables Tracy |
 | Current run record | `_Build/active-profile.json` |
 
 Everything except the game dump now lives in `C:/Users/dudu/Projects/KytyPS5`. It previously spanned three source checkouts plus a runtime folder on `E:`; the other two checkouts were linked git worktrees sharing this repository's object store, and are retired under `C:/Users/dudu/Projects/_retired` together with patches of the uncommitted work found in them. The emulation drive keeps only `E:/Emulation/PS5/Games/DemonsSouls-PPSA01342-dump`. Sections below and the notes in `docs/investigations/` were written before the consolidation and still quote the older paths.
@@ -116,7 +118,7 @@ cmake --build _Build/windows --target kyty_emulator resource_tracking_tests reso
 
 `KYTY_RELEASE_TAG` is empty for these unpublished experiments. Dirty builds disable the disk Vulkan pipeline cache, so expect cold compilation on each fresh game run. Do not erase the existing runtime pipeline cache. Do not build or run tests during a measurement.
 
-The ignored helper `_Build/start-des-profile.ps1 -Phase <unique-name> -StageBuild` stages only the profile executable/PDB, refuses an already running profile PID, creates unique logs/source snapshots, and updates `active-profile.json`. It does not replace the preserved main executable. `_Build/measure-des-performance.ps1 -ProcessId <pid> -OutputPrefix <new-prefix> -Seconds 30` writes raw samples and a JSON summary. Use the phase/run JSON to identify exact binaries and flags.
+The ignored helper `_Build/start-des-profile.ps1 -Phase <unique-name>` launches the build in place with no staging, refuses an already running profile PID, creates unique logs/source snapshots, and updates `active-profile.json`. `_Build/measure-des-performance.ps1 -ProcessId <pid> -OutputPrefix <new-prefix> -Seconds 30` writes raw samples and a JSON summary. Use the phase/run JSON to identify exact binaries and flags.
 
 The vendored tools are `_Build/profiling-tools/capture/tracy-capture.exe`, `csvexport/tracy-csvexport.exe`, and `analyzer/tracy-sample-analyzer.exe`, all built against Tracy 0.13.1 / protocol 76. Capture with `-a 127.0.0.1 -p 8086 -s 20 -o <new.tracy>`; CSV export `-e` gives self times, no `-e` gives total times, and the local analyzer `--frames` emits intervals. PowerShell 5 redirected CSV is UTF-16. Ignore the CSV `total_perc` column's preconnection denominator; calculate against the actual capture window.
 
@@ -158,8 +160,8 @@ Those are synthetic-plan numbers. The change has since been measured in the emul
 Nexus scene: **7.8826 FPS against the 7.5462 FPS combined-arena baseline, about 4.5%**, at 12.622
 CPU core-equivalents and 19.9% GPU (`memo-steady-clean.json`). The gain is smaller than the
 benchmark's 37-40% because evaluation is only about 15% of the render critical path. The two runs
-come from different sessions rather than a back-to-back A/B; `kyty_emulator-profile-srt-pmr.exe`
-is preserved in the runtime folder if a controlled comparison is wanted.
+come from different sessions rather than a back-to-back A/B. No older binary is kept; rebuild the
+earlier commit if a controlled comparison is wanted.
 
 ### Corrections to the earlier analysis
 

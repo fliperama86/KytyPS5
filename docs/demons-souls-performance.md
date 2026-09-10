@@ -6,7 +6,7 @@
 - Source baseline: `fffb4cef55c9e537095093bb796ee4509e899c03`, Release, clang-cl 22.1.6, Windows.
 - Hardware: Ryzen 9 9950X3D and GeForce RTX 5090.
 - Collision serialization remains enabled throughout. Full and light capture were compared separately.
-- One runtime directory: `E:\Emulation\PS5\KytyPS5`. Experimental binaries use `kyty_emulator-profile.exe`; the previous working executable is preserved.
+- One runtime directory, `_Runtime`, and one binary, `_Build/windows/kyty_emulator.exe`, launched in place by the root `Play Demon's Souls.cmd`. No staged or preserved copies; rebuild an earlier commit for a comparison.
 - Cold startup/shader compilation is excluded. No builds or tests ran during the clean measurement windows.
 - FPS comes from the change in presented frame count divided by wall time, not the rounded window-title FPS. CPU is process CPU time divided by wall time, expressed as fully occupied logical cores. GPU readings are device-wide `nvidia-smi` samples.
 

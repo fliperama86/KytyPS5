@@ -150,8 +150,12 @@ deterministic and is the regression signal for further evaluator work.
 | `control-flow-ps` | 80 | 12138 | 7290 |
 | `waterfall-ps` | 80 | 12726 | 8062 |
 
-**These are synthetic-plan numbers and the change has never run in the emulator.** Do not
-quote a frame-rate figure for it until a stationary Nexus capture exists.
+Those are synthetic-plan numbers. The change has since been measured in the emulator on a parked
+Nexus scene: **7.8826 FPS against the 7.5462 FPS combined-arena baseline, about 4.5%**, at 12.622
+CPU core-equivalents and 19.9% GPU (`memo-steady-clean.json`). The gain is smaller than the
+benchmark's 37-40% because evaluation is only about 15% of the render critical path. The two runs
+come from different sessions rather than a back-to-back A/B; `kyty_emulator-profile-srt-pmr.exe`
+is preserved in the runtime folder if a controlled comparison is wanted.
 
 ### Corrections to the earlier analysis
 
@@ -168,22 +172,32 @@ quote a frame-rate figure for it until a stationary Nexus capture exists.
 
 ## Next useful work
 
-1. Capture a stationary Nexus benchmark for the evaluation memo. It is the only unmeasured
-   change on the branch, and the earlier final trace was contaminated by user movement and
-   cold shader compilation.
-2. The remaining evaluation cost is IR walking, about 21 ns per instruction across
-   `std::list<Inst>` nodes holding `std::vector` operands. Compiling the plan into a
-   contiguous instruction array at extraction time is the next structural step. Preserve
-   clean-reader semantics, per-call mutable guest descriptors, active masks and
-   transactional failure. Do not cache resource snapshots across draws without proven
-   invalidation.
-3. If bindless shaders prove hot, memoize the clean reader's GPU-dirty verdict per page for
-   the duration of one materialization instead of per four-byte word. Keep it conservative:
-   only a whole-page clean verdict may skip the per-word check, because a partially dirty
-   page must still be tested word by word.
-4. The disk Vulkan pipeline cache is disabled for dirty builds, so every fresh run
-   recompiles all 633 compute shaders. That is a startup cost separate from steady state,
-   and it contaminated the previous task's final capture.
+Read [the whole-process CPU profile](investigations/cpu-profile-2026-09-10.md) first. It establishes
+that whole-process CPU share is the wrong metric to steer by, that the render critical path is still
+the lever, and that individual symbol names inside this LTO build are not trustworthy.
+
+1. Pool `PreparedBindings` per executor and reuse it across draws. `RenderExecutor::PrepareBindings`
+   currently returns a fresh object by value for every draw and every stage, and each one owns five
+   vectors plus a `mip_views` vector per texture binding. Heap traffic is about 3% of samples in both
+   captures. `clear()` retains capacity, so a pooled object would allocate nothing in the steady
+   state. Cheap and contained; do this before the larger evaluation work.
+2. Compile the resource plan into a contiguous instruction array at extraction time. The remaining
+   evaluation cost is IR walking, about 21 ns per instruction across `std::list<Inst>` nodes holding
+   `std::vector` operands. Preserve clean-reader semantics, per-call mutable guest descriptors,
+   active masks and transactional failure. Do not cache resource snapshots across draws without
+   proven invalidation.
+3. Exit the emulator cleanly at least once so the disk Vulkan pipeline cache persists. It is enabled
+   now that the tree is committed and clean, but every profiling session so far ended in a forced
+   termination, so the cache on disk is stale and each run still recompiles 633 compute shaders cold.
+4. If bindless shaders prove hot, memoize the clean reader's GPU-dirty verdict per page for the
+   duration of one materialization instead of per four-byte word. Keep it conservative: only a
+   whole-page clean verdict may skip the per-word check, because a partially dirty page must still be
+   tested word by word.
 5. Measure moving gameplay separately from cold shader compilation.
-6. Before a release, build the actual committed release binary, validate it, then package
-   and publish through the existing workflow.
+6. Before a release, build the actual committed release binary, validate it, then package and publish
+   through the existing workflow.
+
+Two lines of enquiry are closed. Page-fault-based memory tracking is not a cost at 628 faults per
+second. The `DesTouchTrace` probes cost about 3.4% in exception machinery, but disabling them stopped
+the game reaching gameplay, so the collision workaround is load-bearing and that cost cannot simply
+be reclaimed.

@@ -13,6 +13,7 @@ The source for the Demon's Souls documentation lives in this repository. Add new
 
 These dated notes preserve the evidence and intermediate conclusions from earlier debugging. They include local artifact paths and historical process state; use the current guidance above for the latest status.
 
+- [Whole-process CPU profile](investigations/cpu-profile-2026-09-10.md)
 - [CPU fault investigation](investigations/cpu-fault-investigation.md)
 - [Collision-list race report](investigations/demons-souls-touch-race-report.md)
 - [GPU crash report](investigations/demons-souls-crash-report.md)

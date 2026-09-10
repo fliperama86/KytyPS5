@@ -45,6 +45,27 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
+
+	// Returns the object to its freshly-constructed state while keeping every buffer it has already
+	// grown. Draws reuse a pooled instance rather than building one, so the steady state performs no
+	// allocation; images are resized rather than cleared so each binding's mip_views survives too.
+	void Reset(size_t image_count) {
+		runtime = nullptr;
+		buffer_sources.clear();
+		buffers.clear();
+		samplers.clear();
+		shader_data.clear();
+		for (auto& image: images) {
+			auto reuse = std::move(image.mip_views);
+			reuse.clear();
+			image           = {};
+			image.mip_views = std::move(reuse);
+		}
+		images.resize(image_count);
+		gds                = {nullptr, 0, VK_WHOLE_SIZE};
+		flattened_srt      = {};
+		shader_data_buffer = {};
+	}
 };
 
 [[nodiscard]] vk::DescriptorType

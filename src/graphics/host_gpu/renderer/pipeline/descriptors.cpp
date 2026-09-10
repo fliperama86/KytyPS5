@@ -820,18 +820,21 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
-PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
+                                    PreparedBindings&         prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
-	PreparedBindings prepared;
+	prepared.Reset(program.info.images.size());
 	prepared.runtime = &runtime;
-	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		prepared.images.push_back(std::move(binding));
+		// Keep the pooled entry's mip_views buffer rather than the freshly resolved empty one.
+		binding.mip_views  = std::move(prepared.images[i].mip_views);
+		binding.mip_views.clear();
+		prepared.images[i] = std::move(binding);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -846,7 +849,6 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
-	return prepared;
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
@@ -969,26 +971,26 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
-	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex),
-	};
+	GraphicsBindings bindings {.vertex = &m_vertex_bindings};
+	PrepareBindings(vertex, *bindings.vertex);
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel));
+		bindings.pixel = &m_pixel_bindings;
+		PrepareBindings(pixel, *bindings.pixel);
 	}
-	FindBuffers(bindings.vertex);
-	if (bindings.pixel) {
+	FindBuffers(*bindings.vertex);
+	if (bindings.pixel != nullptr) {
 		FindBuffers(*bindings.pixel);
 	}
-	if (bindings.vertex.runtime->program->info.uses_dma ||
-	    (bindings.pixel && bindings.pixel->runtime->program->info.uses_dma)) {
+	if (bindings.vertex->runtime->program->info.uses_dma ||
+	    (bindings.pixel != nullptr && bindings.pixel->runtime->program->info.uses_dma)) {
 		m_context.GetGpuResources().PrepareBda();
 	}
-	RebindBuffers(bindings.vertex);
-	if (bindings.pixel) {
+	RebindBuffers(*bindings.vertex);
+	if (bindings.pixel != nullptr) {
 		RebindBuffers(*bindings.pixel);
 	}
-	RebindImages(bindings.vertex);
-	if (bindings.pixel) {
+	RebindImages(*bindings.vertex);
+	if (bindings.pixel != nullptr) {
 		RebindImages(*bindings.pixel);
 	}
 	return bindings;

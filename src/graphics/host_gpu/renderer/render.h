@@ -159,7 +159,9 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
 	                    uint64_t indirect_args = 0);
 
-	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
+	// Fills a caller-owned instance instead of returning one: draws reuse pooled storage so the
+	// steady state performs no allocation.
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -171,9 +173,10 @@ private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
+	// Points at the executor's pooled stage storage; pixel is null when that stage is inactive.
 	struct GraphicsBindings {
-		PreparedBindings                vertex;
-		std::optional<PreparedBindings> pixel;
+		PreparedBindings* vertex = nullptr;
+		PreparedBindings* pixel  = nullptr;
 	};
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -197,13 +200,18 @@ private:
 	                         bool set_bind_debug, bool set_auto_debug);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
-	                                               const std::optional<PreparedBindings>& pixel = std::nullopt);
+	                                               const PreparedBindings* pixel = nullptr);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      TrackImageBinding(ImageId id);
 	void                      ResetBindings();
+	// Pooled per-stage binding storage, reused across draws. The executor already keeps per-draw
+	// mutable state such as m_bound_images, so it is entered from one thread at a time.
+	PreparedBindings          m_vertex_bindings;
+	PreparedBindings          m_pixel_bindings;
+	PreparedBindings          m_compute_bindings;
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer& buffer, uint32_t group_x,
 	                                                     uint32_t group_y, uint32_t group_z,

@@ -480,7 +480,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	KYTY_PROFILER_END_BLOCK;
 	KYTY_PROFILER_BLOCK("RenderCompute::PrepareBindings");
-	auto bindings = PrepareBindings(input_info.stage);
+	// Pooled storage reused across dispatches rather than a fresh object each time.
+	auto& bindings = m_compute_bindings;
+	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("RenderCompute::PrepareBda");

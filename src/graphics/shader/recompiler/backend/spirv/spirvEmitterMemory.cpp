@@ -307,6 +307,17 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
+	if (resource.bda_base != 0) {
+		// docs/gpu-descriptor-fetch.md stage 1: the element index is already relative to the V#
+		// base the prologue decoded, so one page-table load per dword reads the guest memory.
+		auto&      state   = ctx.state;
+		const auto address = Binary(
+		    state, OpIAdd, TypeDeviceAddress(state), resource.bda_base,
+		    Binary(state, OpShiftLeftLogical, TypeDeviceAddress(state),
+		           Unary(state, OpUConvert, TypeDeviceAddress(state), index),
+		           ConstantDeviceAddress(state, 2)));
+		return LoadBdaDword(ctx, address);
+	}
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer});
@@ -1013,7 +1024,7 @@ uint32_t EmitBdaPointer(ValueEmitContext& ctx, uint32_t address) {
 }
 
 void DefineGetBdaPointer(EmitterState& state) {
-	if (!state.program.info.uses_dma) {
+	if (!state.program.info.uses_dma && !state.program.info.gpu_descriptors) {
 		return;
 	}
 	const auto type            = TypeDeviceAddress(state);
@@ -1115,11 +1126,7 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto element   = EmitMemoryElementIndex(state, access, index);
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-			           const auto value = state.builder.AllocateId();
-			           state.builder.AddFunction(
-			               {OpLoad, TypeU32(state), value,
-			                EmitMemoryElementPointer(state, access, element)});
-			           return value;
+			           return LoadWordInBounds(ctx, access, element);
 		           }));
 		return true;
 	}

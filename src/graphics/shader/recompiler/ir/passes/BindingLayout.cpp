@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/GpuDescriptorFetch.h"
 
 #include <algorithm>
 #include <array>
@@ -77,8 +78,23 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	}
 	BindingLayout next;
 	next.user_data_registers = CollectUserData(program);
+	if (program.info.gpu_descriptors) {
+		// The shader body never reads the registers a gpu_fetch root walks, so the layout has to
+		// pack them too (docs/gpu-descriptor-fetch.md, stage 1).
+		for (const auto reg: GpuFetchUserDataRegisters(program)) {
+			const auto at = std::ranges::lower_bound(next.user_data_registers, reg);
+			if (at == next.user_data_registers.end() || *at != reg) {
+				next.user_data_registers.insert(at, reg);
+			}
+		}
+	}
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	if (program.info.gpu_descriptors) {
+		// One dword past the memory offsets; the host packs the program's feedback slot id there.
+		next.feedback_slot_dword =
+		    next.memory_offset_dword + (next.memory_offset_count + 3u) / 4u;
+	}
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
@@ -126,9 +142,12 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (UsesGds(program)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
-	if (program.info.uses_dma) {
+	if (program.info.uses_dma || program.info.gpu_descriptors) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
+	}
+	if (program.info.gpu_descriptors) {
+		AddBinding(next, DescriptorBindingKind::DescriptorFeedback);
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||

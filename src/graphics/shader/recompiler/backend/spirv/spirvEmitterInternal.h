@@ -354,6 +354,17 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+// One buffer descriptor the shader fetched itself in the prologue (docs/gpu-descriptor-fetch.md,
+// stage 1). Reads of the resource go to base + byte offset through the BDA page table instead of
+// the bound storage buffer.
+struct GpuFetchBuffer {
+	// Device-address id of the V# base, zero when the resource stays on the host binding.
+	uint32_t base = 0;
+	// u32 id, the readable dword count derived from stride * num_records. Zero when the root was
+	// invalid, the descriptor empty or the range outside the page table, which reads as zero.
+	uint32_t length = 0;
+};
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -371,6 +382,8 @@ struct EmitterState {
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
+	uint32_t                                         descriptor_feedback_variable = 0;
+	std::array<GpuFetchBuffer, IR::ShaderInfo::MaxBuffers> gpu_fetch_buffers {};
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
@@ -664,6 +677,9 @@ struct MemoryResourceAccess {
 	uint32_t         length           = 0;
 	uint32_t         index_offset     = 0;
 	uint32_t         byte_offset      = 0;
+	// Device-address id of a gpu_fetch descriptor's base. Non-zero replaces object_pointer: the
+	// element reads go through the BDA page table and there is no descriptor to point at.
+	uint32_t         bda_base         = 0;
 	bool             add_index_offset = false;
 };
 
@@ -807,6 +823,10 @@ struct SrtLoweredRoot {
 SrtLoweredRoot EmitSrtFlatRoot(ValueEmitContext& ctx, const IR::SrtFlatProgram& program,
                                const IR::SrtFlatRoot& root, std::span<const uint32_t> results,
                                const SrtLoweringInputs& inputs);
+
+// Evaluates every gpu_fetch buffer descriptor once in the function prologue and records a
+// specialization mismatch in the DescriptorFeedback buffer. A no-op without gpu_descriptors.
+void EmitGpuFetchDescriptors(ValueEmitContext& ctx);
 
 // Test-only standalone compute module: runs every descriptor-source root and stores each source's
 // dwords, its validity word and its "lowered" word into storage buffer 0 at `source_stride`.

@@ -62,6 +62,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _Build\measure-des-performan
 The JSON it writes reports frames per second from presented-frame deltas, CPU core-equivalents and
 GPU utilisation. Keep the Tracy capture client disconnected during a measurement.
 
+Record the session type with each sample. This PC is sometimes used over Remote Desktop; under
+RDP the swapchain presents through the RDP display, so frame pacing differs from the local console
+and samples from the two are not directly comparable (`query session` shows which is active). All
+samples on September 10, 2026 from the flat-program build onwards were taken under RDP.
+
 ## Known trap
 
 Looking around in the Nexus with the camera has ended sessions with `vkWaitSemaphores:

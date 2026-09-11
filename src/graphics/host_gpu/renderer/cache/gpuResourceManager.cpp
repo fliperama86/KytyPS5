@@ -93,14 +93,23 @@ void GpuResourceManager::PrepareBda() {
 	const auto mapped_generation = m_mapped_generation;
 	if (!BdaScanRequired(buffer_generation, mapped_generation)) {
 		m_fault_process_pending = true;
+		// Frame replay (docs/frame-replay.md, phase E): every preparation is recorded, scanning
+		// or not, because the number of scans per preparation is what a replay must reproduce.
+		Replay::RecordPrepareEvent(false, 0, 0, 0);
 		return;
 	}
 	KYTY_PROFILER_BLOCK("GpuResourceManager::SynchronizeBdaBuffers");
 	// Take the dirty set before the scan. A range added afterwards also advances the
 	// generation captured above, so the next call picks it up.
 	const auto dirty = m_buffer_cache.TakeBdaDirtyRanges();
-	dirty.ForEach([this](uint64_t start, uint64_t end) {
-		m_mapped_ranges.ForEachIntersection(start, end - start, [this](RangeSet::Range range) {
+	uint32_t   dirty_ranges = 0;
+	uint32_t   synchronized = 0;
+	uint64_t   dirty_bytes  = 0;
+	dirty.ForEach([&](uint64_t start, uint64_t end) {
+		dirty_ranges++;
+		dirty_bytes += end - start;
+		m_mapped_ranges.ForEachIntersection(start, end - start, [&](RangeSet::Range range) {
+			synchronized++;
 			m_buffer_cache.SynchronizeBuffersInRange(range.address, range.size);
 		});
 	});
@@ -110,6 +119,7 @@ void GpuResourceManager::PrepareBda() {
 	m_last_bda_buffer_generation = buffer_generation;
 	m_last_bda_mapped_generation = mapped_generation;
 	m_fault_process_pending = true;
+	Replay::RecordPrepareEvent(true, dirty_ranges, synchronized, dirty_bytes);
 }
 
 bool GpuResourceManager::BdaScanRequired(uint64_t buffer_generation,

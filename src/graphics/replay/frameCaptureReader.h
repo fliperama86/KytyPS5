@@ -28,6 +28,10 @@ struct CaptureManifest {
 	// submissions.bin, which also carry each frame's number and progress count.
 	uint32_t frames       = 0;
 	uint64_t churn_events = 0;
+	// Version 5: how many BDA preparations the captured frames made and how many of them scanned.
+	// This is the ground truth a replay's own counts are compared with.
+	uint64_t prepare_events = 0;
+	uint64_t prepare_scans  = 0;
 };
 
 struct CaptureRegisterFile {
@@ -76,6 +80,9 @@ public:
 	// that moved the BDA generation. Diagnostics -- nothing in the replay consumes it.
 	bool ReadChurnEvents(std::vector<ChurnEventRecord>* out, bool* present,
 	                     std::string* error) const;
+	// The version 5 stream: every BDA preparation of the captured frames and whether it scanned.
+	bool ReadPrepareEvents(std::vector<PrepareEventRecord>* out, bool* present,
+	                       std::string* error) const;
 
 	// Streams memory.bin one page at a time, so a multi-GB capture never has to fit in memory.
 	// The sink returns false to stop with an error the caller has already reported.

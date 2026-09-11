@@ -148,6 +148,19 @@ bool CaptureReader::ParseManifest(const std::string& text, CaptureManifest* out,
 	}
 	manifest.churn_events = found ? value : 0;
 
+	// Version 5. Absent in an older capture, which has no ground truth to compare a replay with.
+	if (!ManifestNumber(text, "prepare_events", &value, &found)) {
+		SetError(error, "manifest.json has a malformed prepare_events");
+		return false;
+	}
+	manifest.prepare_events = found ? value : 0;
+
+	if (!ManifestNumber(text, "prepare_scans", &value, &found)) {
+		SetError(error, "manifest.json has a malformed prepare_scans");
+		return false;
+	}
+	manifest.prepare_scans = found ? value : 0;
+
 	*out = manifest;
 	return true;
 }
@@ -378,6 +391,12 @@ bool CaptureReader::ReadDirtyEvents(std::vector<DirtyEventRecord>* out, bool* pr
 bool CaptureReader::ReadChurnEvents(std::vector<ChurnEventRecord>* out, bool* present,
                                     std::string* error) const {
 	return ReadOptionalRecords(m_dir / "churn-events.bin", out, present, error, "churn-events.bin");
+}
+
+bool CaptureReader::ReadPrepareEvents(std::vector<PrepareEventRecord>* out, bool* present,
+                                      std::string* error) const {
+	return ReadOptionalRecords(m_dir / "prepare-events.bin", out, present, error,
+	                           "prepare-events.bin");
 }
 
 bool CaptureReader::ForEachPage(const PageSink& sink, uint64_t* pages, std::string* error) const {

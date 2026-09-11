@@ -1038,6 +1038,11 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (needs_bda(bindings.vertex) || (bindings.pixel != nullptr && needs_bda(bindings.pixel))) {
 		m_context.GetGpuResources().PrepareBda();
 	}
+	// The frame-replay progress clock ticks again here, whether or not this draw needed a BDA
+	// preparation: a CPU write that arrives before the preparation has to be told apart from one
+	// that arrives after it, and the tick must not depend on --gpu-descriptors
+	// (docs/frame-replay.md, phase E).
+	GuestGpu::BumpProgress();
 	RebindBuffers(*bindings.vertex);
 	if (bindings.pixel != nullptr) {
 		RebindBuffers(*bindings.pixel);

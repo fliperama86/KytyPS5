@@ -14,6 +14,9 @@
 //   churn-events.bin  ChurnEventRecord[]       every other BDA-generation bump of the frames:
 //                                              buffer registrations and retirements, guest map
 //                                              and unmap calls; diagnostics only (v4)
+//   prepare-events.bin PrepareEventRecord[]    every GpuResourceManager::PrepareBda of the
+//                                              frames and whether it scanned: the ground truth
+//                                              a replay has to reproduce (v5)
 //   submissions.bin   SubmissionRecord stream  the captured frames, in processing-start order
 //   registers.bin     RegisterFileRecord stream  command-processor register files at frame start
 //   videoout.bin      VideoOutRecord stream    buffer registrations, one per attribute group
@@ -38,7 +41,15 @@ namespace Libs::Graphics::Replay {
 // Done submission record and the manifest's "frames"), and widens DirtyEventRecord by the frame
 // index the mark belongs to. A version 3 stream of 24-byte dirty events still reads: the reader
 // widens it with frame 0, which is the only frame such a capture has.
-constexpr uint32_t kFormatVersion    = 4;
+//
+// Version 5 adds prepare-events.bin and doubles the resolution of the progress clock: it now ticks
+// once when a draw or dispatch starts and once more after that draw's or dispatch's resource
+// preparation stage, whether or not the stage needed a BDA preparation. A mark that arrives before
+// a draw's PrepareBda and one that arrives after it therefore carry different progress values,
+// which version 4 could not express. Progress values are not comparable across the two versions,
+// so a v4 or older capture keeps the old replay path (the marker thread) and a v5 capture is
+// applied inline on the GPU thread. See docs/frame-replay.md, phase E.
+constexpr uint32_t kFormatVersion    = 5;
 constexpr uint32_t kMinFormatVersion = 1;
 constexpr uint64_t kPageSize         = 16384;
 
@@ -146,7 +157,8 @@ static_assert(sizeof(ShaderRecord) == 40);
 // hundreds of scans into a handful; see the phase C and phase D sections of docs/frame-replay.md.
 //
 // `progress` is GuestGpu::Progress() at the moment of the mark: a per-frame counter the GPU
-// thread bumps once per draw and once per dispatch and Done() resets. It is a clock that means
+// thread bumps when a draw or dispatch starts and again after its resource preparation stage
+// (twice per draw and dispatch since version 5, once before it), and Done() resets. It is a clock that means
 // the same thing in the game and in a replay, unlike wall time. `submission` is the index of the
 // submission the GPU thread had started when the mark arrived, for reading the stream by hand;
 // the replay ignores it. Records are in arrival order, so the stream is sorted by neither field.
@@ -196,6 +208,23 @@ struct ChurnEventRecord {
 };
 static_assert(sizeof(ChurnEventRecord) == 28);
 
+// One GpuResourceManager::PrepareBda call of a captured frame (v5) -- the draw and dispatch
+// preparations that pay for the BDA scan, and the ground truth a replay is measured against.
+// `scanned` is 1 when the BDA generation had moved since the last call and the scan ran, which is
+// exactly one entry of the `GpuResourceManager::SynchronizeBdaBuffers` Tracy zone. The rest
+// describes what the scan had to do, so a replay that reaches the right *number* of scans can
+// still be told apart from one that reaches the right *cost*.
+struct PrepareEventRecord {
+	uint32_t frame        = 0;
+	uint32_t progress     = 0; // GuestGpu::Progress() when the preparation ran
+	uint32_t scanned      = 0; // 0 or 1
+	uint32_t dirty_ranges = 0; // ranges in the dirty set the scan took, 0 when it did not scan
+	uint32_t synchronized = 0; // SynchronizeBuffersInRange calls the scan made
+	uint32_t reserved     = 0;
+	uint64_t dirty_bytes  = 0; // bytes those dirty ranges cover
+};
+static_assert(sizeof(PrepareEventRecord) == 32);
+
 #pragma pack(pop)
 
 // manifest.json keys, all at the top level, written by the capture side. The replay side needs
@@ -219,6 +248,9 @@ static_assert(sizeof(ChurnEventRecord) == 28);
 //   "dirty_events_per_frame": [...]  dirty-events.bin records per frame             (v4)
 //   "progress_events_per_frame": []  draws plus dispatches per frame                (v4)
 //   "churn_events": <count>          records in churn-events.bin                    (v4)
+//   "prepare_events": <count>        records in prepare-events.bin                  (v5)
+//   "prepare_scans": <count>         of those, the ones that scanned                (v5)
+//   "prepares_per_frame": [...], "prepare_scans_per_frame": [...]                   (v5)
 //   "churn_registers_per_frame": [], "churn_retires_per_frame": [],
 //   "churn_maps_per_frame": [], "churn_unmaps_per_frame": []                        (v4)
 //   "gaps": [ {"vaddr": <hex string>, "size": <hex string>, "reason": "<text>"}, ... ]

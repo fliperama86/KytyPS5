@@ -9,6 +9,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
+#include "graphics/replay/frameCapture.h"
 #include "graphics/replay/frameCaptureReader.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
@@ -454,6 +455,82 @@ private:
 	bool                          m_quit    = false;
 };
 
+// Applying the frame's CPU writes inline, on the GPU thread (format version 5).
+//
+// The marker thread of phase D waits for the progress clock to pass a value and then marks from
+// another thread, so a burst of marks recorded at one tick is applied at once and, worse, may land
+// after the GPU thread has already passed the preparation it was meant to precede. From version 5
+// the clock ticks twice per draw and dispatch and the GPU thread itself applies, at every tick, the
+// marks recorded at that tick, before it goes on -- which is where the game's own writes reached
+// the cache. The hook runs on the GPU thread only; the feeder sets the frame up before its first
+// submission and reads the cursor after the queues are drained, so the queue's own synchronisation
+// orders the two.
+struct InlineMarking {
+	BufferCache*                         cache  = nullptr;
+	const std::vector<DirtyEventRecord>* events = nullptr;
+	std::atomic_size_t                   cursor {0};
+};
+
+InlineMarking g_inline_marking;
+
+void InlineProgressHook(uint32_t progress) {
+	auto&       state  = g_inline_marking;
+	const auto* events = state.events;
+	if (events == nullptr) {
+		return;
+	}
+	auto cursor = state.cursor.load(std::memory_order_relaxed);
+	while (cursor < events->size() && (*events)[cursor].progress <= progress) {
+		const auto& event = (*events)[cursor];
+		// Publish the cursor before the call: InvalidateMemory is the game's own path and may
+		// drain the device, and nothing may apply this event twice.
+		state.cursor.store(++cursor, std::memory_order_relaxed);
+		state.cache->InvalidateMemory(event.vaddr, event.size);
+	}
+}
+
+// What the replay's own BDA preparations did, counted through the same sink the capture writes
+// prepare-events.bin from. This is how a replay reports its scan count without a Tracy capture.
+struct PrepareCounters {
+	std::atomic_uint64_t prepares {0};
+	std::atomic_uint64_t scans {0};
+	std::atomic_uint64_t dirty_ranges {0};
+	std::atomic_uint64_t synchronized {0};
+	std::atomic_uint64_t dirty_bytes {0};
+
+	void Reset() noexcept {
+		prepares.store(0, std::memory_order_relaxed);
+		scans.store(0, std::memory_order_relaxed);
+		dirty_ranges.store(0, std::memory_order_relaxed);
+		synchronized.store(0, std::memory_order_relaxed);
+		dirty_bytes.store(0, std::memory_order_relaxed);
+	}
+};
+
+PrepareCounters g_prepare_counters;
+
+void CountPrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
+                       uint64_t dirty_bytes) {
+	auto& counters = g_prepare_counters;
+	counters.prepares.fetch_add(1, std::memory_order_relaxed);
+	if (!scanned) {
+		return;
+	}
+	counters.scans.fetch_add(1, std::memory_order_relaxed);
+	counters.dirty_ranges.fetch_add(dirty_ranges, std::memory_order_relaxed);
+	counters.synchronized.fetch_add(synchronized, std::memory_order_relaxed);
+	counters.dirty_bytes.fetch_add(dirty_bytes, std::memory_order_relaxed);
+}
+
+// What one frame's preparations amounted to, in the capture or in one replayed loop.
+struct PrepareSummary {
+	uint64_t prepares     = 0;
+	uint64_t scans        = 0;
+	uint64_t dirty_ranges = 0;
+	uint64_t synchronized = 0;
+	uint64_t dirty_bytes  = 0;
+};
+
 // One frame of a capture: the slice of submissions.bin between two Done records, the frame's own
 // CPU-dirty marks, and what the recorder said about it. A version 1 to 3 capture has exactly one.
 struct ReplayFrame {
@@ -465,9 +542,13 @@ struct ReplayFrame {
 	size_t   compute  = 0;
 	size_t   flips    = 0;
 	// The marks that arrived before its first draw, applied with the batch on the GPU thread, and
-	// the rest, which the marker thread replays against the progress clock.
+	// the rest, replayed against the progress clock. The timed ones are sorted by progress: the
+	// stream is in arrival order, which is the same thing up to a race on the clock.
 	std::vector<DirtyEventRecord> pre_events;
 	std::vector<DirtyEventRecord> timed_events;
+	// What the capture recorded this frame's BDA preparations doing (format version 5): the
+	// ground truth the replay's own counts are compared with.
+	PrepareSummary recorded_prepares;
 };
 
 // `<path>` becomes `<path stem>-f<n><extension>`, so one loop of M frames writes M images.
@@ -818,12 +899,17 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		::printf("  WARNING        the manifest says %u frames, submissions.bin has %zu\n",
 		         reader.Manifest().frames, recorded.size());
 	}
-	size_t frame_count = frames_wanted == 0 ? recorded.size()
-	                                        : std::min<size_t>(frames_wanted, recorded.size());
+	// The last recorded frame is the one the memory snapshot ends on, so a shorter sequence keeps
+	// the tail of the window, not its head: every frame the replay drops is a frame further from
+	// the state the restore puts the guest in.
+	const size_t frame_count = frames_wanted == 0
+	                               ? recorded.size()
+	                               : std::min<size_t>(frames_wanted, recorded.size());
 	if (frames_wanted > recorded.size()) {
 		::printf("  WARNING        --replay-frames %u, but the capture holds %zu; replaying %zu\n",
 		         frames_wanted, recorded.size(), recorded.size());
 	}
+	const size_t frame_base = recorded.size() - frame_count;
 
 	// 3d. Dirty pages. One set for the whole capture, taken at the end of the last frame; it is
 	// re-marked before every replayed frame, as it has been since phase B, because almost none of
@@ -856,39 +942,93 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		(event.progress == 0 ? frame.pre_events : frame.timed_events).push_back(event);
 	}
 	for (size_t i = 0; i < frame_count; i++) {
-		timed_total += recorded[i].timed_events.size();
+		timed_total += recorded[frame_base + i].timed_events.size();
 	}
 	const bool use_events = dirty_events_present && !dirty_events.empty();
+	// Version 5 keys the marks to a clock that ticks twice per draw and dispatch and applies them
+	// on the GPU thread; an older capture's values mean something else and keep the marker thread.
+	const bool inline_events = use_events && reader.Manifest().format_version >= 5;
+	for (auto& frame: recorded) {
+		std::stable_sort(frame.timed_events.begin(), frame.timed_events.end(),
+		                 [](const DirtyEventRecord& left, const DirtyEventRecord& right) {
+			                 return left.progress < right.progress;
+		                 });
+	}
+
+	// 3f. Prepare events (format version 5): every BDA preparation the captured frames made and
+	// whether it scanned. Nothing in the replay consumes it -- it is the ground truth the replay's
+	// own preparation counts are reported against.
+	std::vector<PrepareEventRecord> prepare_events;
+	bool                            prepare_events_present = false;
+	if (!reader.ReadPrepareEvents(&prepare_events, &prepare_events_present, &error)) {
+		Fail(error);
+		return 1;
+	}
+	for (const auto& event: prepare_events) {
+		if (event.frame >= recorded.size()) {
+			continue;
+		}
+		auto& summary = recorded[event.frame].recorded_prepares;
+		summary.prepares++;
+		if (event.scanned == 0) {
+			continue;
+		}
+		summary.scans++;
+		summary.dirty_ranges += event.dirty_ranges;
+		summary.synchronized += event.synchronized;
+		summary.dirty_bytes += event.dirty_bytes;
+	}
 
 	size_t graphics_count = 0;
 	size_t compute_count  = 0;
 	size_t flip_count     = 0;
 	uint64_t progress_recorded = 0;
 	for (size_t i = 0; i < frame_count; i++) {
-		graphics_count += recorded[i].graphics;
-		compute_count += recorded[i].compute;
-		flip_count += recorded[i].flips;
-		progress_recorded += recorded[i].progress;
+		graphics_count += recorded[frame_base + i].graphics;
+		compute_count += recorded[frame_base + i].compute;
+		flip_count += recorded[frame_base + i].flips;
+		progress_recorded += recorded[frame_base + i].progress;
 	}
 
 	::printf("  registers      %zu command processors, %zu bytes each\n", register_files.size(),
 	         expected_register_size);
 	::printf("  video-out      %zu registrations, handle %d, flip index %d\n", video_out.size(),
 	         handle, flip_index);
-	::printf("  frames         %zu recorded (%llu to %llu), %zu replayed per loop\n",
+	::printf("  frames         %zu recorded (%llu to %llu), %zu replayed per loop (%llu to %llu)\n",
 	         recorded.size(), static_cast<unsigned long long>(recorded.front().number),
-	         static_cast<unsigned long long>(recorded.back().number), frame_count);
+	         static_cast<unsigned long long>(recorded.back().number), frame_count,
+	         static_cast<unsigned long long>(recorded[frame_base].number),
+	         static_cast<unsigned long long>(recorded.back().number));
 	::printf("  submissions    %zu records over the replayed frames (%zu graphics, %zu compute, "
 	         "%zu flips)\n",
 	         graphics_count + compute_count + flip_count, graphics_count, compute_count,
 	         flip_count);
 	::printf("  dirty pages    %zu in %zu ranges\n", dirty_pages.size(), dirty_ranges.size());
+	if (prepare_events_present && !prepare_events.empty()) {
+		uint64_t recorded_prepares = 0;
+		uint64_t recorded_scans    = 0;
+		for (size_t i = 0; i < frame_count; i++) {
+			recorded_prepares += recorded[frame_base + i].recorded_prepares.prepares;
+			recorded_scans += recorded[frame_base + i].recorded_prepares.scans;
+		}
+		::printf("  prepares       %llu recorded over the replayed frames, %llu of them scanned "
+		         "(the ground truth)\n",
+		         static_cast<unsigned long long>(recorded_prepares),
+		         static_cast<unsigned long long>(recorded_scans));
+	} else {
+		::printf("  prepares       none recorded (format version %u); there is no ground truth to "
+		         "compare the replay's scans with\n",
+		         reader.Manifest().format_version);
+	}
 	if (use_events) {
 		::printf("  dirty events   %zu recorded (%zu timed in the replayed frames) over %llu "
 		         "draws%s\n",
 		         dirty_events.size(), timed_total,
 		         static_cast<unsigned long long>(progress_recorded),
 		         skipped_events != 0 ? " (some out of range, skipped)" : "");
+		::printf("  dirty timing   %s\n",
+		         inline_events ? "applied inline on the GPU thread at each progress tick"
+		                       : "applied by the marker thread (capture older than version 5)");
 	} else if (reader.Manifest().format_version >= 3) {
 		::printf("  dirty events   dirty-events.bin is empty; the BDA generation only moves with the "
 		         "batch, which under-counts the BDA scan\n");
@@ -922,16 +1062,23 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	const auto                  run_start = Clock::now();
 
 	std::unique_ptr<DirtyEventMarker> marker;
-	if (use_events) {
+	if (use_events && !inline_events) {
 		marker = std::make_unique<DirtyEventMarker>(buffer_cache);
 	}
+	if (inline_events) {
+		g_inline_marking.cache = &buffer_cache;
+		GuestGpu::SetProgressHook(&InlineProgressHook);
+	}
+	// The replay's own preparations, counted through the sink the capture writes its stream from.
+	Replay::SetPrepareSink(&CountPrepareEvent);
+	std::vector<std::vector<PrepareSummary>> frame_prepares(frame_count);
 	uint64_t late_events = 0;
 
 	for (uint32_t loop = 0; loop < loops; loop++) {
 		double loop_total = 0.0;
 		double gpu_total  = 0.0;
 		for (size_t index = 0; index < frame_count; index++) {
-			const auto& frame = recorded[index];
+			const auto& frame = recorded[frame_base + index];
 			// The recorded dirty set, in one batch on the GPU thread and outside the timing, as it
 			// has been since phase B, plus everything the guest wrote before this frame's first
 			// draw. The events come on top of the batch, not instead of it -- see the phase D
@@ -949,6 +1096,11 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			if (marker) {
 				marker->Start(&frame.timed_events);
 			}
+			if (inline_events) {
+				g_inline_marking.cursor.store(0, std::memory_order_relaxed);
+				g_inline_marking.events = &frame.timed_events;
+			}
+			g_prepare_counters.Reset();
 
 			const auto frame_start = Clock::now();
 			for (size_t i = frame.first; i < frame.first + frame.count; i++) {
@@ -982,12 +1134,25 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 				if (marker) {
 					(void)marker->Finish();
 				}
-				Fail("the GPU thread did not finish frame " + std::to_string(index + 1) +
-				     " of loop " + std::to_string(loop + 1) + " within " +
-				     std::to_string(timeout) + " ms: " + DescribeLastBlockedWait());
+				Fail("the GPU thread did not finish frame " + std::to_string(index + 1) + " (" +
+				     std::to_string(frame.number) + ") of loop " + std::to_string(loop + 1) +
+				     " within " + std::to_string(timeout) + " ms: " + DescribeLastBlockedWait());
 				return 1;
 			}
 			frame_progress[index] = GuestGpu::Progress();
+			if (inline_events) {
+				// The GPU thread is idle, so the hook cannot fire again: whatever is left never had
+				// its tick reached and is applied here, late, exactly as the marker thread does.
+				g_inline_marking.events = nullptr;
+				const auto cursor = g_inline_marking.cursor.load(std::memory_order_relaxed);
+				for (size_t i = cursor; i < frame.timed_events.size(); i++) {
+					buffer_cache.InvalidateMemory(frame.timed_events[i].vaddr,
+					                              frame.timed_events[i].size);
+				}
+				const auto late = frame.timed_events.size() - cursor;
+				frame_late[index] += late;
+				late_events += late;
+			}
 			// The marks still waiting are marked now, inside the frame's timing, and counted: a
 			// frame that outran the recorded events is one whose BDA-scan count is too low, and
 			// the report says so.
@@ -1011,6 +1176,12 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			presented += VideoOut::VideoOutReplayFlipCount(handle) - flips_before;
 			flips_before = VideoOut::VideoOutReplayFlipCount(handle);
 			const auto frame_done = MillisSince(frame_start);
+			frame_prepares[index].push_back(
+			    {g_prepare_counters.prepares.load(std::memory_order_relaxed),
+			     g_prepare_counters.scans.load(std::memory_order_relaxed),
+			     g_prepare_counters.dirty_ranges.load(std::memory_order_relaxed),
+			     g_prepare_counters.synchronized.load(std::memory_order_relaxed),
+			     g_prepare_counters.dirty_bytes.load(std::memory_order_relaxed)});
 			frame_gpu_ms[index].push_back(gpu_done);
 			frame_loop_ms[index].push_back(frame_done);
 			gpu_total += gpu_done;
@@ -1032,7 +1203,33 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		gpu_ms.push_back(gpu_total);
 	}
 	g_wait_diagnostics.store(false, std::memory_order_relaxed);
+	GuestGpu::SetProgressHook(nullptr);
+	Replay::SetPrepareSink(nullptr);
+	g_inline_marking.events = nullptr;
 	const auto run_ms = MillisSince(run_start);
+
+	// The measured loops' preparations, averaged per frame: the number to compare with the
+	// capture's ground truth and with the game's Tracy zone.
+	std::vector<PrepareSummary> prepare_mean(frame_count);
+	for (size_t i = 0; i < frame_count; i++) {
+		const auto& samples = frame_prepares[i];
+		const auto  skipped = samples.size() > 1 ? 1u : 0u;
+		const auto  counted = samples.size() - skipped;
+		if (counted == 0) {
+			continue;
+		}
+		PrepareSummary total;
+		for (size_t loop = skipped; loop < samples.size(); loop++) {
+			total.prepares += samples[loop].prepares;
+			total.scans += samples[loop].scans;
+			total.dirty_ranges += samples[loop].dirty_ranges;
+			total.synchronized += samples[loop].synchronized;
+			total.dirty_bytes += samples[loop].dirty_bytes;
+		}
+		prepare_mean[i] = {total.prepares / counted, total.scans / counted,
+		                   total.dirty_ranges / counted, total.synchronized / counted,
+		                   total.dirty_bytes / counted};
+	}
 
 	// 5. Report. The first loop is a warm-up: pipelines, descriptor sets and history buffers are
 	// all cold, so it is excluded from the statistics (docs/frame-replay.md, limits).
@@ -1057,13 +1254,38 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	PrintStats("ms/loop gpu", gpu_stats);
 	for (size_t i = 0; i < frame_count; i++) {
 		::printf("  frame %-2zu %-5llu gpu median %8.3f  min %8.3f  max %8.3f | loop median %8.3f",
-		         i + 1, static_cast<unsigned long long>(recorded[i].number),
+		         i + 1, static_cast<unsigned long long>(recorded[frame_base + i].number),
 		         frame_gpu_stats[i].median, frame_gpu_stats[i].min, frame_gpu_stats[i].max,
 		         frame_loop_stats[i].median);
 		if (use_events) {
-			::printf(" | events %zu (%llu late) | progress %u of %u", recorded[i].timed_events.size(),
+			::printf(" | events %zu (%llu late) | progress %u of %u",
+			         recorded[frame_base + i].timed_events.size(),
 			         static_cast<unsigned long long>(frame_late[i]), frame_progress[i],
-			         recorded[i].progress);
+			         recorded[frame_base + i].progress);
+		}
+		::printf("\n");
+	}
+	for (size_t i = 0; i < frame_count; i++) {
+		const auto& replayed = prepare_mean[i];
+		const auto& captured = recorded[frame_base + i].recorded_prepares;
+		::printf("  frame %-2zu      prepares %llu (%llu recorded), scans %llu (%llu recorded)",
+		         i + 1, static_cast<unsigned long long>(replayed.prepares),
+		         static_cast<unsigned long long>(captured.prepares),
+		         static_cast<unsigned long long>(replayed.scans),
+		         static_cast<unsigned long long>(captured.scans));
+		if (replayed.scans != 0) {
+			::printf(", %.1f dirty ranges and %.1f buffers a scan",
+			         static_cast<double>(replayed.dirty_ranges) /
+			             static_cast<double>(replayed.scans),
+			         static_cast<double>(replayed.synchronized) /
+			             static_cast<double>(replayed.scans));
+		}
+		if (captured.scans != 0) {
+			::printf(" (recorded %.1f and %.1f)",
+			         static_cast<double>(captured.dirty_ranges) /
+			             static_cast<double>(captured.scans),
+			         static_cast<double>(captured.synchronized) /
+			             static_cast<double>(captured.scans));
 		}
 		::printf("\n");
 	}
@@ -1094,7 +1316,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		report << "  \"frames\": " << frame_count << ",\n";
 		report << "  \"frame_numbers\": [";
 		for (size_t i = 0; i < frame_count; i++) {
-			report << (i == 0 ? "" : ",") << recorded[i].number;
+			report << (i == 0 ? "" : ",") << recorded[frame_base + i].number;
 		}
 		report << "],\n";
 		report << "  \"restore_ranges_ms\": " << ranges_ms << ",\n";
@@ -1132,7 +1354,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		report << "],\n";
 		report << "  \"frame_dirty_events_timed\": [";
 		for (size_t i = 0; i < frame_count; i++) {
-			report << (i == 0 ? "" : ",") << recorded[i].timed_events.size();
+			report << (i == 0 ? "" : ",") << recorded[frame_base + i].timed_events.size();
 		}
 		report << "],\n";
 		report << "  \"frame_dirty_events_late\": [";
@@ -1142,7 +1364,49 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		report << "],\n";
 		report << "  \"frame_progress_captured\": [";
 		for (size_t i = 0; i < frame_count; i++) {
-			report << (i == 0 ? "" : ",") << recorded[i].progress;
+			report << (i == 0 ? "" : ",") << recorded[frame_base + i].progress;
+		}
+		report << "],\n";
+		report << "  \"frame_prepares\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << prepare_mean[i].prepares;
+		}
+		report << "],\n";
+		report << "  \"frame_scans\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << prepare_mean[i].scans;
+		}
+		report << "],\n";
+		report << "  \"frame_scan_dirty_ranges\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << prepare_mean[i].dirty_ranges;
+		}
+		report << "],\n";
+		report << "  \"frame_scan_synchronized\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << prepare_mean[i].synchronized;
+		}
+		report << "],\n";
+		report << "  \"frame_prepares_recorded\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << recorded[frame_base + i].recorded_prepares.prepares;
+		}
+		report << "],\n";
+		report << "  \"frame_scans_recorded\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << recorded[frame_base + i].recorded_prepares.scans;
+		}
+		report << "],\n";
+		report << "  \"frame_scan_dirty_ranges_recorded\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",")
+			       << recorded[frame_base + i].recorded_prepares.dirty_ranges;
+		}
+		report << "],\n";
+		report << "  \"frame_scan_synchronized_recorded\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",")
+			       << recorded[frame_base + i].recorded_prepares.synchronized;
 		}
 		report << "],\n";
 		report << "  \"frame_progress_replayed\": [";

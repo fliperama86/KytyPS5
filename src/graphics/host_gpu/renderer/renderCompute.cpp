@@ -497,6 +497,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		KYTY_PROFILER_BLOCK("RenderCompute::PrepareBda");
 		m_context.GetGpuResources().PrepareBda();
 	}
+	// The progress clock's second tick of this dispatch; see the same call in descriptors.cpp.
+	GuestGpu::BumpProgress();
 	RebindBuffers(bindings);
 	RebindImages(bindings);
 	KYTY_PROFILER_END_BLOCK;

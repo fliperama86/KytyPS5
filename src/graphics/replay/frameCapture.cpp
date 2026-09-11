@@ -54,8 +54,10 @@ struct PendingSubmission {
 // About 75 000 CPU-dirty marks reach the recorder in a Nexus frame, so the buffer is reserved
 // once and only ever cleared: after the first frame the append path allocates nothing. The churn
 // stream is two orders of magnitude smaller but grows with the captured frame count.
-constexpr size_t DIRTY_EVENT_RESERVE = 262144;
-constexpr size_t CHURN_EVENT_RESERVE = 65536;
+constexpr size_t DIRTY_EVENT_RESERVE   = 262144;
+constexpr size_t CHURN_EVENT_RESERVE   = 65536;
+// One record per draw and dispatch preparation: about 11 000 a frame.
+constexpr size_t PREPARE_EVENT_RESERVE = 131072;
 
 struct Recorder {
 	std::mutex                                      mutex;
@@ -70,10 +72,17 @@ struct Recorder {
 	// and retirements) and from every guest thread that maps or unmaps memory.
 	std::mutex                    churn_mutex;
 	std::vector<ChurnEventRecord> churn_events;
+	// The preparations of the frame. Appended from the GPU thread only, but the writer reads it
+	// from there too, so it takes the lock like the others.
+	std::mutex                      prepare_mutex;
+	std::vector<PrepareEventRecord> prepare_events;
 	// Index of the frame being recorded inside the capture window, 0 for the first. Written by
 	// the GPU thread in RecordDone, read by every thread that appends an event.
 	std::atomic_uint32_t frame_index {0};
 };
+
+void CapturePrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
+                         uint64_t dirty_bytes);
 
 struct State {
 	bool                  armed      = false;
@@ -99,9 +108,11 @@ State& Instance() {
 			state.exit_after = Config::FrameCaptureExitEnabled();
 			state.recorder.dirty_events.reserve(DIRTY_EVENT_RESERVE);
 			state.recorder.churn_events.reserve(CHURN_EVENT_RESERVE);
+			state.recorder.prepare_events.reserve(PREPARE_EVENT_RESERVE);
 			state.active.store(true, std::memory_order_relaxed);
 			Detail::g_dirty_events_armed.store(true, std::memory_order_relaxed);
 			Detail::g_churn_events_armed.store(true, std::memory_order_relaxed);
+			SetPrepareSink(&CapturePrepareEvent);
 			LOGF("FrameCapture: armed, folder=%s frame=%d frames=%u exit=%s\n",
 			     state.folder.string().c_str(), state.capture_at, state.frames,
 			     state.exit_after ? "true" : "false");
@@ -110,6 +121,23 @@ State& Instance() {
 	}();
 	(void)loaded;
 	return state;
+}
+
+// The capture's prepare sink: one record per GpuResourceManager::PrepareBda call of the frame.
+// GPU thread only.
+void CapturePrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
+                         uint64_t dirty_bytes) {
+	auto&              recorder = Instance().recorder;
+	PrepareEventRecord record {};
+	record.frame        = recorder.frame_index.load(std::memory_order_relaxed);
+	record.progress     = GuestGpu::Progress();
+	record.scanned      = scanned ? 1u : 0u;
+	record.dirty_ranges = dirty_ranges;
+	record.synchronized = synchronized;
+	record.dirty_bytes  = dirty_bytes;
+
+	std::scoped_lock lock(recorder.prepare_mutex);
+	recorder.prepare_events.push_back(record);
 }
 
 // Churn-event counts per kind and per frame, for the manifest.
@@ -418,6 +446,35 @@ uint64_t WriteChurnEvents(const std::filesystem::path& folder, ChurnCounts& coun
 	return count;
 }
 
+// Every draw and dispatch preparation of the captured frames and whether it scanned: the ground
+// truth a replay is measured against (docs/frame-replay.md, phase E).
+uint64_t WritePrepareEvents(const std::filesystem::path& folder, std::vector<uint64_t>& per_frame,
+                            std::vector<uint64_t>& scans_per_frame, uint64_t& scans, bool& ok) {
+	Writer file;
+	if (!file.Open(folder / "prepare-events.bin")) {
+		LOGF("FrameCapture: cannot create prepare-events.bin\n");
+		ok = false;
+		return 0;
+	}
+
+	auto&            recorder = Instance().recorder;
+	std::unique_lock lock(recorder.prepare_mutex);
+	file.Write(recorder.prepare_events.data(),
+	           recorder.prepare_events.size() * sizeof(PrepareEventRecord));
+	for (const auto& event: recorder.prepare_events) {
+		CountPerFrame(per_frame, event.frame);
+		if (event.scanned != 0) {
+			CountPerFrame(scans_per_frame, event.frame);
+			scans++;
+		}
+	}
+	const auto count = static_cast<uint64_t>(recorder.prepare_events.size());
+	lock.unlock();
+
+	ok = file.Close() && ok;
+	return count;
+}
+
 void WriteRegisters(std::span<const ProcessorRegisters> processors,
                     const std::filesystem::path& folder, bool& ok) {
 	static_assert(std::is_trivially_copyable_v<HW::Context>);
@@ -563,9 +620,14 @@ std::string TitleId() {
 } // namespace
 
 namespace Detail {
-std::atomic_bool g_dirty_events_armed {false};
-std::atomic_bool g_churn_events_armed {false};
+std::atomic_bool            g_dirty_events_armed {false};
+std::atomic_bool            g_churn_events_armed {false};
+std::atomic<PrepareSink>    g_prepare_sink {nullptr};
 } // namespace Detail
+
+void SetPrepareSink(PrepareSink sink) noexcept {
+	Detail::g_prepare_sink.store(sink, std::memory_order_release);
+}
 
 bool Armed() noexcept {
 	return Instance().active.load(std::memory_order_relaxed);
@@ -673,6 +735,10 @@ void ResetFrame() noexcept {
 		std::scoped_lock lock(recorder.churn_mutex);
 		recorder.churn_events.clear();
 	}
+	{
+		std::scoped_lock lock(recorder.prepare_mutex);
+		recorder.prepare_events.clear();
+	}
 	recorder.frame_index.store(0, std::memory_order_relaxed);
 }
 
@@ -779,6 +845,12 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	ChurnCounts churn;
 	const auto  churn_events = WriteChurnEvents(folder, churn, ok);
 	Detail::g_churn_events_armed.store(false, std::memory_order_relaxed);
+	std::vector<uint64_t> prepares_per_frame;
+	std::vector<uint64_t> prepare_scans_per_frame;
+	uint64_t              prepare_scans = 0;
+	const auto prepare_events = WritePrepareEvents(folder, prepares_per_frame,
+	                                               prepare_scans_per_frame, prepare_scans, ok);
+	SetPrepareSink(nullptr);
 	uint32_t   width       = 0;
 	uint32_t   height      = 0;
 	const auto video_out   = WriteVideoOut(folder, width, height, ok);
@@ -791,7 +863,8 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	// the frames in which nothing of that kind happened.
 	const auto frames = frame_numbers.size();
 	for (auto* counts: {&dirty_per_frame, &churn.registers, &churn.retires, &churn.maps,
-	                    &churn.unmaps, &progress_per_frame}) {
+	                    &churn.unmaps, &progress_per_frame, &prepares_per_frame,
+	                    &prepare_scans_per_frame}) {
 		counts->resize(frames, 0);
 	}
 
@@ -832,6 +905,11 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	out += fmt::format("\t\"churn_retires_per_frame\": {},\n", JsonArray(churn.retires));
 	out += fmt::format("\t\"churn_maps_per_frame\": {},\n", JsonArray(churn.maps));
 	out += fmt::format("\t\"churn_unmaps_per_frame\": {},\n", JsonArray(churn.unmaps));
+	out += fmt::format("\t\"prepare_events\": {},\n", prepare_events);
+	out += fmt::format("\t\"prepare_scans\": {},\n", prepare_scans);
+	out += fmt::format("\t\"prepares_per_frame\": {},\n", JsonArray(prepares_per_frame));
+	out += fmt::format("\t\"prepare_scans_per_frame\": {},\n",
+	                   JsonArray(prepare_scans_per_frame));
 	out += fmt::format("\t\"submissions\": {},\n", submissions);
 	out += fmt::format("\t\"prt_apertures\": {},\n", apertures);
 	out += fmt::format("\t\"shaders\": {},\n", shaders);
@@ -867,17 +945,20 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 	LOGF("FrameCapture: %zu frame(s) ending at %d written to %s in %.2f s: %" PRIu64
 	     " ranges, %" PRIu64 " pages (%.2f MiB), %" PRIu64 " dirty pages, %" PRIu64
-	     " dirty events, %" PRIu64 " churn events over %" PRIu64 " draws, %" PRIu64
-	     " submissions, %zu gaps%s\n",
+	     " dirty events, %" PRIu64 " churn events, %" PRIu64 " preparations (%" PRIu64
+	     " scans) over %" PRIu64 " ticks, %" PRIu64 " submissions, %zu gaps%s\n",
 	     frames, frame_num, folder.string().c_str(), seconds, memory.ranges, memory.pages,
 	     static_cast<double>(memory.bytes) / (1024.0 * 1024.0), dirty_pages, dirty_events,
-	     churn_events, progress, submissions, gaps.size(), ok ? "" : " (INCOMPLETE)");
+	     churn_events, prepare_events, prepare_scans, progress, submissions, gaps.size(),
+	     ok ? "" : " (INCOMPLETE)");
 	std::printf("FrameCapture: %zu frame(s) ending at %d written to %s in %.2f s: %" PRIu64
 	            " pages (%.2f MiB), %" PRIu64 " submissions, %" PRIu64 " dirty events, %" PRIu64
-	            " churn events over %" PRIu64 " draws, %zu gaps%s\n",
+	            " churn events, %" PRIu64 " preparations (%" PRIu64 " scans) over %" PRIu64
+	            " ticks, %zu gaps%s\n",
 	            frames, frame_num, folder.string().c_str(), seconds, memory.pages,
 	            static_cast<double>(memory.bytes) / (1024.0 * 1024.0), submissions, dirty_events,
-	            churn_events, progress, gaps.size(), ok ? "" : " (INCOMPLETE)");
+	            churn_events, prepare_events, prepare_scans, progress, gaps.size(),
+	            ok ? "" : " (INCOMPLETE)");
 	std::fflush(stdout);
 
 	return ok;

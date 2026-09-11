@@ -131,6 +131,18 @@ std::vector<DirtyEventRecord> DirtyEvents() {
 	return events;
 }
 
+// The BDA preparations of the same two frames: three in the first, two of which scanned, and two
+// in the second, one of which did. This is the ground truth a replay is compared with.
+std::vector<PrepareEventRecord> PrepareEvents() {
+	std::vector<PrepareEventRecord> events;
+	events.push_back({0, 2, 1, 4, 7, 0, 0x8000});
+	events.push_back({0, 6, 0, 0, 0, 0, 0});
+	events.push_back({0, 14, 1, 2, 3, 0, 0x2000});
+	events.push_back({1, 3, 1, 1, 1, 0, 0x1000});
+	events.push_back({1, 8, 0, 0, 0, 0, 0});
+	return events;
+}
+
 // The other generation bumps of the same two frames: a buffer registered and retired in the
 // first, a guest map and unmap in the second.
 std::vector<ChurnEventRecord> ChurnEvents() {
@@ -233,6 +245,16 @@ bool WriteCapture(const std::filesystem::path& dir) {
 			return false;
 		}
 		for (const auto& event: ChurnEvents()) {
+			writer.Value(event);
+		}
+	}
+
+	{
+		Writer writer(dir / "prepare-events.bin");
+		if (!writer.Ok()) {
+			return false;
+		}
+		for (const auto& event: PrepareEvents()) {
 			writer.Value(event);
 		}
 	}
@@ -346,6 +368,7 @@ bool WriteCapture(const std::filesystem::path& dir) {
 		manifest << "  \"dirty_events\": " << DirtyEvents().size()
 		         << ", \"progress_events\": " << PROGRESS_EVENTS << ",\n";
 		manifest << "  \"churn_events\": " << ChurnEvents().size() << ",\n";
+		manifest << "  \"prepare_events\": " << PrepareEvents().size() << ", \"prepare_scans\": 3,\n";
 		manifest << "  \"gaps\": []\n";
 		manifest << "}\n";
 	}
@@ -393,7 +416,15 @@ void RunTests(const std::filesystem::path& root) {
 	    "{\"format_version\": 4, \"frames\": 6, \"churn_events\": 900}", &manifest, &error));
 	CHECK(manifest.frames == 6);
 	CHECK(manifest.churn_events == 900);
-	CHECK(!CaptureReader::ParseManifest("{\"format_version\": 5}", &manifest, &error));
+	// A version 4 manifest carries no prepare ground truth.
+	CHECK(manifest.prepare_events == 0);
+	CHECK(manifest.prepare_scans == 0);
+	CHECK(CaptureReader::ParseManifest(
+	    "{\"format_version\": 5, \"prepare_events\": 11000, \"prepare_scans\": 352}", &manifest,
+	    &error));
+	CHECK(manifest.prepare_events == 11000);
+	CHECK(manifest.prepare_scans == 352);
+	CHECK(!CaptureReader::ParseManifest("{\"format_version\": 6}", &manifest, &error));
 	CHECK(error.find("version") != std::string::npos);
 	CHECK(!CaptureReader::ParseManifest("{\"frame\": 1}", &manifest, &error));
 
@@ -447,6 +478,22 @@ void RunTests(const std::filesystem::path& root) {
 	CHECK(churn[2].kind == static_cast<uint32_t>(ChurnEventKind::Map));
 	CHECK(churn[3].kind == static_cast<uint32_t>(ChurnEventKind::Unmap));
 	CHECK(churn[3].size == 0x10000);
+
+	std::vector<PrepareEventRecord> prepares;
+	bool                            prepares_present = false;
+	CHECK(reader.ReadPrepareEvents(&prepares, &prepares_present, &error));
+	CHECK(prepares_present);
+	CHECK(prepares.size() == PrepareEvents().size());
+	CHECK(prepares[0].frame == 0);
+	CHECK(prepares[0].scanned == 1);
+	CHECK(prepares[0].dirty_ranges == 4);
+	CHECK(prepares[0].synchronized == 7);
+	CHECK(prepares[0].dirty_bytes == 0x8000);
+	CHECK(prepares[1].scanned == 0);
+	CHECK(prepares[3].frame == 1);
+	CHECK(prepares[3].scanned == 1);
+	CHECK(reader.Manifest().prepare_events == PrepareEvents().size());
+	CHECK(reader.Manifest().prepare_scans == 3);
 
 	std::vector<CaptureRegisterFile> register_files;
 	CHECK(reader.ReadRegisterFiles(&register_files, &error));
@@ -545,6 +592,7 @@ void RunTests(const std::filesystem::path& root) {
 	std::filesystem::remove(legacy / "shaders.bin", ec);
 	std::filesystem::remove(legacy / "dirty-events.bin", ec);
 	std::filesystem::remove(legacy / "churn-events.bin", ec);
+	std::filesystem::remove(legacy / "prepare-events.bin", ec);
 	ReplaceManifestVersion(legacy, "{\"format_version\": 1, \"frame\": 5}\n");
 	{
 		CaptureReader legacy_reader;
@@ -567,6 +615,10 @@ void RunTests(const std::filesystem::path& root) {
 		CHECK(legacy_reader.ReadChurnEvents(&no_churn, &legacy_present, &error));
 		CHECK(!legacy_present);
 		CHECK(no_churn.empty());
+		std::vector<PrepareEventRecord> no_prepares;
+		CHECK(legacy_reader.ReadPrepareEvents(&no_prepares, &legacy_present, &error));
+		CHECK(!legacy_present);
+		CHECK(no_prepares.empty());
 		CHECK(legacy_reader.Manifest().dirty_events == 0);
 		CHECK(legacy_reader.Manifest().progress_events == 0);
 		CHECK(legacy_reader.Manifest().frames == 0);
@@ -577,6 +629,7 @@ void RunTests(const std::filesystem::path& root) {
 	const auto legacy3 = root / "legacy3";
 	CopyCapture(good, legacy3);
 	std::filesystem::remove(legacy3 / "churn-events.bin", ec);
+	std::filesystem::remove(legacy3 / "prepare-events.bin", ec);
 	{
 		Writer writer(legacy3 / "dirty-events.bin");
 		CHECK(writer.Ok());
@@ -629,6 +682,16 @@ void RunTests(const std::filesystem::path& root) {
 		bool                          short_present = false;
 		CHECK(!short_reader.ReadDirtyEvents(&records, &short_present, &error));
 		CHECK(error.find("dirty-events.bin") != std::string::npos);
+	}
+	{
+		const auto size = std::filesystem::file_size(truncated / "prepare-events.bin", ec);
+		TruncateFile(truncated / "prepare-events.bin", size - 5);
+		CaptureReader short_reader;
+		CHECK(short_reader.Open(truncated, &error));
+		std::vector<PrepareEventRecord> records;
+		bool                            short_present = false;
+		CHECK(!short_reader.ReadPrepareEvents(&records, &short_present, &error));
+		CHECK(error.find("prepare-events.bin") != std::string::npos);
 	}
 	{
 		const auto size = std::filesystem::file_size(truncated / "churn-events.bin", ec);

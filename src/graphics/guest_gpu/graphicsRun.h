@@ -56,16 +56,32 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
-	// The frame's progress clock (docs/frame-replay.md, phase D). One relaxed atomic increment per
-	// draw and per dispatch as the command processors execute them, reset by Done(). It is the
-	// only always-on addition the CPU-write timing needed: a counter that means the same thing in
-	// a game run and in a replay, which wall time does not. The frame capture keys every CPU-dirty
-	// mark to it and the replay's marker thread waits on it, so the marks land at the same point
-	// in the GPU thread's work and the BDA generation moves as often as it does in the game.
+	// The frame's progress clock (docs/frame-replay.md, phases D and E). Relaxed atomic
+	// increments on the GPU thread, reset by Done(): one when a draw or dispatch starts and one
+	// after its resource preparation stage, so a CPU write that arrives before a draw's
+	// GpuResourceManager::PrepareBda carries a different value from one that arrives after it.
+	// (The second tick is unconditional, not tied to whether the stage needed a BDA preparation,
+	// so the clock does not depend on --gpu-descriptors.) It is the only always-on addition the
+	// CPU-write timing needed: a counter that means the same thing in a game run and in a replay,
+	// which wall time does not. The frame capture keys every CPU-dirty mark to it and the replay
+	// applies each mark when the clock reaches its value, so the marks land at the same point in
+	// the GPU thread's work and the BDA generation moves as often as it does in the game.
 	[[nodiscard]] static uint32_t Progress() noexcept {
 		return s_progress.load(std::memory_order_relaxed);
 	}
-	static void BumpProgress() noexcept { s_progress.fetch_add(1, std::memory_order_relaxed); }
+	// Called with the new value on the GPU thread every time the clock ticks; the frame replay
+	// installs one to apply the recorded CPU writes of that tick inline, on the thread and at the
+	// point the game's own writes reached the cache. Null outside a replay, one relaxed load.
+	using ProgressHook = void (*)(uint32_t progress);
+	static void SetProgressHook(ProgressHook hook) noexcept {
+		s_progress_hook.store(hook, std::memory_order_release);
+	}
+	static void BumpProgress() noexcept {
+		const auto value = s_progress.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (auto* hook = s_progress_hook.load(std::memory_order_relaxed); hook != nullptr) {
+			hook(value);
+		}
+	}
 	static void ResetProgress() noexcept { s_progress.store(0, std::memory_order_relaxed); }
 	// Index of the submission the GPU thread has started, also reset by Done(). Recorded next to
 	// a dirty event so the stream can be read by hand; nothing depends on it.
@@ -131,7 +147,8 @@ private:
 	std::jthread    m_thread;
 
 	// Written only by the GPU thread, read by any thread; see Progress() above.
-	inline static std::atomic_uint32_t s_progress {0};
+	inline static std::atomic_uint32_t              s_progress {0};
+	inline static std::atomic<GuestGpu::ProgressHook> s_progress_hook {nullptr};
 	inline static std::atomic_uint32_t s_submission_index {0};
 
 	friend class CommandProcessor;

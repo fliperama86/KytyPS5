@@ -45,6 +45,27 @@ inline void RecordDirtyEvent(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// One GpuResourceManager::PrepareBda call, reported to whoever is watching: the capture, which
+// writes it to prepare-events.bin, or a replay, which counts it (format version 5,
+// docs/frame-replay.md, phase E). Both need the same call, and neither is on in a normal run, so
+// it is a single relaxed load of a null pointer there.
+using PrepareSink = void (*)(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
+                             uint64_t dirty_bytes);
+
+namespace Detail {
+extern std::atomic<PrepareSink> g_prepare_sink;
+} // namespace Detail
+
+// Installs the sink; null removes it. The capture installs its own when it arms.
+void SetPrepareSink(PrepareSink sink) noexcept;
+
+inline void RecordPrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
+                               uint64_t dirty_bytes) {
+	if (auto* sink = Detail::g_prepare_sink.load(std::memory_order_relaxed); sink != nullptr) {
+		sink(scanned, dirty_ranges, synchronized, dirty_bytes);
+	}
+}
+
 // Appends one BDA-generation bump that is not a CPU write: a buffer registration or retirement,
 // or a guest map or unmap (format version 4, docs/frame-replay.md, phase E). Diagnostics only --
 // the replay does not consume the stream; it is what says whether the guest's buffer churn has a

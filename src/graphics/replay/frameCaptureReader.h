@@ -18,11 +18,16 @@ struct CaptureManifest {
 	uint64_t frame          = 0;
 	uint32_t width          = 0;
 	uint32_t height         = 0;
-	// Version 3. `progress_events` is GuestGpu::Progress() at the end of the captured frame, the
+	// Version 3. `progress_events` is GuestGpu::Progress() summed over the captured frames, the
 	// draws plus dispatches the replay's progress clock has to reach for every dirty event to be
 	// marked on time; both are 0 in an older capture.
 	uint64_t dirty_events    = 0;
 	uint64_t progress_events = 0;
+	// Version 4. How many consecutive frames the capture holds; 0 in an older capture, which the
+	// replay reads as one. The frames themselves are delimited by the Done records of
+	// submissions.bin, which also carry each frame's number and progress count.
+	uint32_t frames       = 0;
+	uint64_t churn_events = 0;
 };
 
 struct CaptureRegisterFile {
@@ -62,9 +67,14 @@ public:
 	bool ReadPrtApertures(std::vector<PrtApertureRecord>* out, bool* present,
 	                      std::string* error) const;
 	bool ReadShaders(std::vector<ShaderRecord>* out, bool* present, std::string* error) const;
-	// The version 3 stream: every CPU-dirty mark of the frame in arrival order. Absent in a v1 or
-	// v2 capture, which reports `present` false and leaves the replay on the batch path.
+	// The version 3 stream: every CPU-dirty mark of the frames in arrival order. Absent in a v1 or
+	// v2 capture, which reports `present` false and leaves the replay on the batch path. A v3
+	// stream is 24-byte records without a frame index and widens to frame 0 on the way out.
 	bool ReadDirtyEvents(std::vector<DirtyEventRecord>* out, bool* present,
+	                     std::string* error) const;
+	// The version 4 stream: the buffer registrations, retirements and guest map and unmap calls
+	// that moved the BDA generation. Diagnostics -- nothing in the replay consumes it.
+	bool ReadChurnEvents(std::vector<ChurnEventRecord>* out, bool* present,
 	                     std::string* error) const;
 
 	// Streams memory.bin one page at a time, so a multi-GB capture never has to fit in memory.

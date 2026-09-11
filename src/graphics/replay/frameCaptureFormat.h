@@ -8,10 +8,13 @@
 //   manifest.json     format_version, title_id, commit, frame, width, height, counts, gaps
 //   ranges.bin        RangeRecord[]            every mapped guest range at capture time
 //   memory.bin        PageRecord[]             every non-zero 16 KiB page of committed ranges
-//   dirty-pages.bin   uint64_t[]               pages the CPU modified during the captured frame
-//   dirty-events.bin  DirtyEventRecord[]       every CPU-dirty mark of the frame, in arrival
+//   dirty-pages.bin   uint64_t[]               pages the CPU modified during the captured frames
+//   dirty-events.bin  DirtyEventRecord[]       every CPU-dirty mark of the frames, in arrival
 //                                              order, keyed to the GPU thread's progress (v3)
-//   submissions.bin   SubmissionRecord stream  the captured frame, in processing-start order
+//   churn-events.bin  ChurnEventRecord[]       every other BDA-generation bump of the frames:
+//                                              buffer registrations and retirements, guest map
+//                                              and unmap calls; diagnostics only (v4)
+//   submissions.bin   SubmissionRecord stream  the captured frames, in processing-start order
 //   registers.bin     RegisterFileRecord stream  command-processor register files at frame start
 //   videoout.bin      VideoOutRecord stream    buffer registrations, one per attribute group
 //   prt.bin           PrtApertureRecord[]      partially-resident-texture apertures (v2)
@@ -30,7 +33,12 @@ namespace Libs::Graphics::Replay {
 //
 // Version 3 adds dirty-events.bin, the *timing* of the frame's CPU writes. dirty-pages.bin stays
 // for older readers and is what a v3 replay falls back to when the event stream is absent.
-constexpr uint32_t kFormatVersion    = 3;
+//
+// Version 4 adds churn-events.bin, records several consecutive frames instead of one (see the
+// Done submission record and the manifest's "frames"), and widens DirtyEventRecord by the frame
+// index the mark belongs to. A version 3 stream of 24-byte dirty events still reads: the reader
+// widens it with frame 0, which is the only frame such a capture has.
+constexpr uint32_t kFormatVersion    = 4;
 constexpr uint32_t kMinFormatVersion = 1;
 constexpr uint64_t kPageSize         = 16384;
 
@@ -59,7 +67,10 @@ enum class SubmissionKind : uint32_t {
 	Graphics        = 0, // command_dwords then constant_dwords follow the header
 	Compute         = 1, // command_dwords follow the header; queue_id is the guest queue id
 	FlipPreparation = 2, // no dwords; flip_request_id is set
-	Done            = 3, // no dwords; marks GuestGpu::Done()
+	Done            = 3, // no dwords; marks GuestGpu::Done() and so the end of a captured frame.
+	                     // v4: flip_request_id is that frame's GuestGpu frame number and queue_id
+	                     // its progress count (draws plus dispatches), so a multi-frame capture
+	                     // needs no per-frame arrays in the manifest to be replayed.
 };
 
 // One submission of the captured frame. The header is followed by `command_dwords` uint32_t and
@@ -140,28 +151,76 @@ static_assert(sizeof(ShaderRecord) == 40);
 // submission the GPU thread had started when the mark arrived, for reading the stream by hand;
 // the replay ignores it. Records are in arrival order, so the stream is sorted by neither field.
 struct DirtyEventRecord {
+	uint32_t frame      = 0; // index of the frame inside the capture, 0 to frames - 1 (v4)
 	uint32_t progress   = 0;
 	uint32_t submission = 0;
 	uint64_t vaddr      = 0;
 	uint64_t size       = 0;
 };
-static_assert(sizeof(DirtyEventRecord) == 24);
+static_assert(sizeof(DirtyEventRecord) == 28);
+
+// The version 3 layout of the record above, without the frame index. Only the reader knows about
+// it: a v3 capture has exactly one frame, so every such record widens to frame 0.
+struct DirtyEventRecordV3 {
+	uint32_t progress   = 0;
+	uint32_t submission = 0;
+	uint64_t vaddr      = 0;
+	uint64_t size       = 0;
+};
+static_assert(sizeof(DirtyEventRecordV3) == 24);
+
+// The *other* things that bump the BDA generation, which is what decides how many BDA scans a
+// frame pays (GpuResourceManager::PrepareBda). A CPU-dirty mark is one of them and has its own
+// stream; this one records the rest, measured in the game and missing from a replay of a single
+// frame: BufferCache::ChangeRegister on every buffer registration (InvalidateBda) and every
+// retirement (BumpBdaGeneration), and GpuResourceManager::MapMemory / UnmapMemory, which the
+// kernel calls on every guest map and unmap.
+//
+// These records are diagnostics: the replay does not consume them. They exist to answer whether
+// the guest's buffer addresses repeat with a short period -- a ring the replay reproduces by
+// looping several captured frames -- or march forward for ever, which no loop can reproduce.
+// See the phase E section of docs/frame-replay.md.
+enum class ChurnEventKind : uint32_t {
+	BufferRegister = 0, // BufferCache::ChangeRegister<true>, vaddr/size are the buffer's
+	BufferRetire   = 1, // BufferCache::ChangeRegister<false>
+	Map            = 2, // GpuResourceManager::MapMemory, from the kernel's MapGpuRange
+	Unmap          = 3, // GpuResourceManager::UnmapMemory, from the kernel's UnmapGpuRange
+};
+
+struct ChurnEventRecord {
+	uint32_t frame    = 0;
+	uint32_t progress = 0; // GuestGpu::Progress() when the event arrived
+	uint32_t kind     = 0; // ChurnEventKind
+	uint64_t vaddr    = 0;
+	uint64_t size     = 0;
+};
+static_assert(sizeof(ChurnEventRecord) == 28);
 
 #pragma pack(pop)
 
 // manifest.json keys, all at the top level, written by the capture side. The replay side needs
 // only format_version and frame; everything else is for people and scripts.
 //
-//   "format_version": 3
+//   "format_version": 4
 //   "title_id": "PPSA01342"
 //   "commit": "<git hash of the capturing build>"
-//   "frame": <GuestGpu frame number of the captured frame>
+//   "frame": <GuestGpu frame number of the first captured frame>
 //   "width": <presented width>, "height": <presented height>
 //   "ranges": <count>, "pages": <count>, "dirty_pages": <count>, "submissions": <count>
 //   "prt_apertures": <count>, "shaders": <count>                                    (v2)
 //   "dirty_events": <count>          records in dirty-events.bin                    (v3)
-//   "progress_events": <count>       GuestGpu::Progress() at the end of the frame,
-//                                    that is draws plus dispatches                  (v3)
+//   "progress_events": <count>       GuestGpu::Progress() summed over the captured
+//                                    frames, that is draws plus dispatches          (v3)
+//   "frames": <count>                consecutive frames in this capture             (v4)
+//   "snapshot_frame": <number>       the frame whose end the memory, register,
+//                                    video-out, aperture and shader snapshot is of:
+//                                    the last of them                               (v4)
+//   "frame_numbers": [<n>, ...]      their GuestGpu frame numbers                   (v4)
+//   "dirty_events_per_frame": [...]  dirty-events.bin records per frame             (v4)
+//   "progress_events_per_frame": []  draws plus dispatches per frame                (v4)
+//   "churn_events": <count>          records in churn-events.bin                    (v4)
+//   "churn_registers_per_frame": [], "churn_retires_per_frame": [],
+//   "churn_maps_per_frame": [], "churn_unmaps_per_frame": []                        (v4)
 //   "gaps": [ {"vaddr": <hex string>, "size": <hex string>, "reason": "<text>"}, ... ]
 //           ranges the capture could not read back from the GPU (image-owned or unsupported)
 

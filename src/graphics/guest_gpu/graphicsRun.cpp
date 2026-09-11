@@ -223,12 +223,14 @@ void GuestGpu::Done() {
 	if (Replay::Armed()) {
 		const auto frame_num = m_done_num.load();
 		if (Replay::RecordingFrame(frame_num)) {
-			Replay::RecordDone();
+			Replay::RecordDone(frame_num, Progress());
 		}
-		if (Replay::ShouldCapture(frame_num)) {
-			CaptureFrame(frame_num);
-		} else {
-			Replay::ResetFrame();
+		// A capture may span several consecutive frames (--frame-capture-frames), so the frame
+		// that just ended is either dropped, kept for the window, or the last one and written.
+		switch (Replay::OnFrameDone(frame_num)) {
+			case Replay::FrameDisposition::Write: CaptureFrame(frame_num); break;
+			case Replay::FrameDisposition::Discard: Replay::ResetFrame(); break;
+			case Replay::FrameDisposition::Keep: break;
 		}
 	}
 	m_graphics_done = true;

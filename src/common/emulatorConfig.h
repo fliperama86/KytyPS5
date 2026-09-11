@@ -68,12 +68,14 @@ struct ConfigOptions {
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
-	// One-frame capture for the replay harness (docs/frame-replay.md). Off unless a folder is
+	// Frame capture for the replay harness (docs/frame-replay.md). Off unless a folder is
 	// given; frame_capture_at < 0 waits for a file named "trigger" inside that folder.
+	// frame_capture_frames is how many consecutive frames are recorded from there on.
 	bool                  frame_capture_enabled = false;
 	std::filesystem::path frame_capture_folder;
-	int32_t               frame_capture_at   = -1;
-	bool                  frame_capture_exit = true;
+	int32_t               frame_capture_at     = -1;
+	uint32_t              frame_capture_frames = 1;
+	bool                  frame_capture_exit   = true;
 	bool                   graphics_debug_dump_enabled = false;
 	OutputDirection        printf_direction            = OutputDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
@@ -86,6 +88,8 @@ struct ConfigOptions {
 	// Frame replay (docs/frame-replay.md). An empty replay_dir leaves every replay path inert.
 	std::filesystem::path  replay_dir;
 	uint32_t               replay_loops                = DEFAULT_REPLAY_LOOPS;
+	// How many of the capture's frames one loop replays; 0 means all of them.
+	uint32_t               replay_frames               = 0;
 	std::filesystem::path  replay_image;
 	ThreadAffinity         thread_affinity             = ThreadAffinity::Auto;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -121,6 +125,7 @@ std::filesystem::path GetCommandBufferDumpFolder();
 bool                  FrameCaptureEnabled();
 std::filesystem::path GetFrameCaptureFolder();
 int32_t               GetFrameCaptureFrame();
+uint32_t              GetFrameCaptureFrames();
 bool                  FrameCaptureExitEnabled();
 
 bool GraphicsDebugDumpEnabled();
@@ -141,6 +146,7 @@ bool PlayGoHackEnabled();
 bool                  ReplayEnabled();
 std::filesystem::path GetReplayDir();
 uint32_t              GetReplayLoops();
+uint32_t              GetReplayFrames();
 std::filesystem::path GetReplayImage();
 
 ThreadAffinity GetThreadAffinity();

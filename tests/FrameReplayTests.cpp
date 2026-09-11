@@ -5,9 +5,9 @@
 //
 // The synthetic capture is what src/graphics/replay/frameReplay.cpp is exercised against without
 // the game: three committed ranges, a handful of non-zero pages, an empty dirty-page set, a few
-// CPU-dirty events, a zeroed graphics register file, one video-out registration of a small 2D
-// buffer, and a submission stream of NOP packets followed by a flip preparation and a Done. See
-// docs/frame-replay.md.
+// CPU-dirty events and churn events, a zeroed graphics register file, one video-out registration
+// of a small 2D buffer, and two frames of NOP packets, each a graphics submission plus a flip
+// preparation and closed by a Done record. See docs/frame-replay.md.
 
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/replay/frameCaptureReader.h"
@@ -119,17 +119,36 @@ RangeRecord MakeRange(uint64_t vaddr, uint64_t size, uint32_t prot, uint32_t typ
 	return record;
 }
 
-// The frame's CPU-dirty marks: one before the first draw, then two during it. `submission` is
-// carried for people reading the stream; nothing in the reader looks at it.
+// The frames' CPU-dirty marks: one before the first draw of frame 0, then two during it, and one
+// in frame 1. `submission` is carried for people reading the stream; nothing in the reader looks
+// at it.
 std::vector<DirtyEventRecord> DirtyEvents() {
 	std::vector<DirtyEventRecord> events;
-	events.push_back({0, 0, SCRATCH_ADDRESS, 0x1000});
-	events.push_back({3, 1, SCRATCH_ADDRESS + 0x1000, 0x40});
-	events.push_back({17, 2, DISPLAY_ADDRESS, 0x2000});
+	events.push_back({0, 0, 0, SCRATCH_ADDRESS, 0x1000});
+	events.push_back({0, 3, 1, SCRATCH_ADDRESS + 0x1000, 0x40});
+	events.push_back({0, 17, 2, DISPLAY_ADDRESS, 0x2000});
+	events.push_back({1, 5, 0, SCRATCH_ADDRESS + 0x2000, 0x80});
 	return events;
 }
 
-constexpr uint32_t PROGRESS_EVENTS = 21;
+// The other generation bumps of the same two frames: a buffer registered and retired in the
+// first, a guest map and unmap in the second.
+std::vector<ChurnEventRecord> ChurnEvents() {
+	std::vector<ChurnEventRecord> events;
+	events.push_back({0, 2, static_cast<uint32_t>(ChurnEventKind::BufferRegister), SCRATCH_ADDRESS,
+	                  0x4000});
+	events.push_back({0, 9, static_cast<uint32_t>(ChurnEventKind::BufferRetire), SCRATCH_ADDRESS,
+	                  0x4000});
+	events.push_back({1, 0, static_cast<uint32_t>(ChurnEventKind::Map), DISPLAY_ADDRESS, 0x10000});
+	events.push_back({1, 4, static_cast<uint32_t>(ChurnEventKind::Unmap), DISPLAY_ADDRESS, 0x10000});
+	return events;
+}
+
+// Two frames, the second shorter, and their GuestGpu frame numbers.
+constexpr uint32_t CAPTURE_FRAMES         = 2;
+constexpr uint64_t FIRST_FRAME_NUMBER     = 42;
+constexpr uint32_t FRAME_PROGRESS[2]      = {21, 13};
+constexpr uint32_t PROGRESS_EVENTS        = FRAME_PROGRESS[0] + FRAME_PROGRESS[1];
 
 // A PM4 type-3 NOP: KYTY_PM4(2, IT_NOP, 0) followed by one payload dword the parser skips.
 constexpr uint32_t PM4_NOP_HEADER = 0xc0001000u;
@@ -209,6 +228,16 @@ bool WriteCapture(const std::filesystem::path& dir) {
 	}
 
 	{
+		Writer writer(dir / "churn-events.bin");
+		if (!writer.Ok()) {
+			return false;
+		}
+		for (const auto& event: ChurnEvents()) {
+			writer.Value(event);
+		}
+	}
+
+	{
 		Writer writer(dir / "registers.bin");
 		if (!writer.Ok()) {
 			return false;
@@ -274,24 +303,29 @@ bool WriteCapture(const std::filesystem::path& dir) {
 		if (!writer.Ok()) {
 			return false;
 		}
-		const auto       draw = NopStream(8);
-		SubmissionRecord graphics {};
-		graphics.kind           = static_cast<uint32_t>(SubmissionKind::Graphics);
-		graphics.command_dwords = static_cast<uint32_t>(draw.size());
-		writer.Value(graphics);
-		writer.Bytes(draw.data(), draw.size() * sizeof(uint32_t));
-		submission_count++;
+		for (uint32_t frame = 0; frame < CAPTURE_FRAMES; frame++) {
+			const auto       draw = NopStream(8 - 2 * frame);
+			SubmissionRecord graphics {};
+			graphics.kind           = static_cast<uint32_t>(SubmissionKind::Graphics);
+			graphics.command_dwords = static_cast<uint32_t>(draw.size());
+			writer.Value(graphics);
+			writer.Bytes(draw.data(), draw.size() * sizeof(uint32_t));
+			submission_count++;
 
-		SubmissionRecord flip {};
-		flip.kind            = static_cast<uint32_t>(SubmissionKind::FlipPreparation);
-		flip.flip_request_id = 1;
-		writer.Value(flip);
-		submission_count++;
+			SubmissionRecord flip {};
+			flip.kind            = static_cast<uint32_t>(SubmissionKind::FlipPreparation);
+			flip.flip_request_id = 1 + frame;
+			writer.Value(flip);
+			submission_count++;
 
-		SubmissionRecord done {};
-		done.kind = static_cast<uint32_t>(SubmissionKind::Done);
-		writer.Value(done);
-		submission_count++;
+			// A Done record ends the frame and carries its number and progress count (v4).
+			SubmissionRecord done {};
+			done.kind            = static_cast<uint32_t>(SubmissionKind::Done);
+			done.flip_request_id = FIRST_FRAME_NUMBER + frame;
+			done.queue_id        = FRAME_PROGRESS[frame];
+			writer.Value(done);
+			submission_count++;
+		}
 	}
 
 	{
@@ -303,12 +337,15 @@ bool WriteCapture(const std::filesystem::path& dir) {
 		manifest << "  \"format_version\": " << kFormatVersion << ",\n";
 		manifest << "  \"title_id\": \"SYNTHETIC\",\n";
 		manifest << "  \"commit\": \"synthetic\",\n";
-		manifest << "  \"frame\": 42,\n";
+		manifest << "  \"frame\": " << FIRST_FRAME_NUMBER << ",\n";
+		manifest << "  \"frames\": " << CAPTURE_FRAMES << ", \"snapshot_frame\": "
+		         << FIRST_FRAME_NUMBER + CAPTURE_FRAMES - 1 << ",\n";
 		manifest << "  \"width\": " << DISPLAY_WIDTH << ", \"height\": " << DISPLAY_HEIGHT << ",\n";
 		manifest << "  \"ranges\": " << ranges.size() << ", \"pages\": " << page_count
 		         << ", \"dirty_pages\": 0, \"submissions\": " << submission_count << ",\n";
 		manifest << "  \"dirty_events\": " << DirtyEvents().size()
 		         << ", \"progress_events\": " << PROGRESS_EVENTS << ",\n";
+		manifest << "  \"churn_events\": " << ChurnEvents().size() << ",\n";
 		manifest << "  \"gaps\": []\n";
 		manifest << "}\n";
 	}
@@ -349,13 +386,21 @@ void RunTests(const std::filesystem::path& root) {
 	    &error));
 	CHECK(manifest.dirty_events == 12);
 	CHECK(manifest.progress_events == 34);
-	CHECK(!CaptureReader::ParseManifest("{\"format_version\": 4}", &manifest, &error));
+	// A version 3 manifest has neither key, and the replay then reads the capture as one frame.
+	CHECK(manifest.frames == 0);
+	CHECK(manifest.churn_events == 0);
+	CHECK(CaptureReader::ParseManifest(
+	    "{\"format_version\": 4, \"frames\": 6, \"churn_events\": 900}", &manifest, &error));
+	CHECK(manifest.frames == 6);
+	CHECK(manifest.churn_events == 900);
+	CHECK(!CaptureReader::ParseManifest("{\"format_version\": 5}", &manifest, &error));
 	CHECK(error.find("version") != std::string::npos);
 	CHECK(!CaptureReader::ParseManifest("{\"frame\": 1}", &manifest, &error));
 
 	CaptureReader reader;
 	CHECK(reader.Open(good, &error));
-	CHECK(reader.Manifest().frame == 42);
+	CHECK(reader.Manifest().frame == FIRST_FRAME_NUMBER);
+	CHECK(reader.Manifest().frames == CAPTURE_FRAMES);
 	CHECK(reader.Manifest().width == DISPLAY_WIDTH);
 
 	std::vector<RangeRecord> ranges;
@@ -376,7 +421,8 @@ void RunTests(const std::filesystem::path& root) {
 	bool                          events_present = false;
 	CHECK(reader.ReadDirtyEvents(&events, &events_present, &error));
 	CHECK(events_present);
-	CHECK(events.size() == 3);
+	CHECK(events.size() == 4);
+	CHECK(events[0].frame == 0);
 	CHECK(events[0].progress == 0);
 	CHECK(events[0].vaddr == SCRATCH_ADDRESS);
 	CHECK(events[0].size == 0x1000);
@@ -384,6 +430,23 @@ void RunTests(const std::filesystem::path& root) {
 	CHECK(events[1].submission == 1);
 	CHECK(events[2].progress == 17);
 	CHECK(events[2].vaddr == DISPLAY_ADDRESS);
+	// The last mark belongs to the capture's second frame.
+	CHECK(events[3].frame == 1);
+	CHECK(events[3].progress == 5);
+
+	std::vector<ChurnEventRecord> churn;
+	bool                          churn_present = false;
+	CHECK(reader.ReadChurnEvents(&churn, &churn_present, &error));
+	CHECK(churn_present);
+	CHECK(churn.size() == 4);
+	CHECK(churn[0].frame == 0);
+	CHECK(churn[0].kind == static_cast<uint32_t>(ChurnEventKind::BufferRegister));
+	CHECK(churn[0].vaddr == SCRATCH_ADDRESS);
+	CHECK(churn[1].kind == static_cast<uint32_t>(ChurnEventKind::BufferRetire));
+	CHECK(churn[2].frame == 1);
+	CHECK(churn[2].kind == static_cast<uint32_t>(ChurnEventKind::Map));
+	CHECK(churn[3].kind == static_cast<uint32_t>(ChurnEventKind::Unmap));
+	CHECK(churn[3].size == 0x10000);
 
 	std::vector<CaptureRegisterFile> register_files;
 	CHECK(reader.ReadRegisterFiles(&register_files, &error));
@@ -414,11 +477,19 @@ void RunTests(const std::filesystem::path& root) {
 
 	std::vector<CaptureSubmission> submissions;
 	CHECK(reader.ReadSubmissions(&submissions, &error));
-	CHECK(submissions.size() == 3);
+	CHECK(submissions.size() == 3 * CAPTURE_FRAMES);
 	CHECK(submissions[0].commands.size() == 16);
 	CHECK(submissions[0].commands[0] == PM4_NOP_HEADER);
 	CHECK(submissions[1].header.kind == static_cast<uint32_t>(SubmissionKind::FlipPreparation));
 	CHECK(submissions[2].header.kind == static_cast<uint32_t>(SubmissionKind::Done));
+	// Every Done record ends a frame and says which frame it was and how far its progress clock
+	// got, which is how a replay splits the stream without a per-frame index in the manifest.
+	CHECK(submissions[2].header.flip_request_id == FIRST_FRAME_NUMBER);
+	CHECK(submissions[2].header.queue_id == FRAME_PROGRESS[0]);
+	CHECK(submissions[3].commands.size() == 12);
+	CHECK(submissions[5].header.kind == static_cast<uint32_t>(SubmissionKind::Done));
+	CHECK(submissions[5].header.flip_request_id == FIRST_FRAME_NUMBER + 1);
+	CHECK(submissions[5].header.queue_id == FRAME_PROGRESS[1]);
 
 	uint64_t pages = 0;
 	uint64_t seen  = 0;
@@ -473,6 +544,7 @@ void RunTests(const std::filesystem::path& root) {
 	std::filesystem::remove(legacy / "prt.bin", ec);
 	std::filesystem::remove(legacy / "shaders.bin", ec);
 	std::filesystem::remove(legacy / "dirty-events.bin", ec);
+	std::filesystem::remove(legacy / "churn-events.bin", ec);
 	ReplaceManifestVersion(legacy, "{\"format_version\": 1, \"frame\": 5}\n");
 	{
 		CaptureReader legacy_reader;
@@ -491,8 +563,50 @@ void RunTests(const std::filesystem::path& root) {
 		CHECK(legacy_reader.ReadDirtyEvents(&no_events, &legacy_present, &error));
 		CHECK(!legacy_present);
 		CHECK(no_events.empty());
+		std::vector<ChurnEventRecord> no_churn;
+		CHECK(legacy_reader.ReadChurnEvents(&no_churn, &legacy_present, &error));
+		CHECK(!legacy_present);
+		CHECK(no_churn.empty());
 		CHECK(legacy_reader.Manifest().dirty_events == 0);
 		CHECK(legacy_reader.Manifest().progress_events == 0);
+		CHECK(legacy_reader.Manifest().frames == 0);
+	}
+
+	// A version 3 capture: its dirty events are 24-byte records without a frame index, and the
+	// reader widens them onto the one frame such a capture has.
+	const auto legacy3 = root / "legacy3";
+	CopyCapture(good, legacy3);
+	std::filesystem::remove(legacy3 / "churn-events.bin", ec);
+	{
+		Writer writer(legacy3 / "dirty-events.bin");
+		CHECK(writer.Ok());
+		for (const auto& event: DirtyEvents()) {
+			const DirtyEventRecordV3 record {event.progress, event.submission, event.vaddr,
+			                                 event.size};
+			writer.Value(record);
+		}
+	}
+	ReplaceManifestVersion(legacy3, "{\"format_version\": 3, \"frame\": 42, "
+	                                "\"dirty_events\": 4, \"progress_events\": 21}\n");
+	{
+		CaptureReader v3_reader;
+		CHECK(v3_reader.Open(legacy3, &error));
+		CHECK(v3_reader.Manifest().format_version == 3);
+		CHECK(v3_reader.Manifest().frames == 0);
+		std::vector<DirtyEventRecord> widened;
+		bool                          v3_present = false;
+		CHECK(v3_reader.ReadDirtyEvents(&widened, &v3_present, &error));
+		CHECK(v3_present);
+		CHECK(widened.size() == DirtyEvents().size());
+		CHECK(widened[0].frame == 0);
+		CHECK(widened[1].progress == 3);
+		CHECK(widened[2].vaddr == DISPLAY_ADDRESS);
+		// The v3 record of the fourth mark says nothing about a second frame, so it widens to 0.
+		CHECK(widened[3].frame == 0);
+		CHECK(widened[3].size == 0x80);
+		std::vector<ChurnEventRecord> v3_churn;
+		CHECK(v3_reader.ReadChurnEvents(&v3_churn, &v3_present, &error));
+		CHECK(!v3_present);
 	}
 
 	// A truncated optional stream is still an error.
@@ -515,6 +629,16 @@ void RunTests(const std::filesystem::path& root) {
 		bool                          short_present = false;
 		CHECK(!short_reader.ReadDirtyEvents(&records, &short_present, &error));
 		CHECK(error.find("dirty-events.bin") != std::string::npos);
+	}
+	{
+		const auto size = std::filesystem::file_size(truncated / "churn-events.bin", ec);
+		TruncateFile(truncated / "churn-events.bin", size - 9);
+		CaptureReader short_reader;
+		CHECK(short_reader.Open(truncated, &error));
+		std::vector<ChurnEventRecord> records;
+		bool                          short_present = false;
+		CHECK(!short_reader.ReadChurnEvents(&records, &short_present, &error));
+		CHECK(error.find("churn-events.bin") != std::string::npos);
 	}
 
 	// A capture from a different format version is rejected before anything is restored.

@@ -79,6 +79,8 @@ static void PrintUsage() {
 	::printf("  --frame-capture-at <num>             Capture GPU frame <num>. Without it the\n"
 	         "                                       capture waits for a file named trigger\n"
 	         "                                       inside the capture directory.\n");
+	::printf("  --frame-capture-frames <num>         Record that many consecutive frames from the\n"
+	         "                                       trigger frame on. Default: 1.\n");
 	::printf("  --frame-capture-exit <true|false>    Quit after writing the capture.\n"
 	         "                                       Default: true.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
@@ -100,6 +102,8 @@ static void PrintUsage() {
 	         "                                       without a game; docs/frame-replay.md.\n");
 	::printf("  --replay-loops <num>                 Replay loops. Default: %u.\n",
 	         Config::DEFAULT_REPLAY_LOOPS);
+	::printf("  --replay-frames <num>                Frames of the capture one loop replays.\n"
+	         "                                       Default: every frame it holds.\n");
 	::printf("  --replay-image <path>                Write the last replayed frame there.\n");
 }
 
@@ -162,6 +166,17 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 		return false;
 	}
 	out = language;
+	return true;
+}
+
+// A positive count for --frame-capture-frames and --replay-frames.
+static bool ParseFrameCount(const std::string& value, uint32_t& out) {
+	uint32_t frames   = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), frames);
+	if (error != std::errc {} || end != value.data() + value.size() || frames == 0) {
+		return false;
+	}
+	out = frames;
 	return true;
 }
 
@@ -353,6 +368,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.frame_capture_at = frame;
+		} else if (arg == "--frame-capture-frames") {
+			if (!ParseFrameCount(value, options.config.frame_capture_frames)) {
+				::printf("invalid frame count for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--frame-capture-exit") {
 			if (!ParseBool(value, options.config.frame_capture_exit)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -405,6 +425,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--replay-loops") {
 			if (!ParseReplayLoops(value, options.config.replay_loops)) {
 				::printf("invalid replay loop count: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--replay-frames") {
+			if (!ParseFrameCount(value, options.config.replay_frames)) {
+				::printf("invalid frame count for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--replay-image") {

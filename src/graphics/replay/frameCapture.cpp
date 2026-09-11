@@ -52,8 +52,10 @@ struct PendingSubmission {
 };
 
 // About 75 000 CPU-dirty marks reach the recorder in a Nexus frame, so the buffer is reserved
-// once and only ever cleared: after the first frame the append path allocates nothing.
+// once and only ever cleared: after the first frame the append path allocates nothing. The churn
+// stream is two orders of magnitude smaller but grows with the captured frame count.
 constexpr size_t DIRTY_EVENT_RESERVE = 262144;
+constexpr size_t CHURN_EVENT_RESERVE = 65536;
 
 struct Recorder {
 	std::mutex                                      mutex;
@@ -64,15 +66,26 @@ struct Recorder {
 	// and must not queue behind a submission being copied.
 	std::mutex                    dirty_mutex;
 	std::vector<DirtyEventRecord> dirty_events;
+	// And one more for the churn events, which arrive from the GPU thread (buffer registrations
+	// and retirements) and from every guest thread that maps or unmaps memory.
+	std::mutex                    churn_mutex;
+	std::vector<ChurnEventRecord> churn_events;
+	// Index of the frame being recorded inside the capture window, 0 for the first. Written by
+	// the GPU thread in RecordDone, read by every thread that appends an event.
+	std::atomic_uint32_t frame_index {0};
 };
 
 struct State {
 	bool                  armed      = false;
 	int                   capture_at = -1;
+	uint32_t              frames     = 1;
 	bool                  exit_after = true;
 	std::filesystem::path folder;
 	std::atomic_bool      active {false};
-	Recorder              recorder;
+	// The frame the trigger file was seen at, -1 until then. Only meaningful without
+	// --frame-capture-at; the GPU thread is the only writer.
+	int      trigger_frame = -1;
+	Recorder recorder;
 };
 
 State& Instance() {
@@ -82,17 +95,38 @@ State& Instance() {
 		if (state.armed) {
 			state.folder     = Config::GetFrameCaptureFolder();
 			state.capture_at = Config::GetFrameCaptureFrame();
+			state.frames     = Config::GetFrameCaptureFrames();
 			state.exit_after = Config::FrameCaptureExitEnabled();
 			state.recorder.dirty_events.reserve(DIRTY_EVENT_RESERVE);
+			state.recorder.churn_events.reserve(CHURN_EVENT_RESERVE);
 			state.active.store(true, std::memory_order_relaxed);
 			Detail::g_dirty_events_armed.store(true, std::memory_order_relaxed);
-			LOGF("FrameCapture: armed, folder=%s frame=%d exit=%s\n", state.folder.string().c_str(),
-			     state.capture_at, state.exit_after ? "true" : "false");
+			Detail::g_churn_events_armed.store(true, std::memory_order_relaxed);
+			LOGF("FrameCapture: armed, folder=%s frame=%d frames=%u exit=%s\n",
+			     state.folder.string().c_str(), state.capture_at, state.frames,
+			     state.exit_after ? "true" : "false");
 		}
 		return true;
 	}();
 	(void)loaded;
 	return state;
+}
+
+// Churn-event counts per kind and per frame, for the manifest.
+struct ChurnCounts {
+	std::vector<uint64_t> registers;
+	std::vector<uint64_t> retires;
+	std::vector<uint64_t> maps;
+	std::vector<uint64_t> unmaps;
+};
+
+std::string JsonArray(const std::vector<uint64_t>& values) {
+	std::string out = "[";
+	for (size_t i = 0; i < values.size(); i++) {
+		out += fmt::format("{}{}", i == 0 ? "" : ", ", values[i]);
+	}
+	out += "]";
+	return out;
 }
 
 // A plain buffered writer: memory.bin is measured in gigabytes and every other file is tiny.
@@ -319,9 +353,18 @@ uint64_t WriteDirtyPages(RenderContext&                                         
 	return count;
 }
 
-// The arrival order of the frame's CPU-dirty marks, each keyed to the GPU thread's progress
+// Adds one to the per-frame counter, growing the vector to fit the frame index.
+void CountPerFrame(std::vector<uint64_t>& counts, uint32_t frame) {
+	if (counts.size() <= frame) {
+		counts.resize(static_cast<size_t>(frame) + 1, 0);
+	}
+	counts[frame]++;
+}
+
+// The arrival order of the frames' CPU-dirty marks, each keyed to the GPU thread's progress
 // clock. This is what a replay needs to move the BDA generation as often as the game does.
-uint64_t WriteDirtyEvents(const std::filesystem::path& folder, bool& ok) {
+uint64_t WriteDirtyEvents(const std::filesystem::path& folder, std::vector<uint64_t>& per_frame,
+                          bool& ok) {
 	Writer file;
 	if (!file.Open(folder / "dirty-events.bin")) {
 		LOGF("FrameCapture: cannot create dirty-events.bin\n");
@@ -333,7 +376,42 @@ uint64_t WriteDirtyEvents(const std::filesystem::path& folder, bool& ok) {
 	std::unique_lock lock(recorder.dirty_mutex);
 	file.Write(recorder.dirty_events.data(),
 	           recorder.dirty_events.size() * sizeof(DirtyEventRecord));
+	for (const auto& event: recorder.dirty_events) {
+		CountPerFrame(per_frame, event.frame);
+	}
 	const auto count = static_cast<uint64_t>(recorder.dirty_events.size());
+	lock.unlock();
+
+	ok = file.Close() && ok;
+	return count;
+}
+
+// Every other BDA-generation bump of the captured frames: buffer registrations and retirements
+// and guest map and unmap calls. Diagnostics -- the replay does not read this stream; it is what
+// measures the churn a looped sequence of frames has to reproduce (docs/frame-replay.md, phase E).
+uint64_t WriteChurnEvents(const std::filesystem::path& folder, ChurnCounts& counts, bool& ok) {
+	Writer file;
+	if (!file.Open(folder / "churn-events.bin")) {
+		LOGF("FrameCapture: cannot create churn-events.bin\n");
+		ok = false;
+		return 0;
+	}
+
+	auto&            recorder = Instance().recorder;
+	std::unique_lock lock(recorder.churn_mutex);
+	file.Write(recorder.churn_events.data(),
+	           recorder.churn_events.size() * sizeof(ChurnEventRecord));
+	for (const auto& event: recorder.churn_events) {
+		switch (static_cast<ChurnEventKind>(event.kind)) {
+			case ChurnEventKind::BufferRegister:
+				CountPerFrame(counts.registers, event.frame);
+				break;
+			case ChurnEventKind::BufferRetire: CountPerFrame(counts.retires, event.frame); break;
+			case ChurnEventKind::Map: CountPerFrame(counts.maps, event.frame); break;
+			case ChurnEventKind::Unmap: CountPerFrame(counts.unmaps, event.frame); break;
+		}
+	}
+	const auto count = static_cast<uint64_t>(recorder.churn_events.size());
 	lock.unlock();
 
 	ok = file.Close() && ok;
@@ -486,6 +564,7 @@ std::string TitleId() {
 
 namespace Detail {
 std::atomic_bool g_dirty_events_armed {false};
+std::atomic_bool g_churn_events_armed {false};
 } // namespace Detail
 
 bool Armed() noexcept {
@@ -493,15 +572,29 @@ bool Armed() noexcept {
 }
 
 void RecordDirtyEventSlow(uint64_t vaddr, uint64_t size) {
+	auto&            recorder = Instance().recorder;
 	DirtyEventRecord record {};
+	record.frame      = recorder.frame_index.load(std::memory_order_relaxed);
 	record.progress   = GuestGpu::Progress();
 	record.submission = GuestGpu::SubmissionIndex();
 	record.vaddr      = vaddr;
 	record.size       = size;
 
-	auto&            recorder = Instance().recorder;
 	std::scoped_lock lock(recorder.dirty_mutex);
 	recorder.dirty_events.push_back(record);
+}
+
+void RecordChurnEventSlow(ChurnEventKind kind, uint64_t vaddr, uint64_t size) {
+	auto&            recorder = Instance().recorder;
+	ChurnEventRecord record {};
+	record.frame    = recorder.frame_index.load(std::memory_order_relaxed);
+	record.progress = GuestGpu::Progress();
+	record.kind     = static_cast<uint32_t>(kind);
+	record.vaddr    = vaddr;
+	record.size     = size;
+
+	std::scoped_lock lock(recorder.churn_mutex);
+	recorder.churn_events.push_back(record);
 }
 
 bool ExitAfterCapture() noexcept {
@@ -547,13 +640,22 @@ void RecordStarted(uint64_t capture_id) {
 	recorder.pending.erase(it);
 }
 
-void RecordDone() {
-	auto&            recorder = Instance().recorder;
-	std::scoped_lock lock(recorder.mutex);
+void RecordDone(int frame_num, uint32_t progress) {
+	auto& recorder = Instance().recorder;
+	{
+		std::scoped_lock lock(recorder.mutex);
 
-	PendingSubmission pending;
-	pending.header.kind = static_cast<uint32_t>(SubmissionKind::Done);
-	recorder.ordered.push_back(std::move(pending));
+		PendingSubmission pending;
+		pending.header.kind = static_cast<uint32_t>(SubmissionKind::Done);
+		// The Done record carries the frame it closes: its number and its progress count, so a
+		// multi-frame capture is self-describing (frameCaptureFormat.h).
+		pending.header.queue_id        = progress;
+		pending.header.flip_request_id = static_cast<uint64_t>(static_cast<uint32_t>(frame_num));
+		recorder.ordered.push_back(std::move(pending));
+	}
+	// Every event that arrives from here on belongs to the next frame of the window. A frame the
+	// capture then discards takes the index back to 0 through ResetFrame.
+	recorder.frame_index.fetch_add(1, std::memory_order_relaxed);
 }
 
 void ResetFrame() noexcept {
@@ -563,21 +665,42 @@ void ResetFrame() noexcept {
 		recorder.ordered.clear();
 		recorder.pending.clear();
 	}
-	std::scoped_lock lock(recorder.dirty_mutex);
-	recorder.dirty_events.clear();
+	{
+		std::scoped_lock lock(recorder.dirty_mutex);
+		recorder.dirty_events.clear();
+	}
+	{
+		std::scoped_lock lock(recorder.churn_mutex);
+		recorder.churn_events.clear();
+	}
+	recorder.frame_index.store(0, std::memory_order_relaxed);
 }
 
-bool ShouldCapture(int frame_num) {
+FrameDisposition OnFrameDone(int frame_num) {
 	auto& state = Instance();
 	if (!state.active.load(std::memory_order_relaxed)) {
-		return false;
+		return FrameDisposition::Discard;
 	}
-	if (state.capture_at >= 0) {
-		return frame_num == state.capture_at;
-	}
+	const auto frames = state.frames == 0 ? 1u : state.frames;
 
-	std::error_code error;
-	return std::filesystem::exists(state.folder / "trigger", error);
+	int first = state.capture_at;
+	if (state.capture_at < 0) {
+		// Trigger mode: the window starts at the frame the file is first seen at. Once it has
+		// fired the file is never tested again, so a capture of several frames does not depend on
+		// the file surviving.
+		if (state.trigger_frame < 0) {
+			std::error_code error;
+			if (std::filesystem::exists(state.folder / "trigger", error)) {
+				state.trigger_frame = frame_num;
+			}
+		}
+		first = state.trigger_frame;
+	}
+	if (first < 0 || frame_num < first) {
+		return FrameDisposition::Discard;
+	}
+	const int64_t last = static_cast<int64_t>(first) + static_cast<int64_t>(frames) - 1;
+	return frame_num >= last ? FrameDisposition::Write : FrameDisposition::Keep;
 }
 
 bool WriteCapture(RenderContext& renderer, int frame_num,
@@ -630,11 +753,32 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	const auto memory_seconds =
 	    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
-	// 3. Everything else.
-	const auto dirty_pages  = WriteDirtyPages(renderer, ranges, folder, ok);
-	const auto progress     = GuestGpu::Progress();
-	const auto dirty_events = WriteDirtyEvents(folder, ok);
+	// 3. Everything else. The frames of the window, in order, come from the Done records the
+	// recorder holds; each carries its frame number and its progress count.
+	std::vector<uint64_t> frame_numbers;
+	std::vector<uint64_t> progress_per_frame;
+	{
+		auto&            recorder = Instance().recorder;
+		std::scoped_lock lock(recorder.mutex);
+		for (const auto& submission: recorder.ordered) {
+			if (submission.header.kind == static_cast<uint32_t>(SubmissionKind::Done)) {
+				frame_numbers.push_back(submission.header.flip_request_id);
+				progress_per_frame.push_back(submission.header.queue_id);
+			}
+		}
+	}
+	uint64_t progress = 0;
+	for (const auto value: progress_per_frame) {
+		progress += value;
+	}
+
+	const auto dirty_pages = WriteDirtyPages(renderer, ranges, folder, ok);
+	std::vector<uint64_t> dirty_per_frame;
+	const auto dirty_events = WriteDirtyEvents(folder, dirty_per_frame, ok);
 	Detail::g_dirty_events_armed.store(false, std::memory_order_relaxed);
+	ChurnCounts churn;
+	const auto  churn_events = WriteChurnEvents(folder, churn, ok);
+	Detail::g_churn_events_armed.store(false, std::memory_order_relaxed);
 	uint32_t   width       = 0;
 	uint32_t   height      = 0;
 	const auto video_out   = WriteVideoOut(folder, width, height, ok);
@@ -642,6 +786,14 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	const auto submissions = WriteSubmissions(folder, ok);
 	const auto apertures   = WritePrtApertures(folder, ok);
 	const auto shaders     = WriteShaders(folder, ok);
+
+	// Pad the per-frame arrays so every one of them has an entry per captured frame, including
+	// the frames in which nothing of that kind happened.
+	const auto frames = frame_numbers.size();
+	for (auto* counts: {&dirty_per_frame, &churn.registers, &churn.retires, &churn.maps,
+	                    &churn.unmaps, &progress_per_frame}) {
+		counts->resize(frames, 0);
+	}
 
 	if (width == 0) {
 		width  = Config::GetScreenWidth();
@@ -656,7 +808,12 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	out += fmt::format("\t\"format_version\": {},\n", kFormatVersion);
 	out += fmt::format("\t\"title_id\": \"{}\",\n", JsonEscape(TitleId()));
 	out += fmt::format("\t\"commit\": \"{}\",\n", JsonEscape(KYTY_GIT_VERSION));
-	out += fmt::format("\t\"frame\": {},\n", frame_num);
+	out += fmt::format("\t\"frame\": {},\n",
+	                   frame_numbers.empty() ? static_cast<uint64_t>(frame_num)
+	                                         : frame_numbers.front());
+	out += fmt::format("\t\"frames\": {},\n", frames);
+	out += fmt::format("\t\"snapshot_frame\": {},\n", frame_num);
+	out += fmt::format("\t\"frame_numbers\": {},\n", JsonArray(frame_numbers));
 	out += fmt::format("\t\"width\": {},\n", width);
 	out += fmt::format("\t\"height\": {},\n", height);
 	out += fmt::format("\t\"ranges\": {},\n", memory.ranges);
@@ -667,7 +824,14 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	out += fmt::format("\t\"memory_seconds\": {:.3f},\n", memory_seconds);
 	out += fmt::format("\t\"dirty_pages\": {},\n", dirty_pages);
 	out += fmt::format("\t\"dirty_events\": {},\n", dirty_events);
+	out += fmt::format("\t\"dirty_events_per_frame\": {},\n", JsonArray(dirty_per_frame));
 	out += fmt::format("\t\"progress_events\": {},\n", progress);
+	out += fmt::format("\t\"progress_events_per_frame\": {},\n", JsonArray(progress_per_frame));
+	out += fmt::format("\t\"churn_events\": {},\n", churn_events);
+	out += fmt::format("\t\"churn_registers_per_frame\": {},\n", JsonArray(churn.registers));
+	out += fmt::format("\t\"churn_retires_per_frame\": {},\n", JsonArray(churn.retires));
+	out += fmt::format("\t\"churn_maps_per_frame\": {},\n", JsonArray(churn.maps));
+	out += fmt::format("\t\"churn_unmaps_per_frame\": {},\n", JsonArray(churn.unmaps));
 	out += fmt::format("\t\"submissions\": {},\n", submissions);
 	out += fmt::format("\t\"prt_apertures\": {},\n", apertures);
 	out += fmt::format("\t\"shaders\": {},\n", shaders);
@@ -701,18 +865,19 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 
 	const auto seconds =
 	    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-	LOGF("FrameCapture: frame %d written to %s in %.2f s: %" PRIu64 " ranges, %" PRIu64
-	     " pages (%.2f MiB), %" PRIu64 " dirty pages, %" PRIu64 " dirty events over %" PRIu32
-	     " draws, %" PRIu64 " submissions, %zu gaps%s\n",
-	     frame_num, folder.string().c_str(), seconds, memory.ranges, memory.pages,
-	     static_cast<double>(memory.bytes) / (1024.0 * 1024.0), dirty_pages, dirty_events, progress,
-	     submissions, gaps.size(), ok ? "" : " (INCOMPLETE)");
-	std::printf("FrameCapture: frame %d written to %s in %.2f s: %" PRIu64 " pages (%.2f MiB), "
-	            "%" PRIu64 " submissions, %" PRIu64 " dirty events over %" PRIu32
-	            " draws, %zu gaps%s\n",
-	            frame_num, folder.string().c_str(), seconds, memory.pages,
+	LOGF("FrameCapture: %zu frame(s) ending at %d written to %s in %.2f s: %" PRIu64
+	     " ranges, %" PRIu64 " pages (%.2f MiB), %" PRIu64 " dirty pages, %" PRIu64
+	     " dirty events, %" PRIu64 " churn events over %" PRIu64 " draws, %" PRIu64
+	     " submissions, %zu gaps%s\n",
+	     frames, frame_num, folder.string().c_str(), seconds, memory.ranges, memory.pages,
+	     static_cast<double>(memory.bytes) / (1024.0 * 1024.0), dirty_pages, dirty_events,
+	     churn_events, progress, submissions, gaps.size(), ok ? "" : " (INCOMPLETE)");
+	std::printf("FrameCapture: %zu frame(s) ending at %d written to %s in %.2f s: %" PRIu64
+	            " pages (%.2f MiB), %" PRIu64 " submissions, %" PRIu64 " dirty events, %" PRIu64
+	            " churn events over %" PRIu64 " draws, %zu gaps%s\n",
+	            frames, frame_num, folder.string().c_str(), seconds, memory.pages,
 	            static_cast<double>(memory.bytes) / (1024.0 * 1024.0), submissions, dirty_events,
-	            progress, gaps.size(), ok ? "" : " (INCOMPLETE)");
+	            churn_events, progress, gaps.size(), ok ? "" : " (INCOMPLETE)");
 	std::fflush(stdout);
 
 	return ok;

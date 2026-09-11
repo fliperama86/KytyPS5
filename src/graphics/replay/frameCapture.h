@@ -30,6 +30,8 @@ namespace Detail {
 // which runs tens of thousands of times per frame, so it is a plain relaxed load with no
 // function-local static behind it.
 extern std::atomic_bool g_dirty_events_armed;
+// The same for the buffer and mapping churn path (format version 4).
+extern std::atomic_bool g_churn_events_armed;
 } // namespace Detail
 
 // Appends one CPU-dirty mark {progress, submission, vaddr, size} to the frame (format version 3,
@@ -43,20 +45,42 @@ inline void RecordDirtyEvent(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// Appends one BDA-generation bump that is not a CPU write: a buffer registration or retirement,
+// or a guest map or unmap (format version 4, docs/frame-replay.md, phase E). Diagnostics only --
+// the replay does not consume the stream; it is what says whether the guest's buffer churn has a
+// short enough period for a looped sequence of frames to reproduce it. Inert, and one relaxed
+// atomic load, unless --frame-capture armed a capture.
+void RecordChurnEventSlow(ChurnEventKind kind, uint64_t vaddr, uint64_t size);
+inline void RecordChurnEvent(ChurnEventKind kind, uint64_t vaddr, uint64_t size) {
+	if (Detail::g_churn_events_armed.load(std::memory_order_relaxed)) {
+		RecordChurnEventSlow(kind, vaddr, size);
+	}
+}
+
 // Copies the dwords and returns the capture id to carry on the Submission; 0 when not recording.
 [[nodiscard]] uint64_t RecordEnqueue(SubmissionKind kind, uint32_t queue_id,
                                      std::span<const uint32_t> commands,
                                      std::span<const uint32_t> constants, uint64_t flip_request_id);
 // Appends the submission to the frame in the order the GPU thread started processing it.
 void RecordStarted(uint64_t capture_id);
-// Appends the Done marker that closes the frame.
-void RecordDone();
-// Drops everything recorded for the frame that just ended.
+// Appends the Done marker that closes a frame, carrying that frame's GuestGpu number and its
+// progress count (draws plus dispatches), and moves the recorder on to the next frame.
+void RecordDone(int frame_num, uint32_t progress);
+// Drops everything recorded so far and starts the next frame at index 0.
 void ResetFrame() noexcept;
 
-// True when the Done() that ends `frame_num` must write the capture. Tests the trigger file at
-// most once per Done().
-[[nodiscard]] bool ShouldCapture(int frame_num);
+// What Done() must do with the frame that just ended. A capture of K frames
+// (--frame-capture-frames) keeps K frames' records and writes at the end of the last one; K is 1
+// by default, which is the version 1 to 3 behaviour.
+enum class FrameDisposition {
+	Discard, // outside the capture window: drop what the frame recorded
+	Keep,    // inside it, more frames to come: keep the records and go on
+	Write,   // the window is complete: write the capture now
+};
+
+// Decides the frame that just ended. Tests the trigger file at most once per Done(), and only
+// until it fires.
+[[nodiscard]] FrameDisposition OnFrameDone(int frame_num);
 
 // One command processor's register file, as GuestGpu holds it.
 struct ProcessorRegisters {
@@ -67,7 +91,9 @@ struct ProcessorRegisters {
 };
 
 // Flushes the GPU caches into guest memory and writes the whole capture directory. GPU thread
-// only, with the submission queues already drained. Returns true when the directory is complete.
+// only, with the submission queues already drained. `frame_num` is the frame whose end the
+// snapshot is taken at, the last of the captured window. Returns true when the directory is
+// complete.
 bool WriteCapture(RenderContext& renderer, int frame_num,
                   std::span<const ProcessorRegisters> processors);
 

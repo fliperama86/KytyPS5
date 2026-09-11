@@ -115,6 +115,10 @@ int32_t GetFrameCaptureFrame() {
 	return g_config->frame_capture_at;
 }
 
+uint32_t GetFrameCaptureFrames() {
+	return g_config->frame_capture_frames == 0 ? 1u : g_config->frame_capture_frames;
+}
+
 bool FrameCaptureExitEnabled() {
 	return g_config->frame_capture_exit;
 }
@@ -165,6 +169,10 @@ std::filesystem::path GetReplayDir() {
 
 uint32_t GetReplayLoops() {
 	return g_config->replay_loops == 0 ? 1u : g_config->replay_loops;
+}
+
+uint32_t GetReplayFrames() {
+	return g_config->replay_frames;
 }
 
 std::filesystem::path GetReplayImage() {

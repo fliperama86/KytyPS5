@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/replay/frameCapture.h"
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -53,6 +54,9 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 		// Buffers may already cover the new mapping; the next preparation must revisit it.
 		m_buffer_cache.InvalidateBda(vaddr, size);
 	}
+	// Frame capture (docs/frame-replay.md, phase E): a guest map moves both generations, and a
+	// replay of one frame never maps anything.
+	Replay::RecordChurnEvent(Replay::ChurnEventKind::Map, vaddr, size);
 }
 
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -74,6 +78,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		++m_mapped_generation;
 		// Nothing can be uploaded to an unmapped range, and it must not linger in the set.
 		m_buffer_cache.ForgetBdaRange(vaddr, size);
+		Replay::RecordChurnEvent(Replay::ChurnEventKind::Unmap, vaddr, size);
 	};
 	if (m_gpu == nullptr) {
 		unmap();

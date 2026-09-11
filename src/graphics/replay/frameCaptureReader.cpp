@@ -135,6 +135,19 @@ bool CaptureReader::ParseManifest(const std::string& text, CaptureManifest* out,
 	}
 	manifest.progress_events = found ? value : 0;
 
+	// Version 4. A capture written before it has one frame and no churn stream.
+	if (!ManifestNumber(text, "frames", &value, &found)) {
+		SetError(error, "manifest.json has a malformed frames");
+		return false;
+	}
+	manifest.frames = found ? static_cast<uint32_t>(value) : 0;
+
+	if (!ManifestNumber(text, "churn_events", &value, &found)) {
+		SetError(error, "manifest.json has a malformed churn_events");
+		return false;
+	}
+	manifest.churn_events = found ? value : 0;
+
 	*out = manifest;
 	return true;
 }
@@ -344,7 +357,27 @@ bool CaptureReader::ReadShaders(std::vector<ShaderRecord>* out, bool* present,
 
 bool CaptureReader::ReadDirtyEvents(std::vector<DirtyEventRecord>* out, bool* present,
                                     std::string* error) const {
-	return ReadOptionalRecords(m_dir / "dirty-events.bin", out, present, error, "dirty-events.bin");
+	if (m_manifest.format_version >= 4) {
+		return ReadOptionalRecords(m_dir / "dirty-events.bin", out, present, error,
+		                           "dirty-events.bin");
+	}
+	// A version 3 stream has no frame index and exactly one frame to belong to.
+	std::vector<DirtyEventRecordV3> legacy;
+	if (!ReadOptionalRecords(m_dir / "dirty-events.bin", &legacy, present, error,
+	                         "dirty-events.bin")) {
+		return false;
+	}
+	out->clear();
+	out->reserve(legacy.size());
+	for (const auto& record: legacy) {
+		out->push_back({0, record.progress, record.submission, record.vaddr, record.size});
+	}
+	return true;
+}
+
+bool CaptureReader::ReadChurnEvents(std::vector<ChurnEventRecord>* out, bool* present,
+                                    std::string* error) const {
+	return ReadOptionalRecords(m_dir / "churn-events.bin", out, present, error, "churn-events.bin");
 }
 
 bool CaptureReader::ForEachPage(const PageSink& sink, uint64_t* pages, std::string* error) const {

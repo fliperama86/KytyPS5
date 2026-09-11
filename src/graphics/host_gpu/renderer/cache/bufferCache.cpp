@@ -101,6 +101,11 @@ void BufferCache::ChangeRegister(BufferId id) {
 		// A retired buffer needs no upload; its replacement dirties itself when it registers.
 		BumpBdaGeneration();
 	}
+	// Frame capture (docs/frame-replay.md, phase E): both branches move the BDA generation, and
+	// in the game that happens hundreds of times a frame as the guest's allocators rotate.
+	Replay::RecordChurnEvent(insert ? Replay::ChurnEventKind::BufferRegister
+	                                : Replay::ChurnEventKind::BufferRetire,
+	                         buffer.CpuAddress(), buffer.Size());
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {

@@ -115,6 +115,52 @@ replay. What this misses is documented under limits.
    thread's zone totals if Tracy is attached. After the last loop, read back the presented image
    and write it; a script diffs it against the capture screenshot.
 
+## What a capture actually contains
+
+Two captures taken on September 11, 2026 with the build at `1cd3295-dirty`, RTX 5090 / Ryzen 9
+9950X3D, under RDP. Both were written from `GuestGpu::Done()` with the flags in
+[settings.md](settings.md), into `_Runtime/_Diagnostics/replay/`:
+
+| | title screen, `--frame-capture-at 300` | parked Nexus, `trigger` file |
+| --- | --- | --- |
+| frame | 300 | 2069 |
+| capture directory | 2.69 GiB | 6.96 GiB |
+| write time | 3.75 s | 5.95 s |
+| mapped ranges / committed | 1206 / 958 | 7068 / 5673 |
+| non-zero 16 KiB pages | 176 206 (2.69 GiB) | 455 615 (6.96 GiB) |
+| zero pages skipped | 198 978 | 203 466 |
+| CPU-dirty pages of the frame | 19 538 | 75 489 |
+| submissions | 25 | 40 |
+| buffer bytes flushed back | 139 MiB | 672 MiB |
+| images read back | 75 | 107 |
+| gaps | 33 (167 MiB) | 56 (940 MiB) |
+
+Both captures are under ten seconds and well inside the 30 s restore budget if restore is no worse
+than a linear read.
+
+Four things phase B should know before it reads a capture:
+
+- **This title never calls `SubmitFlipPreparation`.** Neither capture has a `FlipPreparation`
+  record: Demon's Souls flips from the graphics command stream
+  (`VideoOutDriver::SubmitFlipFromGpu`, driven by a PM4 packet), not through
+  `sceVideoOutSubmitFlip`. A replay loop must wait for the GPU-side flip the recorded packets
+  trigger, not for a record in `submissions.bin`. The `FlipPreparation` kind stays in the format
+  because the CPU path exists and other titles use it.
+- **`constant_dwords` is always zero here.** `agc.cpp` only ever calls `Submit(dcb, {})`, so the
+  constant-engine span is empty; const RAM is written by packets inside the draw stream.
+- **Graphics and compute interleave inside one frame.** The Nexus frame is 40 records over the
+  graphics queue and seven compute queues (`0x20`, `0x28`, `0x30`, `0x38`, `0x40`, `0x48`,
+  `0x50`), in the order the GPU thread started them. That order is the whole point of the file:
+  replayed on one thread it satisfies every `WAIT_REG_MEM` the original run satisfied.
+- **The gaps are almost all images.** `page not readable` covers a few dozen 16 KiB pages in the
+  private `Stack`/`Code`/`Runtime` ranges that neither the backing-store alias nor a
+  `VirtualQuery`-guarded read could reach. The large gaps are render targets the texture cache
+  could not stage: `BufferCache`'s download buffer is 32 MiB, and a 3840x2160 BGRA8 target is
+  33.2 MiB, so the biggest surfaces — exactly the history buffers under *Limits* below — always
+  fall out. Making them fit needs either a bigger download buffer or a chunked
+  `TextureCache::TryDownloadImage`; both are cheap and belong with the phase B image diff, where
+  the difference is visible.
+
 ## Limits, known up front
 
 - **First loop is wrong for history buffers.** Textures the frame reads before writing

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/srtStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -792,6 +793,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
 		m_impl->window.UpdateTitle();
+		// The presented frame is the only per-frame event every title reaches: a guest that
+		// flips from the GPU never submits a CPU flip preparation. KYTY_DEBUG_SRT_STATS closes
+		// its per-frame sets on the same event the window title counts.
+		SrtStats::EndFrame();
 		// Outside the render lock: the periodic driver cache save takes the pipeline cache mutex,
 		// which pipeline creation never holds while waiting on presentation.
 		m_impl->renderer.GetPipelineCache().SaveIfDirty();

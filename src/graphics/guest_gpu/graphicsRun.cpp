@@ -12,7 +12,6 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/srtStats.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -646,9 +645,6 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			m_renderer.GetGpuResources().RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
-			// One guest frame is behind us on the render thread; KYTY_DEBUG_SRT_STATS closes its
-			// per-frame sets here and periodically rewrites its dump.
-			SrtStats::EndFrame();
 			break;
 	}
 

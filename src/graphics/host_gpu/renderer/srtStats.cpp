@@ -59,11 +59,6 @@ struct ShaderRecord {
 	std::unordered_set<uint64_t> vertex_layouts;
 };
 
-struct FrameSample {
-	uint32_t pipelines = 0;
-	uint32_t shaders   = 0;
-};
-
 struct Accumulator {
 	bool     active        = false;
 	bool     dispatch      = false;
@@ -118,7 +113,10 @@ struct Collector {
 
 	std::unordered_set<const void*> frame_pipelines;
 	std::unordered_set<uint64_t>    frame_shaders;
-	std::vector<FrameSample>        frame_samples;
+	// Per-frame counts are small integers, so binning them keeps the run-length cost flat
+	// instead of retaining one sample per presented frame for hours.
+	std::map<uint32_t, uint64_t> pipelines_per_frame;
+	std::map<uint32_t, uint64_t> shaders_per_frame;
 
 	std::string path;
 	bool        write_failed = false;
@@ -153,16 +151,27 @@ struct Distribution {
 	uint64_t count  = 0;
 };
 
-Distribution Summarize(std::vector<uint32_t> values) {
+Distribution Summarize(const std::map<uint32_t, uint64_t>& bins) {
 	Distribution result;
-	result.count = values.size();
-	if (values.empty()) {
+	for (const auto& [value, count]: bins) {
+		(void)value;
+		result.count += count;
+	}
+	if (result.count == 0) {
 		return result;
 	}
-	std::sort(values.begin(), values.end());
-	result.min    = values.front();
-	result.max    = values.back();
-	result.median = values[values.size() / 2];
+	result.min = bins.begin()->first;
+	result.max = bins.rbegin()->first;
+	// The element a sorted sample list would hold at index count / 2.
+	const uint64_t target = result.count / 2;
+	uint64_t       seen   = 0;
+	for (const auto& [value, count]: bins) {
+		seen += count;
+		if (seen > target) {
+			result.median = value;
+			break;
+		}
+	}
 	return result;
 }
 
@@ -214,15 +223,6 @@ void WriteLocked(Collector& collector) {
 		          return left->hash < right->hash;
 	          });
 
-	std::vector<uint32_t> pipelines_per_frame;
-	std::vector<uint32_t> shaders_per_frame;
-	pipelines_per_frame.reserve(collector.frame_samples.size());
-	shaders_per_frame.reserve(collector.frame_samples.size());
-	for (const auto& sample: collector.frame_samples) {
-		pipelines_per_frame.push_back(sample.pipelines);
-		shaders_per_frame.push_back(sample.shaders);
-	}
-
 	const uint64_t stage_events = collector.draw_stage_events + collector.dispatch_stage_events;
 
 	std::string out;
@@ -261,8 +261,9 @@ void WriteLocked(Collector& collector) {
 	AppendHistogram(out, "sources_per_event_histogram", collector.sources_histogram, ",");
 	AppendHistogram(out, "distinct_buffer_layouts_histogram", buffer_layout_histogram, ",");
 	AppendHistogram(out, "distinct_vertex_layouts_histogram", vertex_layout_histogram, ",");
-	AppendDistribution(out, "graphics_pipelines_per_frame", Summarize(pipelines_per_frame), ",");
-	AppendDistribution(out, "shader_hashes_per_frame", Summarize(shaders_per_frame), "");
+	AppendDistribution(out, "graphics_pipelines_per_frame",
+	                   Summarize(collector.pipelines_per_frame), ",");
+	AppendDistribution(out, "shader_hashes_per_frame", Summarize(collector.shaders_per_frame), "");
 	out += "\t},\n";
 	out += "\t\"shaders\": [\n";
 	for (size_t i = 0; i < ordered.size(); i++) {
@@ -415,8 +416,8 @@ void EndFrame() {
 	auto&                                 collector = Instance();
 	std::lock_guard<std::recursive_mutex> lock(collector.mutex);
 	collector.frames++;
-	collector.frame_samples.push_back({static_cast<uint32_t>(collector.frame_pipelines.size()),
-	                                   static_cast<uint32_t>(collector.frame_shaders.size())});
+	collector.pipelines_per_frame[static_cast<uint32_t>(collector.frame_pipelines.size())]++;
+	collector.shaders_per_frame[static_cast<uint32_t>(collector.frame_shaders.size())]++;
 	collector.frame_pipelines.clear();
 	collector.frame_shaders.clear();
 	if (collector.frames % WriteIntervalFrames == 0) {

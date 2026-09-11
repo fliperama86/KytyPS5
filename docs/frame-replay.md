@@ -6,12 +6,14 @@ minute, deterministic, with Tracy and a screenshot diff. Motivation and the proc
 [performance-roadmap.md](performance-roadmap.md). Status: phases A (capture), B (replay),
 C (validation), D (CPU-write timing) and E (buffer churn and scan timing) done. The bench runs from
 one command, `_Build/replay-des.ps1`, and reproduces the parked-Nexus render thread to within a few
-per cent. Phase E made the capture record the game's own BDA-scan timeline, so the harness is now
-measured against the game run it came from instead of against a Tracy number from another build:
-the replay makes **9479 preparations against 9479 recorded and 156 scans against 160**. The
-`--gpu-descriptors` A/B still does not reproduce the end-to-end ordering, and phase E says why --
-the game itself no longer scans 352 times a frame on this build. The capture to use is `nexus-5`
-(format version 5).
+per cent. Phase E made the capture record the game's own BDA-scan timeline, so the harness is
+measured against the game run it came from: on a capture taken after the protocol's warm-up the
+replay makes **9845 BDA preparations against 9845 recorded and 462 scans against 474**, with 0 late
+CPU writes. The `--gpu-descriptors` A/B is now close but still short: replay ratio **1.068** against
+**1.202** re-measured end to end on this build. What is left is the *cost* of a scan, not its count:
+the replay pays 4.1 us against the game's 25.8 us for the same inputs. **The capture to use is
+`nexus-6`** (format version 5, captured after a five-minute warm-up); a capture taken straight after
+navigating is a cold frame and measures something else, see phase E.
 
 ## What it must do
 
@@ -384,7 +386,7 @@ One command per comparison, from the repository root:
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\_Build\replay-des.ps1' `
-    -Capture '_Runtime\_Diagnostics\replay\nexus-5' -Loops 60 -Repeats 2 -Image `
+    -Capture '_Runtime\_Diagnostics\replay\nexus-6' -Loops 60 -Repeats 2 -Image `
     -Configs '--gpu-descriptors false','--gpu-descriptors true'"
 ```
 
@@ -755,7 +757,8 @@ captured frame. `nexus-4` is six consecutive parked-Nexus frames
 the same run, while the game is still building its scene, records 15 registrations over three frames
 (`_Runtime/_Diagnostics/replay/churn-check`), and `nexus-5`, taken with `--gpu-descriptors true`,
 records 8 registrations and 9 retirements in its frame -- two orders of magnitude below the hundreds
-the phase D hypothesis needed. In the parked Nexus the buffer set and the guest mapping set are
+the phase D hypothesis needed, and `nexus-6`, the warmed capture with the same flag, records none at
+all. In the parked Nexus the buffer set and the guest mapping set are
 static. There is no ring rotating, so **no number of looped frames can add churn that the game does
 not have**, and the multi-frame capture, useful as it is for measuring this, cannot close the gap.
 
@@ -772,50 +775,64 @@ question stopped being "what is missing" and became "when exactly does each mark
 ### The ground truth: the game's own scan timeline
 
 Version 5 records `prepare-events.bin`: one record per `GpuResourceManager::PrepareBda` call of the
-captured frame -- `{frame, progress, scanned, dirty ranges, buffers synchronized, dirty bytes}`.
-`scanned` is exactly one entry of the `GpuResourceManager::SynchronizeBdaBuffers` Tracy zone, so a
-capture now carries the number the acceptance test is about, measured inside the game run that
-produced the capture. `nexus-5`, game frame 1739, taken with `--gpu-descriptors true`:
+captured frame -- `{frame, progress, scanned, dirty ranges, buffers synchronized, scan ns, dirty
+bytes}`. `scanned` is exactly one entry of the `GpuResourceManager::SynchronizeBdaBuffers` Tracy
+zone, so a capture carries the number *and the cost* the acceptance test is about, measured inside
+the game run that produced the capture, with no Tracy attached.
 
-| | nexus-5, in the game |
-| --- | --- |
-| BDA preparations | **9479** (352 of them from compute dispatches, the rest from draws) |
-| of those, scans | **160** (1.7%) |
-| per scan | 4.3 dirty ranges, 4.3 buffers, 107.6 KiB |
-| per frame | 693 dirty ranges, 16.8 MiB synchronized |
-| CPU-dirty marks | 2743, of which 1991 before the first draw |
-| timed marks | 752 on 301 distinct progress ticks |
+Both captures below are the parked Nexus with `--gpu-descriptors true`. The only difference between
+them is that `nexus-6` was taken after the five-minute warm-up the measurement protocol requires and
+`nexus-5` about forty seconds after the navigation script finished:
 
-The shape is the point. Preparations are spread evenly over the frame -- about 1080 per tenth --
-while the scans are not: 127 of the 160 fall in the second tenth, exactly where the guest's writes
-are (470 of the 752 timed marks). The scan count is a function of *where the guest's page writes
-fall relative to the preparations*, and of nothing else.
+| | nexus-5 (cold, frame 1739) | nexus-6 (warm, frame 5180) |
+| --- | --- | --- |
+| BDA preparations | 9479 | **9845** (352 of them from compute dispatches) |
+| of those, scans | 160 (1.7%) | **474** (4.8%) |
+| per scan | 4.3 ranges, 4.3 buffers, 108 KiB, not timed | 3.2 ranges, 3.2 buffers, 34 KiB, **25.8 us** |
+| BDA cost a frame | -- | **12.2 ms** |
+| CPU-dirty marks | 2743 (1991 before the first draw) | 4039 (2467 before the first draw) |
+| timed marks | 752 | 1572 |
+
+**A cold frame is a different frame.** While the driver is still compiling, the GPU thread is slow
+and the guest finishes writing early, so the marks bunch at the start and only 160 preparations see
+a changed generation; warmed up, the writes spread through the frame and 474 do. This is the same
+trap the measurement protocol names for FPS samples
+([performance-roadmap.md](performance-roadmap.md), "Measurement protocol, corrections"), and it
+applies to captures too: **warm up before dropping the trigger file.**
+
+The shape is what the replay has to reproduce. Preparations are spread evenly over the frame -- about
+1000 per tenth -- and the scans follow the guest's writes.
 
 ### The captures
 
-`nexus-4` and `nexus-5` follow the phase C procedure exactly (launch with `--frame-capture <abs>`,
-`_Build/des-navigate.ps1 -NoElevate -WaitForFrame 1000 -HoldSeconds 4 -Presses 12 -GapSeconds 3`,
-`des-window.ps1 -Show` then `-Shot` as `reference.png`, then create `trigger`); `_Build/capture-frame.ps1`
-wraps the launch with the environment the root launcher sets, which the game needs to reach gameplay.
+`nexus-4`, `nexus-5` and `nexus-6` follow the phase C procedure (launch with
+`--frame-capture <abs>`, `_Build/des-navigate.ps1 -NoElevate -WaitForFrame 1000 -HoldSeconds 4
+-Presses 12 -GapSeconds 3`, `des-window.ps1 -Show` then `-Shot` as `reference.png`, then create
+`trigger`); `_Build/capture-frame.ps1` wraps the launch with the environment the root launcher sets,
+which the game needs to reach gameplay. **Wait five minutes between the navigation and the trigger**,
+as an FPS sample does: nexus-6 does and nexus-5 does not, and that alone is the difference between
+474 and 160 BDA scans in the captured frame.
 
-| | nexus-3 (v3) | nexus-4 (v4) | nexus-5 (v5) |
-| --- | --- | --- | --- |
-| frames | 1 (2025) | 6 (1774 to 1779) | 1 (1739) |
-| flags | default | default | `--gpu-descriptors true` |
-| write time | 5.72 s | 5.78 s | 5.66 s |
-| mapped ranges / committed | 6355 / 4940 | 6394 / 4974 | 6425 / 5005 |
-| non-zero 16 KiB pages | 425 177 (6.49 GiB) | 426 663 (6.51 GiB) | 424 329 (6.47 GiB) |
-| CPU-dirty pages | 72 444 | 76 058 | 75 272 |
-| CPU-dirty events | 2941 | 16 032 (2654 to 2684 a frame) | 2755 |
-| churn events | -- | **0** | 21 (8 registrations, 9 retirements) |
-| prepare events / scans | -- | -- | **9479 / 160** |
-| submissions | 40 | 240 | 40 |
-| PRT apertures / shaders | 1 / 9815 | 1 / 9824 | 1 / 9810 |
+| | nexus-3 (v3) | nexus-4 (v4) | nexus-5 (v5) | nexus-6 (v5) |
+| --- | --- | --- | --- | --- |
+| frames | 1 (2025) | 6 (1774 to 1779) | 1 (1739) | 1 (5180) |
+| flags | default | default | `--gpu-descriptors true` | `--gpu-descriptors true` |
+| warmed up before the trigger | no | no | no | **yes, 5 min** |
+| write time | 5.72 s | 5.78 s | 5.66 s | 5.82 s |
+| mapped ranges / committed | 6355 / 4940 | 6394 / 4974 | 6425 / 5005 | 6431 / 5011 |
+| non-zero 16 KiB pages | 425 177 | 426 663 | 424 329 | 428 825 (6.54 GiB) |
+| CPU-dirty pages | 72 444 | 76 058 | 75 272 | 76 449 |
+| CPU-dirty events | 2941 | 16 032 (2654 to 2684 a frame) | 2755 | 4039 |
+| churn events | -- | **0** | 21 | **0** |
+| prepare events / scans | -- | -- | 9479 / 160 | **9845 / 474** |
+| submissions | 40 | 240 | 40 | 40 |
+| PRT apertures / shaders | 1 / 9815 | 1 / 9824 | 1 / 9810 | 1 / 9822 |
 
 The picture is unchanged by any of it: the last frame of nexus-4 replayed against its reference is
-R 11.3, G 9.2, B 5.0 mean absolute difference, and nexus-5 is R 11.0, G 8.5, B 4.4, against phase
-D's R 10.5, G 8.3, B 4.4 -- the same two causes, the auto-exposure history buffer among the capture's
-gaps and two streamed HUD icons in the sparse part of a PRT aperture.
+R 11.3, G 9.2, B 5.0 mean absolute difference, nexus-5 is R 11.0, G 8.5, B 4.4 and nexus-6 is
+R 9.8, G 7.8, B 4.1, against phase D's R 10.5, G 8.3, B 4.4 -- the same two causes, the auto-exposure
+history buffer among the capture's gaps and two streamed HUD icons in the sparse part of a PRT
+aperture.
 
 ### The finer clock and inline application
 
@@ -835,66 +852,110 @@ Two changes make a replay able to reproduce that:
   arrive after the preparation it was meant to precede. A capture older than version 5 keeps the
   marker thread, because its progress values mean something else.
 
+### The dirty set: mark it once, not every frame
+
+A capture's `dirty-pages.bin` is the CPU-dirty page set at the snapshot -- 76 449 pages on nexus-6.
+Almost none of it was written by the captured frame (phase D: five pages of 72 444 on nexus-3); it is
+memory the guest wrote earlier that the GPU has not consumed, and in the game it simply *stays*
+dirty from frame to frame without being written again. Re-marking it before every replayed frame,
+which is what phases B to D did, therefore fabricates work: the marks land in the frame's first BDA
+scans and inflate what each scan has to walk. `--replay-dirty-set once` (the default since phase E)
+marks it at restore instead; `loop` is the old behaviour. Either way the frame's recorded CPU-write
+events are applied per frame. On nexus-5 with `--gpu-descriptors true`, 40 loops:
+
+| mode | scans | dirty ranges a scan | buffers a scan | KiB a scan | us a scan | ms/loop gpu |
+| --- | --- | --- | --- | --- | --- | --- |
+| `loop` | 156 | 17.2 | 17.2 | 7789 | 7.8 | 72.41 |
+| `once` | 156 | 3.8 | 3.8 | 69 | 6.6 | 72.20 |
+| the game | 160 | 4.3 | 4.3 | 108 | -- | -- |
+
+The scan count does not depend on it, the inputs do, and `once` is what the game's own scans see.
+The presented image is identical either way (R 11.0, G 8.5, B 4.4 against the reference in both).
+
 ### The result
 
-`--replay-loops 40 --vblank-frequency 360 --gpu-descriptors true`, nexus-5, 39 measured loops:
+`--replay-loops 40 --vblank-frequency 360 --gpu-descriptors true`, nexus-6, 39 measured loops, the
+replay's own counters (`frame_scans` and friends in `replay-report.json`):
 
-| | game (recorded) | replay | |
+| | game (recorded in nexus-6) | replay | |
 | --- | --- | --- | --- |
-| BDA preparations a frame | 9479 | **9479** | exact |
-| BDA scans a frame | 160 | **156** | -2.5% |
-| progress ticks a frame | 21 638 | 21 638 | exact |
-| late marks | -- | 0 of 752 a loop | |
-| dirty ranges a scan | 4.3 | 17.2 | 4.0x |
-| buffers synchronized a scan | 4.3 | 17.2 | 4.0x |
-| `SynchronizeBdaBuffers` | -- | 1.01 ms, 156 calls, 6.5 us each | Tracy, 30 minus 5 loops |
+| BDA preparations a frame | 9845 | **9845** | exact |
+| BDA scans a frame | 474 | **462** | -2.5% |
+| progress ticks a frame | 22 368 | 22 368 | exact |
+| late marks | -- | 0 of 1572 a loop | |
+| dirty ranges a scan | 3.2 | 2.9 | -9% |
+| dirty bytes a scan | 34 KiB | 33 KiB | -3% |
+| **microseconds a scan** | **25.8** | **4.1** | **6.3x cheaper** |
+| BDA cost a frame | 12.2 ms | 1.9 ms | |
 
-With `--gpu-descriptors false` the same replay makes 357 preparations and 16 scans: the flag is what
-decides how many stages need a BDA preparation at all, which is why the ground truth was captured
-with it on.
+With `--gpu-descriptors false` the same replay makes 357 preparations and 16 scans (the game makes
+352 and 21.2): the flag decides how many stages need a BDA preparation at all, which is why the
+ground truth is captured with it on.
 
-The count is reproduced. The **cost per scan is not**: the replay's scans walk four times as many
-dirty ranges as the game's, because every replayed frame re-marks the whole recorded CPU-dirty page
-set (76 058 pages) to make the loop upload the frame's working set, and those ranges land in the
-frame's first scans. They are cheap ranges -- already-resident buffers -- so the replay pays 6.5 us
-a scan, 1.0 ms a frame. That is a fidelity question about the *inputs* of a scan, not about its
-timing, and it is the next thing to close if the BDA zone ever needs to be judged in replay.
+The count is reproduced, and so are the inputs. The **cost of a scan is not**: with the same number
+of ranges and the same bytes, the replay's scan is six times cheaper. The scan's work is
+`SynchronizeBuffersInRange` on the buffers the dirty ranges intersect, and in a replay those buffers
+are already resident and nothing else is competing for the staging path, while in the game twelve
+guest threads are running and the same upload contends with them. That is the residue the A/B below
+is made of, and it is a *contention* question, not a bookkeeping one.
 
-### The 352 scans, and what acceptance means now
+### Acceptance, re-baselined on this build
 
-The acceptance target -- 352 scans at 29.7 us, 10.47 ms a frame -- comes from
+The old target -- 352 scans at 29.7 us, 10.47 ms a frame, ratio 1.10 -- comes from
 `_Runtime/_Diagnostics/gpufetch/real3-self.csv`, a Tracy capture of the game on the build of
-September 10 (51 402 zone entries over 146 frames). In that run `SynchronizeBdaBuffers` (352.1 a
-frame) and `RenderCompute::PrepareBda` (351.9 a frame) are the same number: *every compute
-preparation scanned*, and the draw path made no BDA preparations at all.
+September 10. The replay is now measured against the current build, so the game side was measured
+again the same day, in the same Remote Desktop session, with the protocol of
+[reaching-the-nexus.md](reaching-the-nexus.md): parked Nexus, five-minute warm-up, 30 s sample, then
+a 15 s Tracy capture, one configuration per launch, closed through the window so the pipeline cache
+is written (`_Build/e2e-rebaseline.ps1`, artifacts in
+`_Runtime/_Diagnostics/replay/e2e-rebaseline/`). Per frame, dividing the Tracy zone totals by the
+`Presenter::Present` count (170 and 147 frames):
 
-On the build of this branch the same scene with the same flag makes 9479 preparations a frame, 9127
-of them from draws, and 160 of them scan. The replay's Tracy agrees with its own counter
-(`RenderCompute::PrepareBda` 351.8 a loop, `SynchronizeBdaBuffers` 156). So **the game itself no
-longer does 352 scans a frame**: the target is a number from another build, and the harness is now
-measured against the ground truth the capture carries.
+| | game, gd=false | game, gd=true | replay, gd=false | replay, gd=true |
+| --- | --- | --- | --- | --- |
+| FPS (30 s sample) | **11.63** | **9.67** | -- | -- |
+| ms a frame | 86.0 | 103.4 | 73.0 | 78.0 |
+| GPU busy | 29% | 30% | -- | -- |
+| CPU core equivalents | 12.6 | 12.6 | -- | -- |
+| `SynchronizeBdaBuffers` | 3.98 ms, 21.2 calls | **10.68 ms, 399 calls** | 0.78 ms, 16 calls | **1.88 ms, 462 calls** |
+| microseconds a scan | 187.6 | 26.8 | 48 | 4.1 |
+| `EvaluateRuntimeSourcesImpl` | 26.30 ms, 20 864 | 31.04 ms, 20 492 | -- | 26.5 ms, 20 008 |
+| `RenderExecutor::RebindBuffers` | 6.35 ms, 20 691 | 4.04 ms, 20 389 | -- | 1.6 ms, 19 874 |
+| `RenderCompute::PrepareBda` | 351.9 | 351.3 | -- | 351.8 |
+| `CpOpDispatchIndirect::SyncArguments` | 3.90 ms, 245.0 | 3.88 ms, 245.0 | -- | 8.75 ms, 245.0 |
 
-Acceptance, restated:
+(The replay's zone rows are the 30-loop minus 5-loop Tracy pair of `nexus-5`; its counts and scan
+costs come from the replay's own counters on `nexus-6`, which need no Tracy.)
 
-- Scans within 25% of the recorded ground truth: **160 recorded, 156 replayed, met.**
-- Scans within 25% of 352: **not met, and not meetable** -- the game does 160 on this build.
-- `--gpu-descriptors` true/false ratio within 10% of 1.10 (that is 0.99 to 1.21), `ms/loop gpu`
-  medians, `_Build/replay-des.ps1 -Loops 40 -Repeats 2` (`nexus-5/ab-phasee/`):
+So the effect the A/B is about is still there, and bigger than in September 10's numbers: **399
+scans a frame at 26.8 us, 10.68 ms**, against 352 at 29.7 us. The earlier phase E draft concluded
+from `nexus-5` that the game no longer scans 352 times a frame; that was wrong, and the cause was
+the capture, not the build -- `nexus-5` was taken before the warm-up and is a cold frame.
+
+Acceptance:
+
+- **`SynchronizeBdaBuffers` per frame within 25%: met.** 462 replayed against 474 recorded in the
+  same frame (-2.5%), and against 399 measured over 147 game frames (+16%).
+- **The `--gpu-descriptors` true/false ratio within 10%: not met, narrowly.** `ms/loop gpu` medians
+  of `_Build/replay-des.ps1 -Loops 40 -Repeats 2` on nexus-6 (`nexus-6/ab-phasee/`):
 
 | config | run 1 | run 2 | median | gpu min | scans a frame |
 | --- | --- | --- | --- | --- | --- |
-| `--gpu-descriptors false` | 71.54 | 71.61 | **71.58** | 69.73 | 16 |
-| `--gpu-descriptors true` | 71.99 | 71.93 | **71.96** | 69.78 | 156 |
+| `--gpu-descriptors false` | 73.24 | 72.84 | **73.04** | 71.16 | 16 |
+| `--gpu-descriptors true` | 77.94 | 78.11 | **78.03** | 76.49 | 462 |
 
-Ratio true/false **1.005**. It is inside the stated window by arithmetic, and it does not reproduce
-what the window was for: end to end, `true` is 10% *slower* than `false` (102 against 92 ms of
-render thread); in replay it is 0.5% slower, within run-to-run noise (0.1%). The 10 ms the A/B is
-made of was 352 scans at 29.7 us on the old build. Today the game's own scan budget for that frame
-is 160 scans, and the replay pays 1.0 ms of it. **The A/B as written cannot be reproduced, because
-the effect it measures is no longer there to reproduce; re-baselining it needs a fresh end-to-end
-Tracy run of the game on this build.** That run is also the only way to get today's cost per scan in
-the game, which the capture does not record -- adding the scan's duration to `PrepareEventRecord` is
-a one-line extension and the obvious next step if the number is wanted without a 40-minute run.
+  Ratio true/false **1.068** against the game's **1.202**; within 10% means 1.082 to 1.322, so it is
+  1.3 points short. For comparison the cold `nexus-5` capture gives 1.005 and phase D's nexus-3 gave
+  0.952, so warming the capture and applying the marks inline moved the harness from "no ordering at
+  all" to "the right ordering, 6% of the 20% margin missing".
+
+The residue is measured and is one thing: **a replayed scan costs 4.1 us where the game's costs
+25.8 us**, on the same 2.9 to 3.2 ranges and 33 to 34 KiB. 462 scans at the game's cost would be
+11.9 ms instead of 1.9 ms, which is the whole of the missing margin. Closing it means making a
+replayed frame pay what the game's upload path pays -- the guest threads that compete for it are
+exactly what the harness does not simulate (see *Limits*) -- so the honest rule stands: **the
+harness reproduces the render thread's structure, its call counts and now its BDA-scan timeline, but
+a change whose cost is the contention around a guest memory upload must still be judged end to end.**
 
 ### The multi-frame loop, and why K is 1 on this title
 
@@ -926,7 +987,7 @@ only for a title whose frames actually differ.
 | B. Replay | `--replay`, memory and state restore, feeder thread, loop timing and report, image readback | 1 to 2 agent-days |
 | C. Validation | capture the parked Nexus on the current build; 60 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff; one command. Done, and the A/B does not reproduce — see *Phase C validation* above | half a day |
 | D. CPU-write timing | format version 3: a progress clock on the GPU thread, `dirty-events.bin`, a marker thread that replays each write where it happened. Done; the timing is exact (0 late events, 11 259 of 11 259 progress) and the BDA scan goes from 28 to 172 calls a loop, but the A/B still does not reproduce — see *Phase D* above | half a day |
-| E. Buffer churn and scan timing | format version 4: `churn-events.bin` and multi-frame captures, which measured the churn at **zero** and refuted the phase D explanation. Format version 5: `prepare-events.bin` (the game's own scan timeline), a clock that ticks twice per draw and dispatch, and inline application of the marks on the GPU thread. Done; the replay makes 9479 preparations against 9479 recorded and 156 scans against 160, and the A/B's 352-scan target is shown to belong to an older build — see *Phase E* above | one day |
+| E. Buffer churn and scan timing | format version 4: `churn-events.bin` and multi-frame captures, which measured the churn at **zero** and refuted the phase D explanation. Format version 5: `prepare-events.bin` (the game's own scan timeline and its cost), a clock that ticks twice per draw and dispatch, inline application of the marks on the GPU thread, and `--replay-dirty-set once`. Done; on a warmed capture the replay makes 9845 preparations against 9845 recorded and 462 scans against 474, the end-to-end A/B was re-baselined on this build (1.202) and the replay reaches 1.068 — see *Phase E* above | one day |
 
 Phase B status, September 11, 2026: `--replay` replays a real capture end to end. On title-2, the
 title screen at frame 300 captured with format version 2, it restores 1190 ranges (6123 MiB) in
@@ -951,9 +1012,11 @@ format did not carry:
    followed by a reserved hole, read through `Memory::TryReadPrtBacking`, which refuses outside a
    registered aperture. Restoring the one aperture Demon's Souls registers fixes every such image.
 
-That recapture is done. **`nexus-5`, format version 5, is the capture to use**; `nexus-4` (format 4,
-six frames) is the churn measurement, `nexus-3` is the phase D reference, `nexus-2` the phase C one
-and `nexus-1` is kept only because its screenshot documents the scene.
+That recapture is done. **`nexus-6`, format version 5, taken after a five-minute warm-up, is the
+capture to use**; `nexus-5` is the same thing captured cold and is kept as the evidence that the
+warm-up matters, `nexus-4` (format 4, six frames) is the churn measurement, `nexus-3` is the phase D
+reference, `nexus-2` the phase C one and `nexus-1` is kept only because its screenshot documents the
+scene.
 
 Code goes under `src/graphics/replay/` (capture and replay), flags in
 [settings.md](settings.md), the capture format and the report format in this file. Both flags

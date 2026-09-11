@@ -28,7 +28,7 @@ Where the 106 ms goes, by source file, self time:
 | SrtWalker.cpp | 28.1 | 26% | SRT evaluation on the CPU (`EvaluateRuntimeSourcesImpl`) |
 | renderDraw.cpp | 13.7 | 13% | per-draw recording: index buffer, shader refresh, depth target, draw |
 | pm4Handlers.cpp | 13.6 | 13% | PM4 packet handlers, indirect argument sync |
-| gpuResourceManager.cpp | 10.5 | 10% | BDA dirty-page sync (`SynchronizeBdaBuffers`), new with stage 1 |
+| gpuResourceManager.cpp | 10.7 | 10% | BDA dirty-page sync (`SynchronizeBdaBuffers`), new with stage 1 |
 | descriptors.cpp | 9.9 | 9% | Vulkan binding: rebind buffers and images, commit |
 | videoOut.cpp | 7.1 | 7% | flip queue |
 | graphicsRun.cpp | 6.6 | 6% | command processor loop |
@@ -50,7 +50,8 @@ How to use it: `_Build/replay-des.ps1 -Capture _Runtime/_Diagnostics/replay/nexu
 -Repeats 2 -Configs '<flags A>', '<flags B>'` prints the comparison table and keeps the reports. A
 60-loop run is 10 s plus a 6 s warm-up; a two-configuration, two-repeat bench is four minutes
 against the 40 minutes an end-to-end A/B costs. The capture to use is
-`_Runtime/_Diagnostics/replay/nexus-5` (format version 5, frame 1739, 6.6 GiB, 40 submissions).
+`_Runtime/_Diagnostics/replay/nexus-6` (format version 5, frame 5180, 6.5 GiB, 40 submissions,
+captured after the protocol's five-minute warm-up).
 
 What it reproduces: the parked-Nexus render thread at 71 ms a loop against 92 ms measured
 end to end (no guest threads compete in replay), with the frame's zone structure intact — 20 867
@@ -71,17 +72,29 @@ item 2 is not, and needs the end-to-end protocol. Evidence in
 [frame-replay.md](frame-replay.md), "Phase D, CPU-write timing".
 
 Phase E (format versions 4 and 5, September 11, 2026) corrected that last paragraph and closed the
-count. The parked Nexus has **no buffer churn at all** -- zero registrations, retirements, maps and
-unmaps in each of six consecutive captured frames -- so the residue was never a missing source of
-BDA-generation bumps. The capture now records the game's own scan timeline (`prepare-events.bin`:
-every `PrepareBda` call and whether it scanned), the progress clock ticks twice per draw and
-dispatch, and the marks are applied inline on the GPU thread: the replay makes **9479 preparations
-against 9479 recorded and 156 scans against 160**, with 0 late marks. The 352-scan, 10.5 ms target
-belongs to the September 10 build, where the draw path made no BDA preparations at all; on this
-build the game itself scans 160 times a frame, so the `--gpu-descriptors` A/B (replay ratio 1.005)
-cannot reproduce an effect that is no longer there and needs re-baselining end to end. What is still
-not reproduced is the *cost* of a scan: the replay's scans walk 17.2 dirty ranges against the game's
-4.3, because a replayed frame re-marks the whole recorded dirty page set.
+count. The parked Nexus has **no buffer churn at all** — zero registrations, retirements, maps and
+unmaps in each of six consecutive captured frames — so the residue was never a missing source of
+BDA-generation bumps. The capture now records the game's own scan timeline and cost
+(`prepare-events.bin`: every `PrepareBda` call, whether it scanned and for how long), the progress
+clock ticks twice per draw and dispatch, the marks are applied inline on the GPU thread, and the
+recorded dirty page set is marked once at restore rather than every frame. On a capture taken after
+the protocol's warm-up the replay makes **9845 preparations against 9845 recorded and 462 scans
+against 474**, with 0 late marks, on 2.9 dirty ranges a scan against 3.2.
+
+The end-to-end side was re-baselined the same day on this build (`e2e-rebaseline/`, Remote Desktop,
+five-minute warm-up, 30 s sample plus a 15 s Tracy capture): **11.63 FPS with `--gpu-descriptors
+false` and 9.67 with `true`, ratio 1.202**, with `SynchronizeBdaBuffers` at **399 calls and 10.68 ms
+a frame** (26.8 us a scan) against 21.2 calls and 3.98 ms with the flag off. The replay reaches
+**1.068** of the 1.202, so the A/B is close but still outside the 10% window, and the residue is one
+number: a replayed scan costs **4.1 us where the game's costs 25.8 us** on the same ranges and bytes,
+because in a replay the buffers are resident and no guest thread competes for the upload path. Items
+1, 3 and 4 are safe to measure in replay; item 2's BDA half is not, and needs the end-to-end
+protocol. Evidence in [frame-replay.md](frame-replay.md), "Phase E".
+
+One trap this found, which applies to every capture: **a frame captured before the warm-up is a cold
+frame.** The same scene captured 40 s after navigating records 160 scans and captured five minutes
+later records 474, because while the driver is still compiling the guest finishes its writes early
+in the frame instead of spreading them through it.
 
 ## Items, in recommended order
 
@@ -128,7 +141,8 @@ measure first. Gate: a runtime setting (see [settings.md](settings.md)).
 ### 2. Finish stage 1 of GPU-side descriptor fetch
 
 Status: stage 1 landed behind `--gpu-descriptors` (default off), measured slower, causes known.
-[gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Stage 1 measured".
+[gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Stage 1 measured" and its re-baseline of
+September 11 (11.63 FPS off against 9.67 on, ratio 1.202).
 
 Two pieces, both foreseeable from the stats dump:
 
@@ -136,8 +150,11 @@ Two pieces, both foreseeable from the stats dump:
   same lowering as the descriptor roots. Then `EvaluateRuntimeSourcesImpl` no longer walks the
   chain for fetched programs. Removes most of the 28 ms.
 - Make the per-draw dirty sync cheap: track dirtied pages as a list instead of scanning dirty
-  ranges against mapped ranges on every generation change (`PrepareBda`, about 340 scans per
-  frame at 30 µs). Removes most of the 10.5 ms.
+  ranges against mapped ranges on every generation change. Re-measured on the build of
+  September 11: **399 scans a frame at 26.8 µs, 10.68 ms** (`PrepareBda` runs 9845 times a frame and
+  4.8% of those find a changed generation; with the flag off it is 21.2 scans and 3.98 ms). A scan
+  walks only 3.2 dirty ranges and 34 KiB, so the cost is not the scan's inputs: the same scan in a
+  replay, with the same ranges, costs 4.1 µs. Removes most of the 10.7 ms.
 
 Expected: about 16 FPS in this scene (projection in the design document).
 

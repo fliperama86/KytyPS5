@@ -189,6 +189,38 @@ faster:
   of a fetched program and the generation changes often enough for about 340 real scans per
   frame at 30 µs each.
 
+#### Re-baselined on the build of September 11, 2026
+
+The numbers above are from build `fffb4ce` (`real3-self.csv`). Stage 1 was measured again on the
+build of `840f02d`, same scene, same Remote Desktop session, same protocol (five-minute warm-up,
+30 s sample, then a 15 s Tracy capture with no other client attached, one configuration per launch,
+closed through the window so the pipeline cache is written). Artifacts in
+`_Runtime/_Diagnostics/replay/e2e-rebaseline/`, script `_Build/e2e-rebaseline.ps1`:
+
+| run | FPS | ms a frame | GPU busy | CPU cores |
+| --- | --- | --- | --- | --- |
+| `--gpu-descriptors false` | **11.63** | 86.0 | 29% | 12.6 |
+| `--gpu-descriptors true` | **9.67** | 103.4 | 30% | 12.6 |
+
+The build is faster than `fffb4ce` (10.85 / 9.81) and the gap stage 1 opens is wider: **1.202
+against 1.105**. Per frame, from the Tracy zone totals divided by the `Presenter::Present` count
+(170 and 147 frames):
+
+| zone | gd=false | gd=true |
+| --- | --- | --- |
+| `GpuResourceManager::SynchronizeBdaBuffers` | 3.98 ms, 21.2 calls, 187.6 us each | **10.68 ms, 399 calls, 26.8 us each** |
+| `EvaluateRuntimeSourcesImpl` | 26.30 ms, 20 864 calls | 31.04 ms, 20 492 calls |
+| `RenderExecutor::RebindBuffers` | 6.35 ms, 20 691 calls | 4.04 ms, 20 389 calls |
+| `RenderCompute::PrepareBda` | 351.9 calls | 351.3 calls |
+| `CpOpDispatchIndirect::SyncArguments` | 3.90 ms, 245.0 calls | 3.88 ms, 245.0 calls |
+
+So the shape is unchanged: stage 1 saves 2.3 ms of `RebindBuffers` and pays 6.7 ms of BDA scan, and
+`EvaluateRuntimeSourcesImpl` is 4.7 ms *worse* rather than unchanged. The scan is the item-2 target
+and it is now measurable per frame without Tracy at all: a frame capture records every `PrepareBda`
+call, whether it scanned and what it cost
+([frame-replay.md](frame-replay.md), phase E), and the replay reproduces 462 of the 474 scans of the
+captured frame.
+
 What stage 1 needs to pay off, both foreseeable from the stats dump:
 
 1. Move the flattened SRT reads in-shader as well: the same lowering over the `flat_reads`

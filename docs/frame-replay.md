@@ -3,10 +3,14 @@
 Record one frame of the parked Nexus once, replay it through the real render path in a loop
 without the game. Turns the 40-minute end-to-end measurement into a bench that runs in under a
 minute, deterministic, with Tracy and a screenshot diff. Motivation and the process it serves:
-[performance-roadmap.md](performance-roadmap.md). Status: phases A (capture), B (replay) and
-C (validation) done. The bench runs from one command, `_Build/replay-des.ps1`, and reproduces the
-parked-Nexus render thread to within a few per cent. The one acceptance test it does **not** pass
-is the `--gpu-descriptors` A/B, and the reason is measured: see *Phase C validation* below.
+[performance-roadmap.md](performance-roadmap.md). Status: phases A (capture), B (replay),
+C (validation) and D (CPU-write timing) done. The bench runs from one command,
+`_Build/replay-des.ps1`, and reproduces the parked-Nexus render thread to within a few per cent.
+The one acceptance test it still does **not** pass is the `--gpu-descriptors` A/B. Phase C found
+the reason to be the timing of the guest's CPU writes; phase D recorded and replayed that timing
+exactly, which moved the BDA scan from 28 to 172 calls a loop against the game's 352 but did not
+close the A/B, and measured what the rest of it is: see *Phase D, CPU-write timing* below. The
+capture to use is `nexus-3` (format version 3).
 
 ## What it must do
 
@@ -73,6 +77,10 @@ Taken at `Done()` of frame N, on the GPU thread:
    and tens of seconds; acceptable for a one-time capture.
 4. **Record the CPU-dirty page set of frame N** from the memory tracker, so replay can re-mark
    them dirty each loop and the dirty-upload path (`PrepareBda`) is exercised as in the game.
+   Version 3 records, next to it, the frame's **CPU-dirty events**: every mark that reached
+   `BufferCache::InvalidateMemory` or `BufferCache::MarkRegionAsCpuModified` during the frame, in
+   arrival order, each keyed to the GPU thread's progress clock. The two are not the same set and
+   neither replaces the other; see *Phase D* below.
 5. **Dump emulator state.** Video-out registrations, the gfx and compute command-processor
    register files, the current flip request id, and the two things the render path needs that are
    neither in guest memory nor in the PM4 stream: the partially-resident-texture apertures
@@ -135,7 +143,9 @@ an ELF. Everything below lives in `src/graphics/replay/frameReplay.cpp`.
    the first `Submit` of every frame, in replay exactly as in the game, so the restore matters for
    the compute processors, which carry state across frames.
 4. **Loop.** For each loop: re-mark the recorded CPU-dirty pages
-   (`BufferCache::MarkRegionAsCpuModified`, coalesced into runs and applied on the GPU thread),
+   (`BufferCache::MarkRegionAsCpuModified`, coalesced into runs and applied on the GPU thread) and,
+   with them, the recorded CPU-dirty events that arrived before the frame's first draw; start the
+   marker thread on the rest of the events (see *Phase D*);
    then feed the recorded submissions in file order (`Submit`, `SubmitCompute`, a fresh CPU flip
    where the capture recorded a `FlipPreparation`, `Done`), wait for the GPU thread to drain and
    for every flip queued on the video-out port to present, record wall time. Demon's Souls flips
@@ -177,15 +187,18 @@ replay: <capture dir>
   video-out      <n> registrations, handle <h>, flip index <i>
   submissions    <n> records (<n> graphics, <n> compute, <n> flips)
   dirty pages    <n> in <n> ranges
+  dirty events   <n> (<n> before the first draw, <n> timed) over <n> draws
   loops          <n> (<n> measured, loop 1 excluded)
   ms/loop        min <a>  median <b>  max <c>  jitter <d>%
   ms/loop gpu    min <a>  median <b>  max <c>  jitter <d>%
+  dirty events   <n> late of <n> timed (<p>%), progress <n> of <n> recorded
   total          <n> s
 ```
 
 `replay-report.json` carries `capture`, `frame`, `loops`, `warmup_loops`, `restore_ranges_ms`,
-`restore_pages_ms`, `restore_pages`, `restore_bytes`, `submissions`, `dirty_pages`, the full
-`loop_ms` and `gpu_ms` arrays, and `summary` / `gpu_summary` objects with `min_ms`, `median_ms`,
+`restore_pages_ms`, `restore_pages`, `restore_bytes`, `submissions`, `dirty_pages`,
+`dirty_events`, `dirty_events_timed`, `dirty_events_late`, `progress_events_captured`,
+`progress_events_replayed`, the full `loop_ms` and `gpu_ms` arrays, and `summary` / `gpu_summary` objects with `min_ms`, `median_ms`,
 `max_ms`, `jitter` and `total_ms`, so two runs diff without re-parsing the console.
 
 ### Emulator state outside guest memory, and what version 2 records
@@ -340,7 +353,7 @@ One command per comparison, from the repository root:
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\_Build\replay-des.ps1' `
-    -Capture '_Runtime\_Diagnostics\replay\nexus-2' -Loops 60 -Repeats 2 -Image `
+    -Capture '_Runtime\_Diagnostics\replay\nexus-3' -Loops 60 -Repeats 2 -Image `
     -Configs '--gpu-descriptors false','--gpu-descriptors true'"
 ```
 
@@ -473,7 +486,7 @@ render-path work faithfully, and must not be used to judge a change whose cost l
 page-write pattern.** Stage 1 of the GPU descriptor fetch is exactly such a change; items 1, 3 and 4
 of the roadmap are not.
 
-### Image
+### Image (phase C)
 
 `--replay-image` on one run of each configuration, decoded and diffed with
 `_Build/replay-image-compare.py` against `nexus-2/reference.png`. The scene matches: same camera,
@@ -526,6 +539,164 @@ backlog. Read the plateau on such a capture, not the median. It does not arise o
 render thread needs 71 ms and the device about 28, so the CPU never gets ahead and the loop is flat
 from loop 3 — one more reason the parked Nexus, not the title screen, is the capture to measure on.
 
+## Phase D, CPU-write timing, September 11, 2026
+
+Phase C left one hypothesis: the A/B fails because the replay does not model *when* the guest
+dirties pages. Phase D recorded that timing, replayed it, and measured the result. The timing is
+now reproduced exactly and the hypothesis is **half right**: it accounts for 1.3 ms of the missing
+10.2, and the measurement below says where the rest is.
+
+### The progress clock
+
+Wall time means nothing across a game run and a replay, so the capture keys each CPU write to the
+GPU thread's own progress: `GuestGpu::Progress()`, a per-frame counter bumped once per draw
+(`CommandProcessor::DrawIndex`, `DrawIndexAuto`) and once per dispatch (`DispatchDirect`), reset by
+`Done()`. It is one relaxed atomic increment and the only always-on addition phase D makes; a run
+with neither `--frame-capture` nor `--replay` is otherwise untouched.
+
+The clock reproduces perfectly. The Nexus frame is **11 259** draws plus dispatches, and every
+replay loop of it ends on 11 259 as well.
+
+### The v3 stream
+
+`dirty-events.bin` is a packed stream of `{uint32 progress; uint32 submission; uint64 vaddr;
+uint64 size}` in arrival order (`frameCaptureFormat.h`). A record is appended by
+`Replay::RecordDirtyEvent`, called from `BufferCache::InvalidateMemory` and
+`BufferCache::MarkRegionAsCpuModified` — the point every guest CPU write reaches, whether it came
+through the host page-fault handler (`GpuResourceManager::HandleFault`) or a kernel write path
+(`Memory::InvalidateMemory`). When no capture is armed the path costs one relaxed atomic load.
+`dirty-pages.bin` is unchanged, so a v1 or v2 reader is unaffected, and the manifest gains
+`dirty_events` and `progress_events`. A capture without the stream replays as before, behind a
+one-line warning.
+
+On replay, a **marker thread** walks the events in arrival order, spins on the progress counter
+until it reaches the value the event carries, and invalidates the range through
+`BufferCache::InvalidateMemory` — the game's own path, not a bare mark: a range the GPU still owns
+has to be flushed back before its CPU state changes, and marking it outright from another thread
+trips the tracker's "CPU dirty state conflicts with GPU dirty state" check on the first loop.
+Events recorded at progress 0 arrived before the frame's first draw and are applied with the batch,
+on the GPU thread, outside the loop timing. At the end of a loop the thread stops waiting, applies
+whatever is left and reports it as *late*; the report prints the count, so a loop that outran the
+marks is visible rather than silent.
+
+### What a frame's CPU writes actually are
+
+The first v3 capture corrected the phase C picture immediately. The recorded dirty **page set** and
+the recorded CPU **writes** are different things, and the replay needs both:
+
+| | nexus-3 |
+| --- | --- |
+| CPU-dirty pages at `Done()` (`dirty-pages.bin`) | 72 444 |
+| CPU-dirty marks during the frame (`dirty-events.bin`) | 2 941 |
+| ... of which before the frame's first draw | 2 010 |
+| ... 16 KiB pages they cover | 884 |
+| ... of those, also in the 72 444 | **5** |
+| mark sizes | 2 931 of 1 byte, 10 larger |
+
+Almost none of the 72 444 pages is dirty because the frame wrote it: they are pages nothing has
+uploaded yet. So the batch re-mark stays — it is what makes a loop upload the frame's working set —
+and the events go on top of it. And a faulting write marks a whole 4 KiB tracker page and unprotects
+it, so a page faults at most once between uploads: 2 941 marks a frame is the real number, not an
+undercount.
+
+The events are also heavily **front-loaded**: 2 010 at progress 0, 851 more inside the first 2 000
+draws, and 80 over the remaining 9 259. That is the guest thread's shape, not an artifact — it
+builds frame N+1 while the GPU starts frame N, then blocks in `Done()` → `WaitForIdle()` for the
+rest of the frame.
+
+### The capture: nexus-3
+
+Same scene, same procedure as nexus-2, on the build of this branch.
+
+| | nexus-2 (v2) | nexus-3 (v3) |
+| --- | --- | --- |
+| frame | 2113 | 2025 |
+| write time | 5.50 s | 5.72 s |
+| mapped ranges / committed | 6344 / 4929 | 6355 / 4940 |
+| non-zero 16 KiB pages | 420 384 (6.41 GiB) | 425 177 (6.49 GiB) |
+| CPU-dirty pages of the frame | 74 625 | 72 444 |
+| CPU-dirty events / progress events | — | 2 941 / 11 259 |
+| submissions | 40 | 40 (23 graphics, 16 compute, 0 flips) |
+| PRT apertures / shader registrations | 1 / 9821 | 1 / 9815 |
+| buffer bytes flushed back / images | 682 MiB / 107 | 690 MiB / 109 |
+| gaps | 55 | 52 |
+
+Restore is 6355 ranges in 0.86 s and 425 177 pages in 4.9 s, as before.
+
+### Acceptance A/B
+
+`--replay-loops 60 --vblank-frequency 360`, two configurations, each run twice, interleaved
+(`nexus-3/ab-phased/`). `ms/loop gpu` medians, loop 1 excluded:
+
+| capture | config | run 1 | run 2 | median | gpu min |
+| --- | --- | --- | --- | --- | --- |
+| nexus-2 (phase C) | `--gpu-descriptors false` | 71.01 | 71.05 | 71.03 | 69.74 |
+| nexus-2 (phase C) | `--gpu-descriptors true` | 71.57 | 70.96 | 71.27 | 69.45 |
+| nexus-3 (phase D) | `--gpu-descriptors false` | 81.56 | 81.16 | **81.36** | 74.38 |
+| nexus-3 (phase D) | `--gpu-descriptors true` | 77.24 | 77.69 | **77.47** | 74.77 |
+
+Ratio true/false: **0.952**, against 1.003 in phase C and **1.10** end to end. Replaying the writes
+made both configurations slower — 10 ms for `false`, 6 ms for `true` — and moved the ratio the wrong
+way. Late events: **0** of 931 per loop, in every run; the replayed progress is 11 259 of 11 259
+recorded. The picture is unchanged: mean absolute difference against `nexus-3/reference.png` is
+R 10.5, G 8.3, B 4.4, against R 10.9, G 8.7, B 4.7 in phase C, from the same two causes.
+
+### Zones, per loop against the game per frame
+
+30-loop minus 5-loop Tracy captures of both configurations (`nexus-3/tracy/nexus3-gd{,5}-*.csv`)
+against `_Runtime/_Diagnostics/gpufetch/real3-self.csv`, 146 frames, `--gpu-descriptors true`:
+
+| zone | game, gd=true | nexus-2, gd=true | nexus-3, gd=true |
+| --- | --- | --- | --- |
+| `GpuResourceManager::SynchronizeBdaBuffers` | **10.47 ms, 352.1** | 0.23 ms, 28 | **1.56 ms, 172.2** |
+| `RenderCompute::PrepareBda` (calls only) | 351.9 | — | 352.0 |
+| `EvaluateRuntimeSourcesImpl` | 28.14 ms, 20 350 | 24.1 ms, 20 867 | 26.40 ms, 20 816 |
+| `RenderExecutor::RebindBuffers` | 4.49 ms, 20 201 | 1.37 ms, 20 717 | 3.22 ms, 20 682 |
+| `CpOpDispatchIndirect::SyncArguments` | 3.65 ms, 244.9 | 9.96 ms, 245 | 4.53 ms, 245.0 |
+
+With `--gpu-descriptors false` the replay scans 17.7 times a loop for 1.03 ms.
+
+### Acceptance: not met, and what the rest of the gap is
+
+- The ratio of `ms/loop gpu` medians is **0.952**; within 10% of the game's 1.10 means 0.99 to 1.21.
+- `SynchronizeBdaBuffers` runs **172.2** times a loop; within 25% of 352 means 264 to 440.
+
+Neither is met, and nothing was tuned to chase them. The measurement above says why, and it is not
+the write timing, which is now exact:
+
+1. **The scan count is short by half, in the part of the frame that has no CPU writes.** In the game
+   `RenderCompute::PrepareBda` is called 351.9 times a frame and `SynchronizeBdaBuffers` runs 352.1
+   times: the BDA generation has moved before *every single* compute preparation. The replay makes
+   the same 352.0 preparations and finds a changed generation only 172 times. Since 80 of the
+   frame's 931 timed writes fall in its last 9 259 draws, the game's generation cannot be moving on
+   CPU writes there — something else is moving it.
+2. **That something else is buffer churn.** The generation is bumped by
+   `BufferCache::ChangeRegister` on every buffer registration and every buffer retirement
+   (`bufferCache.cpp:99` and `:102`) and by `GpuResourceManager::MapMemory`, not only by the
+   CPU-write path. In the game the guest's allocators move constantly, so buffers are created and
+   retired all through the frame and guest threads map and unmap memory. A replay loop runs over the
+   buffer set loop 1 built, maps nothing, and retires almost nothing, so all of those bumps are
+   missing — and they are exactly the ones spread evenly across the frame.
+3. **The cost per scan follows from the same cause.** The game pays 29.7 µs a scan, the replay
+   9.07 µs. A scan resynchronizes the buffers intersecting the ranges accumulated since the last
+   one; in the game those are the ranges of the buffers it has just built, in the replay they are
+   the 884 pages of a frame's worth of 1-byte marks, only five of which are in the frame's dirty
+   set. Half the calls at a third of the cost is 1.56 ms against 10.47.
+
+So the rule from phase C narrows rather than lifts: **the harness measures render-path work
+faithfully, and still must not be used to judge a change whose cost lives in the guest's memory
+behaviour — now specifically its buffer and mapping churn, not its page writes.** Stage 1 of the GPU
+descriptor fetch is such a change; roadmap items 1, 3 and 4 are not.
+
+Closing it means a format version 4 that records the *other* generation bumps as well — buffer
+registrations and retirements and map/unmap calls, each keyed to the same progress clock — and a
+replay that reproduces them. That is a larger change than phase D: a replay cannot register a guest
+buffer it has no reason to create, so it would need either a synthetic churn source or a real one
+driven from the recorded events. The alternative, and probably the better answer, is roadmap item 2
+itself: make the per-draw dirty sync cheap (a dirty-page list instead of a scan of dirty ranges
+against mapped ranges), after which the zone is small in the game too and the A/B stops depending on
+it.
+
 ## Phases
 
 | Phase | Deliverable | Estimate |
@@ -533,6 +704,7 @@ from loop 3 — one more reason the parked Nexus, not the title screen, is the c
 | A. Capture | flag, quiesce and flush, sparse memory dump, submission recorder in processing order, state dump, manifest; format in `frameCaptureFormat.h`. Done except the screenshot, which needs a presenter readback path | 1 agent-day |
 | B. Replay | `--replay`, memory and state restore, feeder thread, loop timing and report, image readback | 1 to 2 agent-days |
 | C. Validation | capture the parked Nexus on the current build; 60 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff; one command. Done, and the A/B does not reproduce — see *Phase C validation* above | half a day |
+| D. CPU-write timing | format version 3: a progress clock on the GPU thread, `dirty-events.bin`, a marker thread that replays each write where it happened. Done; the timing is exact (0 late events, 11 259 of 11 259 progress) and the BDA scan goes from 28 to 172 calls a loop, but the A/B still does not reproduce — see *Phase D* above | half a day |
 
 Phase B status, September 11, 2026: `--replay` replays a real capture end to end. On title-2, the
 title screen at frame 300 captured with format version 2, it restores 1190 ranges (6123 MiB) in
@@ -557,8 +729,8 @@ format did not carry:
    followed by a reserved hole, read through `Memory::TryReadPrtBacking`, which refuses outside a
    registered aperture. Restoring the one aperture Demon's Souls registers fixes every such image.
 
-That recapture is done: `nexus-2`, format version 2, is the capture to use; `nexus-1` is kept only
-because its screenshot documents the scene.
+That recapture is done. `nexus-3`, format version 3, is the capture to use; `nexus-2` is the
+phase C reference and `nexus-1` is kept only because its screenshot documents the scene.
 
 Code goes under `src/graphics/replay/` (capture and replay), flags in
 [settings.md](settings.md), the capture format and the report format in this file. Both flags

@@ -50,7 +50,7 @@ How to use it: `_Build/replay-des.ps1 -Capture _Runtime/_Diagnostics/replay/nexu
 -Repeats 2 -Configs '<flags A>', '<flags B>'` prints the comparison table and keeps the reports. A
 60-loop run is 10 s plus a 6 s warm-up; a two-configuration, two-repeat bench is four minutes
 against the 40 minutes an end-to-end A/B costs. The capture to use is
-`_Runtime/_Diagnostics/replay/nexus-2` (format version 2, frame 2113, 6.4 GiB, 40 submissions).
+`_Runtime/_Diagnostics/replay/nexus-3` (format version 3, frame 2025, 6.5 GiB, 40 submissions).
 
 What it reproduces: the parked-Nexus render thread at 71 ms a loop against 92 ms measured
 end to end (no guest threads compete in replay), with the frame's zone structure intact — 20 867
@@ -58,17 +58,17 @@ end to end (no guest threads compete in replay), with the frame's zone structure
 `CpOpDispatchIndirect::SyncArguments` a loop against 245 a frame. Run-to-run repeatability is 0.05
 to 0.9%. The presented image matches the capture screenshot bar exposure and two streamed HUD icons.
 
-What it does not reproduce: **anything whose cost is the guest's page-write pattern within a frame.**
-The replay re-marks the recorded CPU-dirty set in one batch before each loop, so
-`GpuResourceManager::SynchronizeBdaBuffers` runs 28 times a loop for 0.23 ms instead of 352 times a
-frame for 10.47 ms. That 10.2 ms is the whole of the `--gpu-descriptors` A/B, which therefore comes
-out 1.00 in replay against 1.10 end to end. Items 1, 3 and 4 below do not depend on it and are safe
-to measure in replay; item 2 is not, and needs the end-to-end protocol or the fix below.
-
-Next on the harness, when item 2 is picked up: record the CPU-dirty set **per submission** instead
-of per frame (capture format version 3), so the replay re-marks each slice between submissions and
-the BDA scan runs as often as it does in the game. Evidence and sizing in
-[frame-replay.md](frame-replay.md), "Why the A/B does not reproduce, measured".
+What it does not reproduce: **anything whose cost is the guest's memory churn within a frame.**
+Phase D (format version 3, September 11, 2026) records every CPU write of the frame against a
+draw-and-dispatch progress clock and replays it from a marker thread at the same point, exactly —
+0 late events, 11 259 of 11 259 progress reached — which took
+`GpuResourceManager::SynchronizeBdaBuffers` from 28 calls a loop for 0.23 ms to 172 for 1.56 ms,
+against 352 for 10.47 ms in the game, and moved the `--gpu-descriptors` ratio from 1.00 to 0.95
+against 1.10 end to end. The remainder is not page writes: the BDA generation is also bumped by
+every buffer registration and retirement and by every map, and a replay loop reuses the buffer set
+loop 1 built. Items 1, 3 and 4 below do not depend on any of this and are safe to measure in replay;
+item 2 is not, and needs the end-to-end protocol. Evidence in
+[frame-replay.md](frame-replay.md), "Phase D, CPU-write timing".
 
 ## Items, in recommended order
 

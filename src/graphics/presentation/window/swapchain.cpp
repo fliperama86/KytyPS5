@@ -792,6 +792,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
 		m_impl->window.UpdateTitle();
+		// Outside the render lock: the periodic driver cache save takes the pipeline cache mutex,
+		// which pipeline creation never holds while waiting on presentation.
+		m_impl->renderer.GetPipelineCache().SaveIfDirty();
 		m_impl->frames.Release(&frame, true);
 		return;
 	}

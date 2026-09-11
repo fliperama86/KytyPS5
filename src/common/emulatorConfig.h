@@ -94,6 +94,9 @@ struct ConfigOptions {
 	// default: it is what the game's own BDA scans see) or before every replayed frame (false,
 	// the phase B to D behaviour). See docs/frame-replay.md, phase E.
 	bool                   replay_dirty_set_once       = true;
+	// Host threads that spin on the guest CPUs for the length of a replay, imitating the game's
+	// job-system workers, which busy-wait in guest code. 0 leaves the machine to the replay.
+	uint32_t               replay_spin_threads         = 0;
 	std::filesystem::path  replay_image;
 	ThreadAffinity         thread_affinity             = ThreadAffinity::Auto;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -152,6 +155,7 @@ std::filesystem::path GetReplayDir();
 uint32_t              GetReplayLoops();
 uint32_t              GetReplayFrames();
 bool                  ReplayDirtySetOnce();
+uint32_t              GetReplaySpinThreads();
 std::filesystem::path GetReplayImage();
 
 ThreadAffinity GetThreadAffinity();

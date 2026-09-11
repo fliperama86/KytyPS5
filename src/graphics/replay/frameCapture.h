@@ -49,8 +49,19 @@ inline void RecordDirtyEvent(uint64_t vaddr, uint64_t size) {
 // writes it to prepare-events.bin, or a replay, which counts it (format version 5,
 // docs/frame-replay.md, phase E). Both need the same call, and neither is on in a normal run, so
 // it is a single relaxed load of a null pointer there.
-using PrepareSink = void (*)(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                             uint64_t dirty_bytes, uint32_t scan_ns);
+struct PrepareSample {
+	bool     scanned      = false;
+	uint32_t dirty_ranges = 0;
+	uint32_t synchronized = 0;
+	uint32_t scan_ns      = 0;
+	// Host page-protection changes the scan caused, from PageProtectCallCount. Replay-only
+	// diagnostics: PrepareEventRecord has no room for them and a capture does not write them.
+	uint32_t protect_calls = 0;
+	uint32_t protect_pages = 0;
+	uint64_t dirty_bytes   = 0;
+};
+
+using PrepareSink = void (*)(const PrepareSample& sample);
 
 namespace Detail {
 extern std::atomic<PrepareSink> g_prepare_sink;
@@ -59,10 +70,9 @@ extern std::atomic<PrepareSink> g_prepare_sink;
 // Installs the sink; null removes it. The capture installs its own when it arms.
 void SetPrepareSink(PrepareSink sink) noexcept;
 
-inline void RecordPrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                               uint64_t dirty_bytes, uint32_t scan_ns) {
+inline void RecordPrepareEvent(const PrepareSample& sample) {
 	if (auto* sink = Detail::g_prepare_sink.load(std::memory_order_relaxed); sink != nullptr) {
-		sink(scanned, dirty_ranges, synchronized, dirty_bytes, scan_ns);
+		sink(sample);
 	}
 }
 

@@ -179,6 +179,10 @@ bool ReplayDirtySetOnce() {
 	return g_config->replay_dirty_set_once;
 }
 
+uint32_t GetReplaySpinThreads() {
+	return g_config->replay_spin_threads;
+}
+
 std::filesystem::path GetReplayImage() {
 	return g_config->replay_image;
 }

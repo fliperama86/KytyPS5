@@ -16,8 +16,10 @@ namespace Libs::Graphics::Replay {
 // See docs/frame-replay.md.
 // `dirty_set_once` marks the recorded CPU-dirty page set at restore only, instead of before every
 // replayed frame; the frame's recorded CPU-write events are applied per frame either way.
+// `spin_threads` host threads busy-wait on the guest CPU set for the length of the run, imitating
+// the game's job-system workers, which spin in guest code while the render thread works.
 int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames,
-              bool dirty_set_once, const std::filesystem::path& image);
+              bool dirty_set_once, uint32_t spin_threads, const std::filesystem::path& image);
 
 // WAIT_REG_MEM diagnostics, so a wait that never completes ends the replay with the address and
 // the compare parameters instead of spinning. Off outside a replay; the recording call is behind

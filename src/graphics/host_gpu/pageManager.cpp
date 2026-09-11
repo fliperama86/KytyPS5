@@ -29,6 +29,10 @@ namespace {
 
 constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
 constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
+
+// Counted for the frame replay; see PageProtectCallCount in the header.
+std::atomic_uint64_t g_protect_calls {0};
+std::atomic_uint64_t g_protect_pages {0};
 constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
@@ -221,6 +225,8 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
+		g_protect_calls.fetch_add(1, std::memory_order_relaxed);
+		g_protect_pages.fetch_add(size / PAGE_SIZE, std::memory_order_relaxed);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,
@@ -351,5 +357,13 @@ template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, Reg
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+
+uint64_t PageProtectCallCount() noexcept {
+	return g_protect_calls.load(std::memory_order_relaxed);
+}
+
+uint64_t PageProtectPageCount() noexcept {
+	return g_protect_pages.load(std::memory_order_relaxed);
+}
 
 } // namespace Libs::Graphics

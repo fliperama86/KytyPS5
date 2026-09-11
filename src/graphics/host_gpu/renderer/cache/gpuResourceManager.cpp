@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/replay/frameCapture.h"
 
@@ -98,13 +99,15 @@ void GpuResourceManager::PrepareBda() {
 		m_fault_process_pending = true;
 		// Frame replay (docs/frame-replay.md, phase E): every preparation is recorded, scanning
 		// or not, because the number of scans per preparation is what a replay must reproduce.
-		Replay::RecordPrepareEvent(false, 0, 0, 0, 0);
+		Replay::RecordPrepareEvent(Replay::PrepareSample {});
 		return;
 	}
 	// The scan is timed only while a capture or a replay is watching, so a normal run pays one
 	// relaxed load and no clock reads.
 	const bool watched = Replay::PrepareEventsWatched();
 	const auto started = watched ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const auto protect_calls_before = watched ? PageProtectCallCount() : 0;
+	const auto protect_pages_before = watched ? PageProtectPageCount() : 0;
 	KYTY_PROFILER_BLOCK("GpuResourceManager::SynchronizeBdaBuffers");
 	// Take the dirty set before the scan. A range added afterwards also advances the
 	// generation captured above, so the next call picks it up.
@@ -126,14 +129,24 @@ void GpuResourceManager::PrepareBda() {
 	m_last_bda_buffer_generation = buffer_generation;
 	m_last_bda_mapped_generation = mapped_generation;
 	m_fault_process_pending = true;
-	const auto scan_ns =
-	    watched ? static_cast<uint32_t>(std::min<int64_t>(
-	                  std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                      std::chrono::steady_clock::now() - started)
-	                      .count(),
-	                  UINT32_MAX))
-	            : 0u;
-	Replay::RecordPrepareEvent(true, dirty_ranges, synchronized, dirty_bytes, scan_ns);
+	if (watched) {
+		Replay::PrepareSample sample;
+		sample.scanned      = true;
+		sample.dirty_ranges = dirty_ranges;
+		sample.synchronized = synchronized;
+		sample.dirty_bytes  = dirty_bytes;
+		sample.scan_ns      = static_cast<uint32_t>(
+		         std::min<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                          std::chrono::steady_clock::now() - started)
+		                          .count(),
+		                      UINT32_MAX));
+		// The re-protection the scan's uploads caused: every SynchronizeBuffersInRange that
+		// uploads a page has the tracker protect it again, which is a kernel call and, with guest
+		// threads running, a TLB shootdown across every one of them.
+		sample.protect_calls = static_cast<uint32_t>(PageProtectCallCount() - protect_calls_before);
+		sample.protect_pages = static_cast<uint32_t>(PageProtectPageCount() - protect_pages_before);
+		Replay::RecordPrepareEvent(sample);
+	}
 }
 
 bool GpuResourceManager::BdaScanRequired(uint64_t buffer_generation,

@@ -154,7 +154,11 @@ Two pieces, both foreseeable from the stats dump:
   September 11: **399 scans a frame at 26.8 µs, 10.68 ms** (`PrepareBda` runs 9845 times a frame and
   4.8% of those find a changed generation; with the flag off it is 21.2 scans and 3.98 ms). A scan
   walks only 3.2 dirty ranges and 34 KiB, so the cost is not the scan's inputs: the same scan in a
-  replay, with the same ranges, costs 4.1 µs. Removes most of the 10.7 ms.
+  replay, with the same ranges, costs 4.1 µs, and putting twelve spinning threads on the guest CPUs
+  does not close that gap (4.8 µs), so it is not simply contention from running threads either
+  ([frame-replay.md](frame-replay.md), phase E). A scan makes about two page re-protections in
+  replay; what the game's scan makes is not recorded yet and is the measurement that would settle
+  where the 26 µs goes. Removes most of the 10.7 ms.
 
 Expected: about 16 FPS in this scene (projection in the design document).
 

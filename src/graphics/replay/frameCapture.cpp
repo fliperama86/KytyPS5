@@ -81,8 +81,7 @@ struct Recorder {
 	std::atomic_uint32_t frame_index {0};
 };
 
-void CapturePrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                         uint64_t dirty_bytes, uint32_t scan_ns);
+void CapturePrepareEvent(const PrepareSample& sample);
 
 struct State {
 	bool                  armed      = false;
@@ -125,17 +124,16 @@ State& Instance() {
 
 // The capture's prepare sink: one record per GpuResourceManager::PrepareBda call of the frame.
 // GPU thread only.
-void CapturePrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                         uint64_t dirty_bytes, uint32_t scan_ns) {
+void CapturePrepareEvent(const PrepareSample& sample) {
 	auto&              recorder = Instance().recorder;
 	PrepareEventRecord record {};
 	record.frame        = recorder.frame_index.load(std::memory_order_relaxed);
 	record.progress     = GuestGpu::Progress();
-	record.scanned      = scanned ? 1u : 0u;
-	record.dirty_ranges = dirty_ranges;
-	record.synchronized = synchronized;
-	record.scan_ns      = scan_ns;
-	record.dirty_bytes  = dirty_bytes;
+	record.scanned      = sample.scanned ? 1u : 0u;
+	record.dirty_ranges = sample.dirty_ranges;
+	record.synchronized = sample.synchronized;
+	record.scan_ns      = sample.scan_ns;
+	record.dirty_bytes  = sample.dirty_bytes;
 
 	std::scoped_lock lock(recorder.prepare_mutex);
 	recorder.prepare_events.push_back(record);

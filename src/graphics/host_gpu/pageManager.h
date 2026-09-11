@@ -10,6 +10,13 @@ namespace Libs::Graphics {
 
 enum class PageFaultAccess { Read, Write, Execute, Unknown };
 
+// How many host page-protection changes the tracker has made, and how many tracker pages they
+// covered, since the process started. Two relaxed atomic adds per NtProtectVirtualMemory call;
+// the frame replay reads them around a BDA scan to report the re-protection each scan causes
+// (docs/frame-replay.md, phase E, and docs/investigations/render-thread-kernel-2026-09-10.md).
+[[nodiscard]] uint64_t PageProtectCallCount() noexcept;
+[[nodiscard]] uint64_t PageProtectPageCount() noexcept;
+
 class PageManager final {
 public:
 	PageManager();

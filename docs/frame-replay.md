@@ -936,7 +936,8 @@ Acceptance:
 
 - **`SynchronizeBdaBuffers` per frame within 25%: met.** 462 replayed against 474 recorded in the
   same frame (-2.5%), and against 399 measured over 147 game frames (+16%).
-- **The `--gpu-descriptors` true/false ratio within 10%: not met, narrowly.** `ms/loop gpu` medians
+- **The `--gpu-descriptors` true/false ratio within 10%: not met, narrowly**, and not for want of
+  contention (see below). `ms/loop gpu` medians
   of `_Build/replay-des.ps1 -Loops 40 -Repeats 2` on nexus-6 (`nexus-6/ab-phasee/`):
 
 | config | run 1 | run 2 | median | gpu min | scans a frame |
@@ -951,11 +952,50 @@ Acceptance:
 
 The residue is measured and is one thing: **a replayed scan costs 4.1 us where the game's costs
 25.8 us**, on the same 2.9 to 3.2 ranges and 33 to 34 KiB. 462 scans at the game's cost would be
-11.9 ms instead of 1.9 ms, which is the whole of the missing margin. Closing it means making a
-replayed frame pay what the game's upload path pays -- the guest threads that compete for it are
-exactly what the harness does not simulate (see *Limits*) -- so the honest rule stands: **the
-harness reproduces the render thread's structure, its call counts and now its BDA-scan timeline, but
-a change whose cost is the contention around a guest memory upload must still be judged end to end.**
+11.9 ms instead of 1.9 ms, which is the whole of the missing margin.
+
+### Is it the twelve spinning guest threads? No
+
+The obvious explanation is contention: the game runs twelve core equivalents of job-system workers
+busy-waiting in guest code while the render thread works
+([cpu-profile-2026-09-10.md](investigations/cpu-profile-2026-09-10.md)), and a replay runs on an
+otherwise idle machine, so every kernel call the render thread makes -- a page re-protection above
+all -- should be cheaper. `--replay-spin-threads <N>` tests it directly: N host threads pinned to
+the guest CPU group by the same affinity policy, spinning on one relaxed atomic load and a
+`YieldProcessor` per iteration, no syscalls and no writes, for the length of the run. The replay also
+counts the tracker's `NtProtectVirtualMemory` calls inside each scan (`PageProtectCallCount`, a
+relaxed counter in the page manager). nexus-6, 40 loops, `ms/loop gpu` medians:
+
+| spin threads | gd=true ms | gd=false ms | ratio | us a scan, true | us a scan, false | protect calls a scan (pages) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 78.52 | 73.26 | 1.072 | 4.2 | 51.1 | 2.0 (3.2) |
+| 6 | 79.74 | 74.26 | 1.074 | 4.6 | 58.3 | 2.0 (3.2) |
+| 12 | 79.02 | 74.25 | 1.064 | 4.8 | 60.8 | 2.0 (3.2) |
+| the game | 103.4 | 86.0 | **1.202** | **25.8** | **187.6** | not recorded |
+
+Tracy agrees with the replay's own counters and adds the surrounding zones (30-loop minus 5-loop
+pairs, gd=true): `SynchronizeBdaBuffers` 462 calls at 4.6 us with N=0 and 4.4 us with N=12,
+`EvaluateRuntimeSourcesImpl` 28.31 ms against 28.06 ms, both at 20 739 calls -- against the game's
+31.04 ms (gd=true) and 26.30 ms (gd=false) at about 20 500. The spinners cost the loop half a
+millisecond and move a scan by well under a microsecond, in the noise and not consistently in one
+direction; the ratio does not move either, because both configurations pay the same half
+millisecond.
+
+So **the per-scan cost is not the presence of running threads**. The protect-call count per scan is
+identical at every N -- 2.0 calls over 3.2 pages -- so it is not TLB-shootdown volume either: the
+count does not move and the cost barely does. And it cannot be memory bandwidth, because these
+spinners touch nothing. What the spinners do not imitate is the guest threads' *work*: in the game
+every page a scan re-protects is a page a guest thread faults on again, each fault costing an
+exception, a handler and another protection change, and the guest's own uploads and reads share the
+memory system with the scan's. A replay applies the recorded marks from the render thread itself and
+never faults, so it pays for none of that.
+
+The last thing this measurement wants is the game's own protect count per scan, and
+`PrepareEventRecord` has no room left for it: a version 6 record, or a second stream keyed to the
+same progress clock, would say directly whether the game's 25.8 us is more protections or dearer
+ones. Until then the honest rule stands: **the harness reproduces the render thread's structure, its
+call counts and its BDA-scan timeline, but a change whose cost is the guest's fault and upload
+traffic around that scan must still be judged end to end.**
 
 ### The multi-frame loop, and why K is 1 on this title
 

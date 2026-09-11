@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -498,6 +499,8 @@ struct PrepareCounters {
 	std::atomic_uint64_t synchronized {0};
 	std::atomic_uint64_t dirty_bytes {0};
 	std::atomic_uint64_t scan_ns {0};
+	std::atomic_uint64_t protect_calls {0};
+	std::atomic_uint64_t protect_pages {0};
 
 	void Reset() noexcept {
 		prepares.store(0, std::memory_order_relaxed);
@@ -506,33 +509,75 @@ struct PrepareCounters {
 		synchronized.store(0, std::memory_order_relaxed);
 		dirty_bytes.store(0, std::memory_order_relaxed);
 		scan_ns.store(0, std::memory_order_relaxed);
+		protect_calls.store(0, std::memory_order_relaxed);
+		protect_pages.store(0, std::memory_order_relaxed);
 	}
 };
 
 PrepareCounters g_prepare_counters;
 
-void CountPrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                       uint64_t dirty_bytes, uint32_t scan_ns) {
+void CountPrepareEvent(const Replay::PrepareSample& sample) {
 	auto& counters = g_prepare_counters;
 	counters.prepares.fetch_add(1, std::memory_order_relaxed);
-	if (!scanned) {
+	if (!sample.scanned) {
 		return;
 	}
 	counters.scans.fetch_add(1, std::memory_order_relaxed);
-	counters.dirty_ranges.fetch_add(dirty_ranges, std::memory_order_relaxed);
-	counters.synchronized.fetch_add(synchronized, std::memory_order_relaxed);
-	counters.dirty_bytes.fetch_add(dirty_bytes, std::memory_order_relaxed);
-	counters.scan_ns.fetch_add(scan_ns, std::memory_order_relaxed);
+	counters.dirty_ranges.fetch_add(sample.dirty_ranges, std::memory_order_relaxed);
+	counters.synchronized.fetch_add(sample.synchronized, std::memory_order_relaxed);
+	counters.dirty_bytes.fetch_add(sample.dirty_bytes, std::memory_order_relaxed);
+	counters.scan_ns.fetch_add(sample.scan_ns, std::memory_order_relaxed);
+	counters.protect_calls.fetch_add(sample.protect_calls, std::memory_order_relaxed);
+	counters.protect_pages.fetch_add(sample.protect_pages, std::memory_order_relaxed);
 }
+
+// The guest's job-system workers busy-wait in guest code while the render thread works: twelve
+// core equivalents of spinning, on the CPUs the affinity policy gives the guest
+// (docs/investigations/cpu-profile-2026-09-10.md). A replay runs no guest code, so the machine is
+// idle around it and every kernel call the render thread makes -- a page re-protection above all --
+// is cheaper than it is in the game. These threads put that load back without pretending to do the
+// guest's work: one relaxed load of a shared flag and a pause per iteration, no syscalls, no
+// writes. --replay-spin-threads, off by default.
+class SpinThreads final {
+public:
+	explicit SpinThreads(uint32_t count) {
+		m_threads.reserve(count);
+		for (uint32_t i = 0; i < count; i++) {
+			m_threads.emplace_back([this] {
+				Common::ApplyThreadAffinity(Common::ThreadAffinityGroup::Guest, "ReplaySpin");
+				while (!m_stop.load(std::memory_order_relaxed)) {
+					SpinPause();
+				}
+			});
+		}
+	}
+
+	~SpinThreads() {
+		m_stop.store(true, std::memory_order_relaxed);
+		for (auto& thread: m_threads) {
+			if (thread.joinable()) {
+				thread.join();
+			}
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(SpinThreads);
+
+private:
+	std::atomic_bool         m_stop {false};
+	std::vector<std::thread> m_threads;
+};
 
 // What one frame's preparations amounted to, in the capture or in one replayed loop.
 struct PrepareSummary {
-	uint64_t prepares     = 0;
-	uint64_t scans        = 0;
-	uint64_t dirty_ranges = 0;
-	uint64_t synchronized = 0;
-	uint64_t dirty_bytes  = 0;
-	uint64_t scan_ns      = 0;
+	uint64_t prepares      = 0;
+	uint64_t scans         = 0;
+	uint64_t dirty_ranges  = 0;
+	uint64_t synchronized  = 0;
+	uint64_t dirty_bytes   = 0;
+	uint64_t scan_ns       = 0;
+	uint64_t protect_calls = 0;
+	uint64_t protect_pages = 0;
 };
 
 // One frame of a capture: the slice of submissions.bin between two Done records, the frame's own
@@ -631,7 +676,7 @@ std::string DescribeLastBlockedWait() {
 }
 
 int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_wanted,
-              bool dirty_set_once, const std::filesystem::path& image) {
+              bool dirty_set_once, uint32_t spin_threads, const std::filesystem::path& image) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SetUnhandledExceptionFilter(ReplayCrashFilter);
 #endif
@@ -1010,6 +1055,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	         flip_count);
 	::printf("  dirty pages    %zu in %zu ranges, re-marked %s\n", dirty_pages.size(),
 	         dirty_ranges.size(), dirty_set_once ? "once at restore" : "before every frame");
+	::printf("  spin threads   %u on the guest CPUs\n", spin_threads);
 	if (prepare_events_present && !prepare_events.empty()) {
 		uint64_t recorded_prepares = 0;
 		uint64_t recorded_scans    = 0;
@@ -1077,6 +1123,11 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	}
 	// The replay's own preparations, counted through the sink the capture writes its stream from.
 	Replay::SetPrepareSink(&CountPrepareEvent);
+	// The guest's spinning job workers, if this run wants them; they live until the run ends.
+	std::unique_ptr<SpinThreads> spinners;
+	if (spin_threads != 0) {
+		spinners = std::make_unique<SpinThreads>(spin_threads);
+	}
 	if (dirty_set_once && !dirty_ranges.empty()) {
 		gpu.SendCommandSync([&]() {
 			for (const auto& range: dirty_ranges) {
@@ -1200,7 +1251,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			     g_prepare_counters.dirty_ranges.load(std::memory_order_relaxed),
 			     g_prepare_counters.synchronized.load(std::memory_order_relaxed),
 			     g_prepare_counters.dirty_bytes.load(std::memory_order_relaxed),
-			     g_prepare_counters.scan_ns.load(std::memory_order_relaxed)});
+			     g_prepare_counters.scan_ns.load(std::memory_order_relaxed),
+			     g_prepare_counters.protect_calls.load(std::memory_order_relaxed),
+			     g_prepare_counters.protect_pages.load(std::memory_order_relaxed)});
 			frame_gpu_ms[index].push_back(gpu_done);
 			frame_loop_ms[index].push_back(frame_done);
 			gpu_total += gpu_done;
@@ -1222,6 +1275,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		gpu_ms.push_back(gpu_total);
 	}
 	g_wait_diagnostics.store(false, std::memory_order_relaxed);
+	spinners.reset();
 	GuestGpu::SetProgressHook(nullptr);
 	Replay::SetPrepareSink(nullptr);
 	g_inline_marking.events = nullptr;
@@ -1245,10 +1299,13 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			total.synchronized += samples[loop].synchronized;
 			total.dirty_bytes += samples[loop].dirty_bytes;
 			total.scan_ns += samples[loop].scan_ns;
+			total.protect_calls += samples[loop].protect_calls;
+			total.protect_pages += samples[loop].protect_pages;
 		}
-		prepare_mean[i] = {total.prepares / counted,     total.scans / counted,
-		                   total.dirty_ranges / counted, total.synchronized / counted,
-		                   total.dirty_bytes / counted,  total.scan_ns / counted};
+		prepare_mean[i] = {total.prepares / counted,      total.scans / counted,
+		                   total.dirty_ranges / counted,  total.synchronized / counted,
+		                   total.dirty_bytes / counted,   total.scan_ns / counted,
+		                   total.protect_calls / counted, total.protect_pages / counted};
 	}
 
 	// 5. Report. The first loop is a warm-up: pipelines, descriptor sets and history buffers are
@@ -1295,7 +1352,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		         static_cast<unsigned long long>(captured.scans));
 		if (replayed.scans != 0) {
 			const auto scans = static_cast<double>(replayed.scans);
-			::printf(", %.1f ranges %.1f buffers %.0f KiB %.1f us a scan",
+			::printf(", %.1f protects (%.1f pages), %.1f ranges %.1f buffers %.0f KiB %.1f us a scan",
+			         static_cast<double>(replayed.protect_calls) / scans,
+			         static_cast<double>(replayed.protect_pages) / scans,
 			         static_cast<double>(replayed.dirty_ranges) / scans,
 			         static_cast<double>(replayed.synchronized) / scans,
 			         static_cast<double>(replayed.dirty_bytes) / scans / 1024.0,
@@ -1405,6 +1464,17 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		}
 		report << "],\n";
 		report << "  \"dirty_set_once\": " << (dirty_set_once ? "true" : "false") << ",\n";
+		report << "  \"spin_threads\": " << spin_threads << ",\n";
+		report << "  \"frame_scan_protect_calls\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << prepare_mean[i].protect_calls;
+		}
+		report << "],\n";
+		report << "  \"frame_scan_protect_pages\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << prepare_mean[i].protect_pages;
+		}
+		report << "],\n";
 		report << "  \"frame_scan_ns\": [";
 		for (size_t i = 0; i < frame_count; i++) {
 			report << (i == 0 ? "" : ",") << prepare_mean[i].scan_ns;

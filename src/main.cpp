@@ -107,6 +107,9 @@ static void PrintUsage() {
 	::printf("  --replay-dirty-set <once|loop>       Re-mark the recorded CPU-dirty page set once\n"
 	         "                                       at restore or before every frame.\n"
 	         "                                       Default: once.\n");
+	::printf("  --replay-spin-threads <num>          Spin that many threads on the guest CPUs for\n"
+	         "                                       the replay, as the game's job workers do.\n"
+	         "                                       Default: 0.\n");
 	::printf("  --replay-image <path>                Write the last replayed frame there.\n");
 }
 
@@ -445,6 +448,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--replay-spin-threads") {
+			uint32_t threads  = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), threads);
+			if (error != std::errc {} || end != value.data() + value.size() || threads > 64) {
+				::printf("invalid thread count for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.replay_spin_threads = threads;
 		} else if (arg == "--replay-image") {
 			options.config.replay_image = Common::FixFilenameSlash(value);
 		} else if (arg == "--keymap") {

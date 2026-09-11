@@ -56,6 +56,23 @@ public:
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
+	// The frame's progress clock (docs/frame-replay.md, phase D). One relaxed atomic increment per
+	// draw and per dispatch as the command processors execute them, reset by Done(). It is the
+	// only always-on addition the CPU-write timing needed: a counter that means the same thing in
+	// a game run and in a replay, which wall time does not. The frame capture keys every CPU-dirty
+	// mark to it and the replay's marker thread waits on it, so the marks land at the same point
+	// in the GPU thread's work and the BDA generation moves as often as it does in the game.
+	[[nodiscard]] static uint32_t Progress() noexcept {
+		return s_progress.load(std::memory_order_relaxed);
+	}
+	static void BumpProgress() noexcept { s_progress.fetch_add(1, std::memory_order_relaxed); }
+	static void ResetProgress() noexcept { s_progress.store(0, std::memory_order_relaxed); }
+	// Index of the submission the GPU thread has started, also reset by Done(). Recorded next to
+	// a dirty event so the stream can be read by hand; nothing depends on it.
+	[[nodiscard]] static uint32_t SubmissionIndex() noexcept {
+		return s_submission_index.load(std::memory_order_relaxed);
+	}
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
@@ -112,6 +129,10 @@ private:
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
+
+	// Written only by the GPU thread, read by any thread; see Progress() above.
+	inline static std::atomic_uint32_t s_progress {0};
+	inline static std::atomic_uint32_t s_submission_index {0};
 
 	friend class CommandProcessor;
 };

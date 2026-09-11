@@ -233,6 +233,9 @@ void GuestGpu::Done() {
 	}
 	m_graphics_done = true;
 	m_done_num++;
+	// The progress clock is per frame; every queue is drained by now (see above).
+	ResetProgress();
+	s_submission_index.store(0, std::memory_order_relaxed);
 }
 
 // Runs the one-frame capture on the GPU thread with the queues already drained; the caller holds
@@ -675,6 +678,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	if (first_slice) {
 		submission.started = true;
+		s_submission_index.fetch_add(1, std::memory_order_relaxed);
 		if (submission.capture_id != 0) {
 			Replay::RecordStarted(submission.capture_id);
 		}
@@ -969,6 +973,8 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CheckBuffer();
+	// The frame's progress clock; see GuestGpu::Progress().
+	GuestGpu::BumpProgress();
 
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
@@ -1207,6 +1213,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 	{
 		CheckBuffer();
+		GuestGpu::BumpProgress();
 		frame_num = m_renderer.GetGpu().GetFrameNum();
 		if (GraphicsRunDebugDumpEnabled()) {
 			static std::atomic<uint32_t> log_count {0};
@@ -1295,6 +1302,7 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	CheckBuffer();
+	GuestGpu::BumpProgress();
 
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;

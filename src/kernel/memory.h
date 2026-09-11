@@ -110,6 +110,10 @@ void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// True when TryReadGpuCleanBacking would take its checks for this range and pass all of them, so
+// every subrange of it can be read with plain TryReadBacking. A caller that reads many small words
+// out of one page asks once for the page instead of once per word.
+[[nodiscard]] bool     IsGpuCleanBackingRange(uint64_t vaddr, uint64_t size);
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);

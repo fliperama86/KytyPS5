@@ -111,6 +111,12 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// Reads consecutive guest dwords exactly the way one shader resource materialization does: one
+// page-verdict cache for the whole call, the unchanged per-word clean read wherever a page is not
+// wholly clean. Exposed for the production-cache test; the emulator reaches this path through
+// SrtRuntime instead.
+bool ReadShaderGuestWordsForTest(uint64_t address, std::span<uint32_t> values);
+
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);

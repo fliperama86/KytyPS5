@@ -4531,6 +4531,175 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // The shader materialization reader takes one clean verdict per 4 KiB guest page and reuses it
+  // for every word in that page. A page that stops being wholly clean must fall back to the
+  // per-word check, word for word, and reach exactly the words the old per-word reader reached.
+  void CheckShaderGuestPageVerdicts() {
+    constexpr const char *name = "ShaderGuestPageVerdicts";
+    constexpr uint64_t base = 0x0000000203f00000ull;
+    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t word_count = 24;
+    constexpr uint64_t image_size = sizeof(uint32_t);
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "page-verdict direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "page-verdict fixed direct-memory mapping failed");
+    std::array<uint32_t, word_count> written{};
+    for (uint32_t index = 0; index < word_count; index++) {
+      written[index] = 0xc0de0000u + index;
+    }
+    std::memcpy(mapped, written.data(), sizeof(written));
+
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      LibKernel::Memory::InstallGpuResources(&resources);
+      resources.MapMemory(base, allocation_size);
+      auto &texture_cache = resources.GetTextureCache();
+
+      // Only the GPU thread may take the clean path, so every read runs there.
+      const auto ReadWords = [&gpu](uint64_t address, uint32_t count,
+                                    std::array<uint32_t, word_count> &out) {
+        bool ok = false;
+        gpu.SendCommandSync([&] {
+          ok = Libs::Graphics::ReadShaderGuestWordsForTest(
+              address, std::span<uint32_t>(out.data(), count));
+        });
+        return ok;
+      };
+      // The unchanged per-word reader, for the "same result the old code would
+      // have" comparison.
+      const auto ReadWordsPerWord = [&gpu](uint64_t address, uint32_t count,
+                                           std::array<uint32_t, word_count> &out) {
+        bool ok = false;
+        gpu.SendCommandSync([&] {
+          ok = true;
+          for (uint32_t index = 0; index < count && ok; index++) {
+            ok = LibKernel::Memory::TryReadGpuCleanBacking(
+                address + index * sizeof(uint32_t), &out[index],
+                sizeof(uint32_t));
+          }
+        });
+        return ok;
+      };
+
+      const auto CleanPage = [&gpu](uint64_t address) {
+        bool clean = false;
+        gpu.SendCommandSync([&] {
+          clean = LibKernel::Memory::IsGpuCleanBackingRange(address, 0x1000);
+        });
+        return clean;
+      };
+
+      std::array<uint32_t, word_count> cached{};
+      std::array<uint32_t, word_count> per_word{};
+      Require(name, "clean page verdict", CleanPage(base),
+              "an untouched mapped page was not reported wholly clean");
+      Require(name, "clean page read",
+              ReadWords(base, word_count, cached) && cached == written,
+              "a wholly clean page did not read back through the page verdict");
+      Require(name, "clean page parity",
+              ReadWordsPerWord(base, word_count, per_word) && per_word == written,
+              "the per-word reader disagreed with the page verdict on a clean page");
+
+      // One GPU-modified image over the first word alone. The page verdict must
+      // fail, and the fallback must still be per word: word 0 fails, the rest do
+      // not.
+      ImageDesc dirty{};
+      dirty.type = BindingType::Texture;
+      dirty.info.data = {base, image_size};
+      dirty.info.pixel_format = vk::Format::eR8G8B8A8Srgb;
+      dirty.info.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
+      dirty.info.type = Prospero::ImageType::kColor2D;
+      dirty.info.extent = {1, 1, 1};
+      dirty.info.resources = {1, 1};
+      dirty.info.pitch = 1;
+      dirty.info.bytes_per_block = 4;
+      dirty.info.samples = 1;
+      dirty.info.tile_mode = Prospero::TileMode::kLinear;
+      dirty.info.mip_layout[0] = {0, 4, 1, 1};
+      dirty.view_info.format = dirty.info.pixel_format;
+      dirty.view_info.type = vk::ImageViewType::e2D;
+      dirty.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      dirty.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto image = texture_cache.FindImage(dirty);
+      Require(name, "image registration", static_cast<bool>(image),
+              "the page-verdict fixture image was not registered");
+      texture_cache.GetImage(image).MarkGpuModified();
+      Require(name, "page no longer clean",
+              texture_cache.IsRegionGpuModified(base, 0x1000) && !CleanPage(base),
+              "a GPU-modified image on the page did not revoke the clean verdict");
+
+      // The image is normalized when it is registered, so the covered span is
+      // read back rather than assumed.
+      const auto covered_end = texture_cache.GetImage(image).info.data.End();
+      Require(name, "fixture covers part of the page",
+              covered_end > base && covered_end % sizeof(uint32_t) == 0 &&
+                  covered_end < base + sizeof(written),
+              "the fixture image covers every word the test wants to compare");
+      const auto covered_words =
+          static_cast<uint32_t>((covered_end - base) / sizeof(uint32_t));
+      const auto tail_words = word_count - covered_words;
+
+      cached.fill(0);
+      per_word.fill(0);
+      Require(name, "covered words fall back",
+              !ReadWords(base, covered_words, cached) &&
+                  !ReadWordsPerWord(base, covered_words, per_word),
+              "a covered word was readable where the per-word reader failed it");
+      Require(name, "uncovered words still read",
+              ReadWords(covered_end, tail_words, cached) &&
+                  ReadWordsPerWord(covered_end, tail_words, per_word) &&
+                  cached == per_word,
+              "the fallback was taken page-wide instead of word by word");
+      for (uint32_t index = 0; index < tail_words; index++) {
+        Require(name, "uncovered word values",
+                cached[index] == written[covered_words + index],
+                "a word outside the GPU-modified image read the wrong value");
+      }
+
+      texture_cache.GetImage(image).ClearGpuModified();
+      cached.fill(0);
+      Require(name, "clean verdict returns",
+              CleanPage(base) && ReadWords(base, word_count, cached) &&
+                  cached == written,
+              "the page did not become clean again once the image was released");
+
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "page-verdict direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "page-verdict direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -30284,6 +30453,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-generation-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaGenerationCaching();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--page-verdict-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckShaderGuestPageVerdicts();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {

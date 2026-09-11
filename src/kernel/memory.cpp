@@ -878,6 +878,21 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool IsGpuCleanBackingRange(uint64_t vaddr, uint64_t size) {
+	// Deliberately narrower than TryReadGpuCleanBacking, which skips its checks for a range that
+	// is not GPU-tracked: a whole page can fail IsGpuAddressRange while words inside it pass it,
+	// so an untracked range reports "not clean" and its words take the per-word path unchanged.
+	if (!IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	if (g_gpu_resources == nullptr) {
+		return true;
+	}
+	return Graphics::GuestGpu::IsGpuThread() &&
+	       !GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	       !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size);
+}
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;

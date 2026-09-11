@@ -87,6 +87,7 @@ any single window.
 | `bc74f63` context dirty mask, pipeline and dynamic-state memo | 10.398 | 12.573 | 26.0% |
 | `61d5917` per-stage allocation pooling | 10.703 | 12.535 | 27.2% |
 | rebind memo (not kept) | 10.729 | 12.557 | 27.2% |
+| page verdict cache | 10.887 | 12.551 | 26.1% |
 
 Zone self times divide by the 20.1-second capture window; every zone below runs on the render
 thread, so the share is that thread's share.
@@ -159,11 +160,54 @@ formatted and small-buffer streamed slots must be excluded in any case: they cop
 ownership on every call, and an image-backed texel buffer can change without the buffer cache
 knowing.
 
-### What is left
+### Page verdict cache, kept but not a win
 
 `EvaluateRuntimeSourcesImpl` dominates the render thread: 5.88 s of the 20.1-second capture (29%)
-over 4.3 million calls, about 1.37 microseconds per stage per draw. It is seven times the size of
-anything else measured here and is the obvious next target.
+over 4.3 million calls, about 1.37 microseconds per stage per draw, seven times the size of
+anything else measured here. The evaluation itself is a compiled flat program, so the suspicion was
+its guest reads: a clean read goes through `TryReadGpuCleanBacking`, which per four-byte word runs
+`IsGpuAddressRange`, `IsGpuThread`, a buffer-cache `RangeSet` lookup and a locked texture-cache
+region query before it reaches the backing store.
+
+The reader now takes one verdict per 4 KiB guest page instead of one per word. A page is `Clean`
+when its whole extent passes the same three checks; every word in such a page is then read with
+plain `TryReadBacking`, because a range with no GPU-dirty bytes and no GPU-modified image contains
+no word that has either. Any other verdict falls back to the unchanged per-word call, so behaviour
+is identical, and no per-word result is ever remembered. The cache is eight entries, direct-mapped
+by page number, on the stack of `ProgramCache::Get`; it is created beside the `SrtRuntime` and
+handed over in `SrtRuntime::userdata`, which was unused. Exactly one materialization runs per
+`Get`, so the verdicts cannot outlive the call that took them, and only the GPU thread reaches the
+clean path at all (`IsGpuCleanBackingRange` requires `IsGpuThread`), which is the same thread that
+runs the materialization. Nothing can therefore record a GPU write between a verdict and the reads
+it covers. `SyncGpuCleanBacking` only ever clears GPU-dirty state, so a sync during the call can
+turn a `NotClean` page clean, never the reverse. `SyncShaderGuestMemory` was left alone: it works
+on whole ranges already and it mutates state, so its result must not be cached.
+
+It works and it changes nothing measurable. The 30-second clean window produced **10.887 FPS**
+against 10.703 and 10.786 for the same code without it, inside the scene's own noise, and
+`EvaluateRuntimeSourcesImpl` in `page-verdict.tracy` is 5.876 s over 4,299,561 calls, 1,366 ns
+each, against 5.876 s over 4,291,183 calls at 1,369 ns in `phaseA-3.tracy`. Taken under Remote
+Desktop, like every sample from the flat-program build onwards.
+
+Counters compiled into a throwaway build explain why. Per million `EvaluateRuntimeSourcesImpl`
+calls in the parked scene the flat program executes 23.7 million instructions and performs **21.5
+million guest word reads — but only 45,000 of them are clean reads**. Demon's Souls marks almost
+none of its SRT reads clean, and a read that is not clean has no reader installed at all: it is a
+direct `memcpy` from the guest address, which never consults the GPU caches. The page verdict
+covers 0.2% of the reads this zone performs, and 99.9% of those now hit a verdict already taken,
+which is why the hit rate is excellent and the frame rate is unmoved. The change is kept because it
+is cheap, tested and correct, not because it paid.
+
+### What is left
+
+The same counters point at the real shape of the cost. Each `EvaluateRuntimeSourcesImpl` call
+reads about **21 guest dwords scattered across the SRT**, one per flattened slot, and re-reads
+every one of them for the same shader on every draw. At 1.37 microseconds for 23.7 instructions
+plus 21.4 scattered reads, the zone is paying roughly 60 nanoseconds per step, which is memory
+latency, not arithmetic. The next experiment is therefore to cache the flattened SRT contents per
+shader and user-data pointer and invalidate it from the page writes that can change it, rather than
+to make the individual read cheaper. `RenderExecutor::RebindBuffers` remains the second-largest
+zone at 1.38 s over 4.3 million calls; the note above on why its memo was rejected still applies.
 
 
 ## Reproducing a capture

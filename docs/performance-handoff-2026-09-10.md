@@ -278,7 +278,11 @@ zone self time, not by sample attribution.
 6. Before a release, build the actual committed release binary, validate it, then package and publish
    through the existing workflow.
 
-Two lines of enquiry are closed. Page-fault-based memory tracking is not a cost at 628 faults per
+Three lines of enquiry are closed. The render thread's "26% kernel" from Tracy is Tracy counting
+every non-emulator module as kernel; true kernel time on that thread is 10.4%, split between queue
+submission, semaphore waits and guest page protection, with no hidden hotspot
+([render-thread kernel breakdown](investigations/render-thread-kernel-2026-09-10.md)).
+Page-fault-based memory tracking is not a cost at 628 faults per
 second. The `DesTouchTrace` probes cost about 3.4% in exception machinery, but disabling them stopped
 the game reaching gameplay, so the collision workaround is load-bearing and that cost cannot simply
 be reclaimed.

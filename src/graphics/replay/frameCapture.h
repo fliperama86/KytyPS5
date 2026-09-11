@@ -27,8 +27,7 @@ namespace Libs::Graphics::Replay {
 // Copies the dwords and returns the capture id to carry on the Submission; 0 when not recording.
 [[nodiscard]] uint64_t RecordEnqueue(SubmissionKind kind, uint32_t queue_id,
                                      std::span<const uint32_t> commands,
-                                     std::span<const uint32_t> constants,
-                                     uint64_t                  flip_request_id);
+                                     std::span<const uint32_t> constants, uint64_t flip_request_id);
 // Appends the submission to the frame in the order the GPU thread started processing it.
 void RecordStarted(uint64_t capture_id);
 // Appends the Done marker that closes the frame.

@@ -2,7 +2,6 @@
 
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
-#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -39,8 +38,8 @@ constexpr uint64_t READ_CHUNK        = 1024 * 1024;
 constexpr size_t   WRITE_BUFFER_SIZE = 8 * 1024 * 1024;
 
 struct Gap {
-	uint64_t    vaddr  = 0;
-	uint64_t    size   = 0;
+	uint64_t    vaddr = 0;
+	uint64_t    size  = 0;
 	std::string reason;
 };
 
@@ -51,10 +50,10 @@ struct PendingSubmission {
 };
 
 struct Recorder {
-	std::mutex                                        mutex;
-	std::unordered_map<uint64_t, PendingSubmission>   pending;
-	std::vector<PendingSubmission>                    ordered;
-	uint64_t                                          next_id = 1;
+	std::mutex                                      mutex;
+	std::unordered_map<uint64_t, PendingSubmission> pending;
+	std::vector<PendingSubmission>                  ordered;
+	uint64_t                                        next_id = 1;
 };
 
 struct State {
@@ -75,9 +74,8 @@ State& Instance() {
 			state.capture_at = Config::GetFrameCaptureFrame();
 			state.exit_after = Config::FrameCaptureExitEnabled();
 			state.active.store(true, std::memory_order_relaxed);
-			LOGF("FrameCapture: armed, folder=%s frame=%d exit=%s\n",
-			     state.folder.string().c_str(), state.capture_at,
-			     state.exit_after ? "true" : "false");
+			LOGF("FrameCapture: armed, folder=%s frame=%d exit=%s\n", state.folder.string().c_str(),
+			     state.capture_at, state.exit_after ? "true" : "false");
 		}
 		return true;
 	}();
@@ -120,7 +118,7 @@ public:
 			return m_ok;
 		}
 		FlushBuffer();
-		m_ok = (std::fclose(m_file) == 0) && m_ok;
+		m_ok   = (std::fclose(m_file) == 0) && m_ok;
 		m_file = nullptr;
 		return m_ok;
 	}
@@ -271,7 +269,7 @@ MemoryStats WriteMemory(const std::vector<LibKernel::Memory::VirtualRangeSnapsho
 	return stats;
 }
 
-uint64_t WriteDirtyPages(RenderContext& renderer,
+uint64_t WriteDirtyPages(RenderContext&                                              renderer,
                          const std::vector<LibKernel::Memory::VirtualRangeSnapshot>& ranges,
                          const std::filesystem::path& folder, bool& ok) {
 	Writer file;
@@ -486,8 +484,8 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	// every frame.
 	state.active.store(false, std::memory_order_relaxed);
 
-	const auto started = std::chrono::steady_clock::now();
-	const auto& folder = state.folder;
+	const auto  started = std::chrono::steady_clock::now();
+	const auto& folder  = state.folder;
 
 	std::error_code error;
 	std::filesystem::create_directories(folder, error);
@@ -506,7 +504,7 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	std::vector<TextureCache::CaptureGap> image_gaps;
 	const auto flushed_images = renderer.GetTextureCache().FlushGpuModifiedImages(image_gaps);
 
-	auto&      scheduler      = renderer.GetCommandScheduler();
+	auto&      scheduler       = renderer.GetCommandScheduler();
 	const auto completion_tick = scheduler.CurrentTick();
 	scheduler.EndRendering();
 	scheduler.Finish();
@@ -523,16 +521,16 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	bool ok = true;
 
 	// 2. Guest memory.
-	const auto ranges  = LibKernel::Memory::SnapshotVirtualRanges();
-	const auto memory  = WriteMemory(ranges, folder, gaps, dropped_gaps, ok);
+	const auto ranges = LibKernel::Memory::SnapshotVirtualRanges();
+	const auto memory = WriteMemory(ranges, folder, gaps, dropped_gaps, ok);
 	const auto memory_seconds =
 	    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
 	// 3. Everything else.
-	const auto dirty_pages  = WriteDirtyPages(renderer, ranges, folder, ok);
-	uint32_t   width        = 0;
-	uint32_t   height       = 0;
-	const auto video_out    = WriteVideoOut(folder, width, height, ok);
+	const auto dirty_pages = WriteDirtyPages(renderer, ranges, folder, ok);
+	uint32_t   width       = 0;
+	uint32_t   height      = 0;
+	const auto video_out   = WriteVideoOut(folder, width, height, ok);
 	WriteRegisters(processors, folder, ok);
 	const auto submissions = WriteSubmissions(folder, ok);
 

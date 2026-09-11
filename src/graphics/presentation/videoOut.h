@@ -58,18 +58,18 @@ void                          VideoOutShutdown();
 // `attribute` holds the raw VideoOutBufferAttribute2 bytes the guest passed, `attribute_size` how
 // many of them are meaningful. `buffers` holds `count` {data, metadata} guest addresses.
 struct VideoOutRegistrationSnapshot {
-	static constexpr int      BUFFER_NUM_MAX    = 16;
+	static constexpr int      BUFFER_NUM_MAX     = 16;
 	static constexpr uint32_t ATTRIBUTE_MAX_SIZE = 128;
 
-	int      handle         = 0;
-	int      set_index      = 0;
-	int      index_start    = 0;
-	int      count          = 0;
-	int      category       = 0;
-	uint32_t width          = 0;
-	uint32_t height         = 0;
-	uint32_t attribute_size = 0;
-	std::array<uint8_t, ATTRIBUTE_MAX_SIZE>                    attribute {};
+	int                                                       handle         = 0;
+	int                                                       set_index      = 0;
+	int                                                       index_start    = 0;
+	int                                                       count          = 0;
+	int                                                       category       = 0;
+	uint32_t                                                  width          = 0;
+	uint32_t                                                  height         = 0;
+	uint32_t                                                  attribute_size = 0;
+	std::array<uint8_t, ATTRIBUTE_MAX_SIZE>                   attribute {};
 	std::array<std::pair<uint64_t, uint64_t>, BUFFER_NUM_MAX> buffers {};
 };
 

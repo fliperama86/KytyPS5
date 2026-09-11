@@ -30,6 +30,7 @@
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <cstdlib>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -37,6 +38,54 @@
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Upper-bound experiment for docs/gpu-descriptor-fetch.md stage 1, temporary. With
+// KYTY_DEBUG_GPU_FETCH_STUB=1 and --gpu-descriptors true, every read-only buffer with a valid flat
+// root is marked gpu_fetch without any shader support: the render thread skips its evaluation
+// and binding, the shader reads the dummy buffer and the picture is wrong. Measures the CPU
+// ceiling of the stage before the emitter side lands.
+bool GpuFetchStubEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEBUG_GPU_FETCH_STUB");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled && Config::GpuDescriptorsEnabled();
+}
+
+void MarkGpuFetchStub(ShaderRecompiler::IR::ResourcePlan& plan) {
+	if (!GpuFetchStubEnabled()) {
+		return;
+	}
+	bool any = false;
+	for (auto& buffer: plan.info.buffers) {
+		if (!buffer.read || buffer.written || buffer.atomic ||
+		    buffer.image_alias != ShaderRecompiler::IR::BufferResource::NoImageAlias) {
+			continue;
+		}
+		if (buffer.source >= plan.flat.sources.size() || !plan.flat.sources[buffer.source].valid) {
+			continue;
+		}
+		buffer.gpu_fetch = true;
+		any              = true;
+	}
+	plan.info.gpu_descriptors = plan.info.gpu_descriptors || any;
+}
+
+void CopyGpuFetchStub(const ShaderRecompiler::IR::ShaderInfo& from,
+                      ShaderRecompiler::IR::ShaderInfo&       to) {
+	if (!GpuFetchStubEnabled() || from.buffers.size() != to.buffers.size()) {
+		return;
+	}
+	for (size_t index = 0; index < from.buffers.size(); index++) {
+		to.buffers[index].gpu_fetch = from.buffers[index].gpu_fetch;
+	}
+	to.gpu_descriptors = from.gpu_descriptors;
+}
+
+} // namespace
+
 
 namespace {
 
@@ -602,12 +651,14 @@ struct PipelineCache::ProgramCache {
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			MarkGpuFetchStub(resource_plan);
 			ReportMaterialization(label, stage, params.hash, report,
 			                      ShaderRecompiler::IR::MaterializeResources(
 			                          resource_plan, runtime, resources, specialization, &report));
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
 		}
 		auto& source_entry = entry->second;
+		CopyGpuFetchStub(source_entry.resource_plan.info, translated.program.info);
 		if (Config::GpuDescriptorsEnabled()) {
 			// A variant compiles against the tuples the CPU just derived; those are the ones a
 			// later GPU-fetch draw keeps.

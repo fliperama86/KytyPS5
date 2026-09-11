@@ -46,7 +46,8 @@ bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
-                            std::vector<uint8_t>& active_sources);
+                            std::vector<uint8_t>& active_sources,
+                            std::span<const uint8_t> skip_sources = {});
 
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
              std::vector<uint32_t>& flat);

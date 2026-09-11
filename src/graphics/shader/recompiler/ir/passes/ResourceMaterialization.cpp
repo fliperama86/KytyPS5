@@ -576,7 +576,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 } // namespace
 
 static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& runtime,
-                                MaterializedSnapshot& snapshot, MaterializeReport* report) {
+                                MaterializedSnapshot& snapshot, MaterializeReport* report,
+                                std::span<const uint8_t> skip_sources) {
 #if defined(TRACY_ENABLE)
 	KYTY_PROFILER_BLOCK("MaterializeSnapshot");
 #endif
@@ -597,7 +598,8 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint8_t>         active_sources;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
-	                            flattened_srt, program.clean_flat_slots, active_sources)) {
+	                            flattened_srt, program.clean_flat_slots, active_sources,
+	                            skip_sources)) {
 		return fail("a descriptor source did not evaluate");
 	}
 
@@ -1330,7 +1332,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		*report = {};
 	}
 	MaterializedSnapshot materialized;
-	if (!MaterializeSnapshot(program, runtime, materialized, report)) {
+	// The sources behind buffers the shader fetches itself are not walked; their descriptor
+	// dwords stay zero and their specialization tuples are restored from the baked ones below.
+	std::vector<uint8_t> skip_sources;
+	if (gpu_fetch != nullptr && gpu_fetch->specialization != nullptr) {
+		skip_sources.assign(program.descriptor_sources.size(), 0u);
+		const auto count = std::min(gpu_fetch->buffers.size(), program.info.buffers.size());
+		for (size_t index = 0; index < count; index++) {
+			const auto source = program.info.buffers[index].source;
+			if (gpu_fetch->buffers[index] != 0u && source < skip_sources.size()) {
+				skip_sources[source] = 1u;
+			}
+		}
+	}
+	if (!MaterializeSnapshot(program, runtime, materialized, report, skip_sources)) {
 		return false;
 	}
 	if (!BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization,

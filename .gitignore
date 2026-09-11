@@ -7,3 +7,6 @@ _Build/
 _Runtime/
 cmake-build-debug/
 _PipelineCache/
+
+# Claude Code agent worktrees
+.claude/worktrees/

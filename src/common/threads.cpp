@@ -533,8 +533,150 @@ static void WriteAffinityLine(const std::string& message) {
 	Log::Flush();
 }
 
-void ApplyThreadAffinityFromEnv(const char* variable, const char* thread_label) {
-	const auto mask = AffinityMaskFor(variable);
+static const char* AffinityVariable(ThreadAffinityGroup group) {
+	switch (group) {
+		case ThreadAffinityGroup::Render: return "KYTY_GPU_THREAD_AFFINITY";
+		case ThreadAffinityGroup::Present: return "KYTY_PRESENT_THREAD_AFFINITY";
+		case ThreadAffinityGroup::Guest: return "KYTY_GUEST_THREAD_AFFINITY";
+	}
+	return "";
+}
+
+// One L3 cache: the logical processors behind it and its size in bytes.
+struct L3Cache {
+	uint64_t mask = 0;
+	uint64_t size = 0;
+};
+
+// Written once by InitializeThreadAffinity() before any of the threads below exists, read-only
+// afterwards.
+static uint64_t g_derived_large_cache_mask = 0;
+static uint64_t g_derived_other_mask       = 0;
+
+static uint64_t DerivedAffinityMaskFor(ThreadAffinityGroup group) {
+	return (group == ThreadAffinityGroup::Guest ? g_derived_other_mask
+	                                            : g_derived_large_cache_mask);
+}
+
+// Every distinct L3 in processor group 0, in the order the API reports them. Entries sharing a
+// processor mask are merged, because a host may report one cache once per cache type.
+static std::vector<L3Cache> EnumerateL3Caches() {
+	std::vector<L3Cache> caches;
+
+	DWORD length = 0;
+	if (GetLogicalProcessorInformationEx(RelationCache, nullptr, &length) != 0 ||
+	    GetLastError() != ERROR_INSUFFICIENT_BUFFER || length == 0) {
+		return caches;
+	}
+
+	std::vector<uint8_t> buffer(length);
+	if (GetLogicalProcessorInformationEx(
+	        RelationCache, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+	        &length) == 0) {
+		return caches;
+	}
+
+	for (DWORD offset = 0; offset + sizeof(DWORD) * 2 <= length;) {
+		const auto* info =
+		    reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+		if (info->Size == 0 || offset + info->Size > length) {
+			break;
+		}
+		offset += info->Size;
+
+		if (info->Relationship != RelationCache || info->Cache.Level != 3 ||
+		    info->Cache.GroupMask.Group != 0) {
+			continue;
+		}
+
+		const auto mask = static_cast<uint64_t>(info->Cache.GroupMask.Mask);
+		const auto size = static_cast<uint64_t>(info->Cache.CacheSize);
+		if (mask == 0 || size == 0) {
+			continue;
+		}
+
+		const auto it = std::find_if(caches.begin(), caches.end(),
+		                             [mask](const L3Cache& entry) { return entry.mask == mask; });
+		if (it != caches.end()) {
+			// <windows.h> defines a max() macro here, so compare by hand.
+			if (size > it->size) {
+				it->size = size;
+			}
+		} else {
+			caches.push_back(L3Cache {mask, size});
+		}
+	}
+
+	return caches;
+}
+
+// The render thread's working set is scattered guest memory, so on a host whose L3 caches differ in
+// size it wants the largest one to itself. That is only derivable when every logical processor sits
+// in one processor group, because SetThreadAffinityMask cannot name another group.
+static void DeriveAffinityMasks() {
+	if (GetActiveProcessorGroupCount() > 1) {
+		return;
+	}
+
+	const auto caches = EnumerateL3Caches();
+	if (caches.size() < 2) {
+		return;
+	}
+
+	const auto largest = std::max_element(
+	    caches.begin(), caches.end(),
+	    [](const L3Cache& a, const L3Cache& b) { return a.size < b.size; });
+	const auto smallest = std::min_element(
+	    caches.begin(), caches.end(),
+	    [](const L3Cache& a, const L3Cache& b) { return a.size < b.size; });
+	if (largest->size == smallest->size) {
+		// Uniform host: no die is worth preferring, and pinning would only take cores away.
+		return;
+	}
+
+	DWORD_PTR process_mask = 0;
+	DWORD_PTR system_mask  = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) == 0) {
+		return;
+	}
+
+	const auto large_mask = largest->mask & static_cast<uint64_t>(process_mask);
+	const auto other_mask = static_cast<uint64_t>(process_mask) & ~largest->mask;
+	if (large_mask == 0 || other_mask == 0) {
+		return;
+	}
+
+	g_derived_large_cache_mask = large_mask;
+	g_derived_other_mask       = other_mask;
+
+	constexpr uint64_t BYTES_PER_MIB = 1024 * 1024;
+	std::string        topology;
+	for (const auto& cache: caches) {
+		if (!topology.empty()) {
+			topology += ", ";
+		}
+		topology += fmt::sprintf("%" PRIu64 " MiB on 0x%016" PRIx64, cache.size / BYTES_PER_MIB,
+		                         cache.mask);
+	}
+	WriteAffinityLine(fmt::sprintf("affinity: L3 topology: %s; derived render+present mask "
+	                               "0x%016" PRIx64 ", guest mask 0x%016" PRIx64 "\n",
+	                               topology.c_str(), large_mask, other_mask));
+}
+
+void InitializeThreadAffinity(bool derive) {
+	if (derive) {
+		DeriveAffinityMasks();
+	}
+}
+
+void ApplyThreadAffinity(ThreadAffinityGroup group, const char* thread_label) {
+	const auto* variable = AffinityVariable(group);
+	const auto* source   = variable;
+	auto        mask     = AffinityMaskFor(variable);
+	if (mask == 0) {
+		mask   = DerivedAffinityMaskFor(group);
+		source = "derived";
+	}
 	if (mask == 0) {
 		return;
 	}
@@ -544,17 +686,19 @@ void ApplyThreadAffinityFromEnv(const char* variable, const char* thread_label) 
 	if (previous == 0) {
 		WriteAffinityLine(
 		    fmt::sprintf("affinity: %s = 0x%016" PRIx64 " rejected for %s (thread %u), error %u\n",
-		                 variable, mask, label, thread, static_cast<uint32_t>(GetLastError())));
+		                 source, mask, label, thread, static_cast<uint32_t>(GetLastError())));
 		return;
 	}
 	WriteAffinityLine(fmt::sprintf("affinity: %s -> %s (thread %u): mask 0x%016" PRIx64
 	                               ", was 0x%016" PRIx64 "\n",
-	                               variable, label, thread, mask, static_cast<uint64_t>(previous)));
+	                               source, label, thread, mask, static_cast<uint64_t>(previous)));
 }
 
 #else
 
-void ApplyThreadAffinityFromEnv(const char* /*variable*/, const char* /*thread_label*/) {}
+void InitializeThreadAffinity(bool /*derive*/) {}
+
+void ApplyThreadAffinity(ThreadAffinityGroup /*group*/, const char* /*thread_label*/) {}
 
 #endif
 

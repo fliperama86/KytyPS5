@@ -10,10 +10,21 @@ namespace Common {
 
 void InitializeThreads();
 
-// Pins the calling thread to the host CPU set named by a hexadecimal mask in the environment
-// variable, and logs one line when it does. The variable is read once per process; an unset,
-// empty or unparseable value leaves the thread alone. Windows only, a no-op elsewhere.
-void ApplyThreadAffinityFromEnv(const char* variable, const char* thread_label);
+// The thread groups host affinity distinguishes. Render and presentation want the die with the
+// largest L3; everything the guest runs belongs on the rest of the machine.
+enum class ThreadAffinityGroup { Render, Present, Guest };
+
+// Derives a mask per group from the host L3 cache topology and logs one line when it finds a
+// layout worth splitting: at least two L3 caches of differing size, all in one processor group.
+// Uniform hosts, single-cache hosts and `derive == false` derive nothing. Call once, after the
+// log is up and before any affected thread starts. Windows only, a no-op elsewhere.
+void InitializeThreadAffinity(bool derive);
+
+// Pins the calling thread to its group's host CPU set and logs one line when it does. The group's
+// KYTY_*_THREAD_AFFINITY variable, a hexadecimal mask, overrides the derived mask; it is read once
+// per process, and an unset, empty or unparseable value falls back to the derived mask. A thread
+// with neither is left alone. Windows only, a no-op elsewhere.
+void ApplyThreadAffinity(ThreadAffinityGroup group, const char* thread_label);
 
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();

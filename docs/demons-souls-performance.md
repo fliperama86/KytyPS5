@@ -217,8 +217,10 @@ logical CPUs 0-15 and 32 MB behind 16-31**, so the 3D V-cache die is the low hal
 worker threads spin at 100% each and, left alone, the scheduler spreads everything over both dies.
 
 `KYTY_GPU_THREAD_AFFINITY`, `KYTY_PRESENT_THREAD_AFFINITY` and `KYTY_GUEST_THREAD_AFFINITY`
-(see [settings.md](settings.md)) pin those threads to a hexadecimal mask at startup. Five 30-second
-clean windows in the parked Nexus, same binary, same session (Remote Desktop):
+(see [settings.md](settings.md)) pin those threads to a hexadecimal mask at startup. They were how
+the arrangement below was found; the masks are now derived from the cache topology by default, and
+the variables override that. Five 30-second clean windows in the parked Nexus, same binary, same
+session (Remote Desktop):
 
 | Run | GPU + present | Guest threads | FPS | CPU cores | GPU % |
 | --- | --- | --- | --- | --- | --- |
@@ -244,16 +246,32 @@ the frame rate moves because the render thread's scattered SRT reads hit in cach
 `gpu-lo` also shifts about 0.3 core-equivalents from user to kernel time, which is the guest workers
 contending harder on sixteen cores instead of thirty-two, and costs nothing here because they spin.
 
-The variables stay off by default: the masks are specific to this CPU, and a fixed mask on a host
-with a different CCD layout, or with one CCD, would be a pessimization. On this machine set
+### Deriving the masks, now the default
 
-```powershell
-$env:KYTY_GPU_THREAD_AFFINITY = '0xFFFF'; $env:KYTY_PRESENT_THREAD_AFFINITY = '0xFFFF'
-$env:KYTY_GUEST_THREAD_AFFINITY = '0xFFFF0000'
+Nothing about the arrangement is specific to this CPU except the numbers, and Windows will name
+them. `--thread-affinity auto`, the default, calls `GetLogicalProcessorInformationEx(RelationCache)`
+at startup, keeps the level-3 entries, and derives two masks when it finds at least two L3 caches of
+unequal size: the render and presentation threads get the group mask of the largest cache, every
+guest thread gets the rest of the process affinity mask. A host whose L3 caches are all the same
+size, a host with one L3 cache, a host with more than one processor group (`SetThreadAffinityMask`
+cannot name another group) and every non-Windows platform derive nothing and behave exactly as
+before. `--thread-affinity none` turns the derivation off. The three environment variables still
+work and override the derived mask of their group, so an experiment needs no rebuild.
+
+It logs the topology it found and what it made of it, once, before any of those threads starts:
+
+```
+affinity: L3 topology: 96 MiB on 0x000000000000ffff, 32 MiB on 0x00000000ffff0000; derived render+present mask 0x000000000000ffff, guest mask 0x00000000ffff0000
 ```
 
-before launching. Deriving the masks from the cache topology at runtime instead of hard-coding them
-is the obvious way to make this a default, and has not been done.
+which is the `gpu-lo` row above, reached with nothing set in the environment. Two 30-second clean
+windows of that build in the parked Nexus, one session, Remote Desktop: **11.163 FPS** (12.589 CPU
+core equivalents, 27.6% GPU) and **11.080 FPS** (12.597, 28.2%). Both sit above every unpinned
+window of this build (10.70-10.98) and below the two hand-pinned `gpu-lo` windows (11.387, 11.532)
+taken in an earlier session with the same masks. Since the derived masks are byte-for-byte the
+`gpu-lo` masks and the kernel-time shift is the same 0.31 core equivalents, the gap is session
+drift, not a difference in what the code does; read the gain as "a few percent, in the same
+direction", not as a reproduction of 4-5%.
 
 ## Reproducing a capture
 

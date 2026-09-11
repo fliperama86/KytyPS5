@@ -286,3 +286,31 @@ Page-fault-based memory tracking is not a cost at 628 faults per
 second. The `DesTouchTrace` probes cost about 3.4% in exception machinery, but disabling them stopped
 the game reaching gameplay, so the collision workaround is load-bearing and that cost cannot simply
 be reclaimed.
+
+## Where this stands, September 11, 2026
+
+Parked Nexus, this machine, Remote Desktop session: **4.21 → 11.2 FPS** across the two days. The
+steps after the flat program were small and are recorded in
+[demons-souls-performance.md](demons-souls-performance.md): pooling, incremental BDA sync, the
+context dirty mask, per-stage pooling, CCD affinity. Three experiments measured zero and were
+reverted with their write-ups kept: the page verdict cache, the rebind memo and the per-frame SRT
+cache (its saving moved into page-fault kernel time).
+
+The shape is now understood and is not a hotspot. The game issues about 8,700 individual indirect
+draws and 1,900 dispatches per frame; the console's command processor consumes them in hardware,
+while here every one is reconstructed in software on one thread at about 8 µs. The render thread
+is the frame; the GPU sits at 25 to 28%; the twelve guest threads spin waiting for it.
+
+What is left, with honest expectations, all measured or studied rather than guessed:
+
+1. Native indirect dispatch without the argument readback. About 245 GPU drains per frame and 4% of
+   the thread (`CpOpDispatchIndirect::SyncArguments`). Contained.
+2. Front-stage threading: parse and evaluate ahead of the render thread. Studied in detail (the
+   evaluator is pure and thread-local; the blocker is the `IsGpuThread` gate; CP memory writes are
+   eager, so deferring them makes read-ahead safe). Ceiling about 1.6x, realistic 14 to 16 FPS.
+3. Async shader compile with an interpreter fallback, RPCS3 style, for the first-encounter stutter.
+   Playability, not average frame rate.
+4. Upstream PR #506, a few percent.
+
+Stacked, these reach perhaps 20 FPS in this scene. 30 FPS needs the shader backend to fetch
+descriptors on the GPU, which is a redesign, not an optimization. Decide on that basis.

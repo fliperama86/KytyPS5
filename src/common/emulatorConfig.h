@@ -60,7 +60,6 @@ struct ConfigOptions {
 	bool                   shader_validation_enabled   = false;
 	bool                   shader_lds_waitcnt_barrier_enabled = false;
 	bool                   shader_storage_image_bounds_check_enabled = true;
-	bool                   srt_cache_enabled                         = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -98,7 +97,6 @@ bool     VulkanValidationEnabled();
 bool                   ShaderValidationEnabled();
 bool                   ShaderLdsWaitcntBarrierEnabled();
 bool                   ShaderStorageImageBoundsCheckEnabled();
-bool                   SrtCacheEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 ShaderLogDirection     GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();

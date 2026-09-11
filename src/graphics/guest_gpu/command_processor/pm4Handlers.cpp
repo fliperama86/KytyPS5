@@ -1,5 +1,4 @@
 #include "common/assert.h"
-#include "common/guestPageWatch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1383,7 +1382,6 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
 	if (dst != nullptr && buffer_size != 0) {
-		Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst), buffer_size);
 		memset(dst, 0, buffer_size);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {

@@ -20,7 +20,6 @@
 #include <unistd.h>
 #endif
 
-#include "common/guestPageWatch.h"
 #include "common/assert.h"
 #include "common/byteBuffer.h"
 #include "common/common.h"
@@ -2027,9 +2026,6 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
 	int64_t result = 0;
-	// The socket write happens in kernel mode: a write-protected destination page fails the call
-	// instead of faulting, so any watch on it has to go first.
-	Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(buf), host_len);
 	if (addr == nullptr) {
 		result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
 	} else {

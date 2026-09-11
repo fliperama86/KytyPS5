@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
-#include "common/guestPageWatch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -1586,9 +1585,6 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
-	// The image's guest range now answers from the GPU copy, and a later download writes it back
-	// through the backing alias without faulting.
-	Common::GuestPageWatch::Invalidate(image.info.data.address, image.info.data.size);
 	image.MarkGpuModified();
 }
 

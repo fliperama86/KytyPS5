@@ -64,9 +64,6 @@ static void PrintUsage() {
 	         "                                       in an LDS compute shader. Default: false.\n");
 	::printf("  --shader-storage-bounds-check <t|f>  Bounds-check storage image writes in the\n"
 	         "                                       generated SPIR-V. Default: true.\n");
-	::printf("  --srt-cache <true|false>             Cache the flattened shader resource table\n"
-	         "                                       per frame, invalidated by guest page\n"
-	         "                                       writes. Default: true.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -292,11 +289,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--shader-storage-bounds-check") {
 			if (!ParseBool(value, options.config.shader_storage_image_bounds_check_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--srt-cache") {
-			if (!ParseBool(value, options.config.srt_cache_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

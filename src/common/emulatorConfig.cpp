@@ -1,7 +1,6 @@
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
-#include "common/guestPageWatch.h"
 
 #include <algorithm>
 #include <memory>
@@ -26,13 +25,6 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 
 	*g_config = cfg;
-	// The SRT cache lives in the shader recompiler, which links nothing but the page-watch
-	// module, so the flag is pushed to it rather than read from there.
-	Common::GuestPageWatch::SetEnabled(cfg.srt_cache_enabled);
-	// Counting costs two relaxed increments per evaluation, so it is only turned on for the two
-	// runs that want the numbers. TRACY_ENABLE alone is not a gate: this build always defines it.
-	Common::GuestPageWatch::SetReporting(cfg.graphics_debug_dump_enabled ||
-	                                     cfg.profiler_direction != ProfilerDirection::None);
 }
 
 uint32_t GetScreenWidth() {
@@ -85,10 +77,6 @@ bool ShaderLdsWaitcntBarrierEnabled() {
 
 bool ShaderStorageImageBoundsCheckEnabled() {
 	return g_config->shader_storage_image_bounds_check_enabled;
-}
-
-bool SrtCacheEnabled() {
-	return g_config->srt_cache_enabled;
 }
 
 ShaderOptimizationType GetShaderOptimizationType() {

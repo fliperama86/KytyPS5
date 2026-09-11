@@ -366,8 +366,7 @@ void SpinPause() noexcept {
 // left at once and reports how many were late, which is what the replay report prints.
 class DirtyEventMarker final {
 public:
-	DirtyEventMarker(BufferCache& cache, std::vector<DirtyEventRecord> events)
-	    : m_cache(cache), m_events(std::move(events)) {
+	explicit DirtyEventMarker(BufferCache& cache): m_cache(cache) {
 		m_thread = std::thread([this] { Run(); });
 	}
 
@@ -384,10 +383,12 @@ public:
 
 	KYTY_CLASS_NO_COPY(DirtyEventMarker);
 
-	void Start() {
+	// `events` are the frame's timed marks; they outlive the run, so the thread borrows them.
+	void Start(const std::vector<DirtyEventRecord>* events) {
 		{
 			std::lock_guard lock(m_mutex);
 			m_abandon.store(false, std::memory_order_relaxed);
+			m_events  = events;
 			m_late    = 0;
 			m_running = true;
 		}
@@ -411,8 +412,9 @@ private:
 			}
 			lock.unlock();
 
-			uint64_t late = 0;
-			for (const auto& event: m_events) {
+			uint64_t    late   = 0;
+			const auto* events = m_events;
+			for (const auto& event: *events) {
 				uint32_t spins = 0;
 				while (GuestGpu::Progress() < event.progress) {
 					if (m_abandon.load(std::memory_order_relaxed)) {
@@ -440,9 +442,9 @@ private:
 		}
 	}
 
-	BufferCache&                  m_cache;
-	std::vector<DirtyEventRecord> m_events;
-	std::thread                   m_thread;
+	BufferCache&                         m_cache;
+	const std::vector<DirtyEventRecord>* m_events = nullptr;
+	std::thread                          m_thread;
 	std::mutex                    m_mutex;
 	std::condition_variable       m_start;
 	std::condition_variable       m_finished;
@@ -451,6 +453,53 @@ private:
 	bool                          m_running = false;
 	bool                          m_quit    = false;
 };
+
+// One frame of a capture: the slice of submissions.bin between two Done records, the frame's own
+// CPU-dirty marks, and what the recorder said about it. A version 1 to 3 capture has exactly one.
+struct ReplayFrame {
+	uint64_t number   = 0; // GuestGpu frame number in the captured run
+	uint32_t progress = 0; // draws plus dispatches the capture recorded for it
+	size_t   first    = 0; // index of its first submission record
+	size_t   count    = 0; // how many, the Done record excluded
+	size_t   graphics = 0;
+	size_t   compute  = 0;
+	size_t   flips    = 0;
+	// The marks that arrived before its first draw, applied with the batch on the GPU thread, and
+	// the rest, which the marker thread replays against the progress clock.
+	std::vector<DirtyEventRecord> pre_events;
+	std::vector<DirtyEventRecord> timed_events;
+};
+
+// `<path>` becomes `<path stem>-f<n><extension>`, so one loop of M frames writes M images.
+std::filesystem::path FrameImagePath(const std::filesystem::path& image, size_t frame_index) {
+	auto path = image;
+	path.replace_filename(image.stem().string() + "-f" + std::to_string(frame_index + 1) +
+	                      image.extension().string());
+	return path;
+}
+
+// The raw image plus the sidecar that says how to read it (docs/frame-replay.md).
+bool WritePresentedImage(const std::filesystem::path& path, const PresentedImage& readback) {
+	std::ofstream raw(path, std::ios::binary | std::ios::trunc);
+	if (!raw.is_open()) {
+		return false;
+	}
+	raw.write(reinterpret_cast<const char*>(readback.pixels.data()),
+	          static_cast<std::streamsize>(readback.pixels.size()));
+	raw.close();
+	auto sidecar_path = path;
+	sidecar_path += ".json";
+	std::ofstream sidecar(sidecar_path, std::ios::binary | std::ios::trunc);
+	if (!sidecar.is_open()) {
+		return false;
+	}
+	sidecar << "{\"width\":" << readback.width << ",\"height\":" << readback.height
+	        << ",\"format\":\"" << readback.format
+	        << "\",\"bytes_per_pixel\":" << readback.bytes_per_pixel
+	        << ",\"stride\":" << readback.width * readback.bytes_per_pixel << "}\n";
+	sidecar.close();
+	return true;
+}
 
 // One contiguous run of recorded dirty pages, so a loop re-marks them with a handful of calls.
 std::vector<RestoredRange> CoalescePages(std::vector<uint64_t> pages) {
@@ -496,7 +545,7 @@ std::string DescribeLastBlockedWait() {
 	return buffer;
 }
 
-int RunReplay(const std::filesystem::path& dir, uint32_t loops,
+int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_wanted,
               const std::filesystem::path& image) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SetUnhandledExceptionFilter(ReplayCrashFilter);
@@ -719,31 +768,66 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 		}
 	}
 
-	// 3c. Submissions. The dwords stay in these vectors for the whole run: GuestGpu borrows the
-	// spans and the GPU thread reads them long after the feeder moved on.
+	// 3c. Submissions, split into frames. The dwords stay in these vectors for the whole run:
+	// GuestGpu borrows the spans and the GPU thread reads them long after the feeder moved on.
 	std::vector<CaptureSubmission> submissions;
 	if (!reader.ReadSubmissions(&submissions, &error)) {
 		Fail(error);
 		return 1;
 	}
-	size_t graphics_count = 0;
-	size_t compute_count  = 0;
-	size_t flip_count     = 0;
-	size_t done_count     = 0;
-	for (const auto& submission: submissions) {
-		switch (static_cast<SubmissionKind>(submission.header.kind)) {
-			case SubmissionKind::Graphics: graphics_count++; break;
-			case SubmissionKind::Compute: compute_count++; break;
-			case SubmissionKind::FlipPreparation: flip_count++; break;
-			case SubmissionKind::Done: done_count++; break;
+	// A Done record ends a frame and carries its number and progress count (format version 4);
+	// in an older capture those fields are zero and there is exactly one frame.
+	std::vector<ReplayFrame> recorded;
+	{
+		ReplayFrame current;
+		current.first = 0;
+		for (size_t i = 0; i < submissions.size(); i++) {
+			const auto& header = submissions[i].header;
+			switch (static_cast<SubmissionKind>(header.kind)) {
+				case SubmissionKind::Graphics:
+					current.graphics++;
+					current.count++;
+					break;
+				case SubmissionKind::Compute:
+					current.compute++;
+					current.count++;
+					break;
+				case SubmissionKind::FlipPreparation:
+					current.flips++;
+					current.count++;
+					break;
+				case SubmissionKind::Done:
+					current.number   = header.flip_request_id;
+					current.progress = header.queue_id;
+					recorded.push_back(std::move(current));
+					current       = ReplayFrame {};
+					current.first = i + 1;
+					break;
+			}
+		}
+		if (current.count != 0) {
+			::printf("  WARNING        %zu submissions after the last Done record are ignored\n",
+			         current.count);
 		}
 	}
-	if (done_count == 0) {
+	if (recorded.empty()) {
 		Fail("submissions.bin has no Done record, so the frame has no end");
 		return 1;
 	}
+	if (reader.Manifest().frames != 0 && reader.Manifest().frames != recorded.size()) {
+		::printf("  WARNING        the manifest says %u frames, submissions.bin has %zu\n",
+		         reader.Manifest().frames, recorded.size());
+	}
+	size_t frame_count = frames_wanted == 0 ? recorded.size()
+	                                        : std::min<size_t>(frames_wanted, recorded.size());
+	if (frames_wanted > recorded.size()) {
+		::printf("  WARNING        --replay-frames %u, but the capture holds %zu; replaying %zu\n",
+		         frames_wanted, recorded.size(), recorded.size());
+	}
 
-	// 3d. Dirty pages.
+	// 3d. Dirty pages. One set for the whole capture, taken at the end of the last frame; it is
+	// re-marked before every replayed frame, as it has been since phase B, because almost none of
+	// it comes from a CPU write of the frame -- it is memory nothing has uploaded yet.
 	std::vector<uint64_t> dirty_pages;
 	if (!reader.ReadDirtyPages(&dirty_pages, &error)) {
 		Fail(error);
@@ -752,37 +836,58 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	const auto dirty_ranges = CoalescePages(dirty_pages);
 
 	// 3e. Dirty events (format version 3): the same CPU writes with the moment they arrived, keyed
-	// to the GPU thread's progress clock. Without them the loop can only re-mark everything in one
-	// batch, which is why the phase C A/B did not reproduce (docs/frame-replay.md).
+	// to the GPU thread's progress clock, and from version 4 to the frame they arrived in. Without
+	// them the loop can only re-mark everything in one batch, which is why the phase C A/B did not
+	// reproduce (docs/frame-replay.md).
 	std::vector<DirtyEventRecord> dirty_events;
 	bool                          dirty_events_present = false;
 	if (!reader.ReadDirtyEvents(&dirty_events, &dirty_events_present, &error)) {
 		Fail(error);
 		return 1;
 	}
-	std::vector<DirtyEventRecord> pre_events;
-	std::vector<DirtyEventRecord> timed_events;
-	uint64_t                      skipped_events = 0;
+	uint64_t skipped_events = 0;
+	size_t   timed_total    = 0;
 	for (const auto& event: dirty_events) {
-		if (!IsMarkableRange(event.vaddr, event.size)) {
+		if (!IsMarkableRange(event.vaddr, event.size) || event.frame >= recorded.size()) {
 			skipped_events++;
 			continue;
 		}
-		(event.progress == 0 ? pre_events : timed_events).push_back(event);
+		auto& frame = recorded[event.frame];
+		(event.progress == 0 ? frame.pre_events : frame.timed_events).push_back(event);
+	}
+	for (size_t i = 0; i < frame_count; i++) {
+		timed_total += recorded[i].timed_events.size();
 	}
 	const bool use_events = dirty_events_present && !dirty_events.empty();
+
+	size_t graphics_count = 0;
+	size_t compute_count  = 0;
+	size_t flip_count     = 0;
+	uint64_t progress_recorded = 0;
+	for (size_t i = 0; i < frame_count; i++) {
+		graphics_count += recorded[i].graphics;
+		compute_count += recorded[i].compute;
+		flip_count += recorded[i].flips;
+		progress_recorded += recorded[i].progress;
+	}
 
 	::printf("  registers      %zu command processors, %zu bytes each\n", register_files.size(),
 	         expected_register_size);
 	::printf("  video-out      %zu registrations, handle %d, flip index %d\n", video_out.size(),
 	         handle, flip_index);
-	::printf("  submissions    %zu records (%zu graphics, %zu compute, %zu flips)\n",
-	         submissions.size(), graphics_count, compute_count, flip_count);
+	::printf("  frames         %zu recorded (%llu to %llu), %zu replayed per loop\n",
+	         recorded.size(), static_cast<unsigned long long>(recorded.front().number),
+	         static_cast<unsigned long long>(recorded.back().number), frame_count);
+	::printf("  submissions    %zu records over the replayed frames (%zu graphics, %zu compute, "
+	         "%zu flips)\n",
+	         graphics_count + compute_count + flip_count, graphics_count, compute_count,
+	         flip_count);
 	::printf("  dirty pages    %zu in %zu ranges\n", dirty_pages.size(), dirty_ranges.size());
 	if (use_events) {
-		::printf("  dirty events   %zu (%zu before the first draw, %zu timed) over %llu draws%s\n",
-		         dirty_events.size(), pre_events.size(), timed_events.size(),
-		         static_cast<unsigned long long>(reader.Manifest().progress_events),
+		::printf("  dirty events   %zu recorded (%zu timed in the replayed frames) over %llu "
+		         "draws%s\n",
+		         dirty_events.size(), timed_total,
+		         static_cast<unsigned long long>(progress_recorded),
 		         skipped_events != 0 ? " (some out of range, skipped)" : "");
 	} else if (reader.Manifest().format_version >= 3) {
 		::printf("  dirty events   dirty-events.bin is empty; the BDA generation only moves with the "
@@ -794,7 +899,8 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	}
 	::fflush(stdout);
 
-	// 4. Loop.
+	// 4. Loop. One loop is the recorded sequence of frames in order, which is what makes the
+	// guest's ring buffers rotate as they did in the game (docs/frame-replay.md, phase E).
 	g_wait_diagnostics.store(true, std::memory_order_relaxed);
 	auto&               buffer_cache = renderer->GetBufferCache();
 	uint64_t            presented    = 0;
@@ -803,94 +909,127 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	std::vector<double> gpu_ms;
 	loop_ms.reserve(loops);
 	gpu_ms.reserve(loops);
-	const auto run_start = Clock::now();
+	// Per frame, one sample per loop.
+	std::vector<std::vector<double>> frame_loop_ms(frame_count);
+	std::vector<std::vector<double>> frame_gpu_ms(frame_count);
+	std::vector<uint64_t>            frame_late(frame_count, 0);
+	std::vector<uint32_t>            frame_progress(frame_count, 0);
+	for (size_t i = 0; i < frame_count; i++) {
+		frame_loop_ms[i].reserve(loops);
+		frame_gpu_ms[i].reserve(loops);
+	}
+	std::vector<PresentedImage> frame_images;
+	const auto                  run_start = Clock::now();
 
 	std::unique_ptr<DirtyEventMarker> marker;
 	if (use_events) {
-		marker = std::make_unique<DirtyEventMarker>(buffer_cache, timed_events);
+		marker = std::make_unique<DirtyEventMarker>(buffer_cache);
 	}
-	uint64_t              late_events = 0;
-	std::vector<uint32_t> progress_reached;
-	progress_reached.reserve(loops);
+	uint64_t late_events = 0;
 
 	for (uint32_t loop = 0; loop < loops; loop++) {
-		// The recorded dirty set, in one batch on the GPU thread and outside the timing, as it has
-		// been since phase B. That set is what makes the loop upload the frame's working set: almost
-		// none of it comes from a CPU write of the frame, it is memory nothing has uploaded yet. The
-		// recorded events are the writes, and they come on top of it, not instead of it -- see the
-		// phase D section of docs/frame-replay.md.
-		if (!dirty_ranges.empty() || !pre_events.empty()) {
-			gpu.SendCommandSync([&]() {
-				for (const auto& range: dirty_ranges) {
-					buffer_cache.MarkRegionAsCpuModified(range.start, range.size);
-				}
-				// Everything the guest wrote before the frame's first draw, through the same
-				// invalidation path the marker thread uses.
-				for (const auto& event: pre_events) {
-					buffer_cache.InvalidateMemory(event.vaddr, event.size);
-				}
-			});
-		}
-		if (marker) {
-			marker->Start();
-		}
-
-		const auto loop_start = Clock::now();
-		for (const auto& submission: submissions) {
-			switch (static_cast<SubmissionKind>(submission.header.kind)) {
-				case SubmissionKind::Graphics:
-					gpu.Submit(submission.commands, submission.constants);
-					break;
-				case SubmissionKind::Compute:
-					gpu.SubmitCompute(submission.header.queue_id, submission.commands);
-					break;
-				case SubmissionKind::FlipPreparation: {
-					// The recorded request id belongs to the captured run; the replay reserves its
-					// own flip through the path VideoOutSubmitFlip takes.
-					const int result = VideoOut::VideoOutReplaySubmitFlip(handle, flip_index);
-					if (result != 0) {
-						g_wait_diagnostics.store(false, std::memory_order_relaxed);
-						Fail("VideoOutSubmitFlip failed in loop " + std::to_string(loop) + ": " +
-						     std::to_string(result));
-						return 1;
+		double loop_total = 0.0;
+		double gpu_total  = 0.0;
+		for (size_t index = 0; index < frame_count; index++) {
+			const auto& frame = recorded[index];
+			// The recorded dirty set, in one batch on the GPU thread and outside the timing, as it
+			// has been since phase B, plus everything the guest wrote before this frame's first
+			// draw. The events come on top of the batch, not instead of it -- see the phase D
+			// section of docs/frame-replay.md.
+			if (!dirty_ranges.empty() || !frame.pre_events.empty()) {
+				gpu.SendCommandSync([&]() {
+					for (const auto& range: dirty_ranges) {
+						buffer_cache.MarkRegionAsCpuModified(range.start, range.size);
 					}
-					break;
-				}
-				case SubmissionKind::Done: break;
+					for (const auto& event: frame.pre_events) {
+						buffer_cache.InvalidateMemory(event.vaddr, event.size);
+					}
+				});
 			}
-		}
-
-		const uint32_t timeout = loop == 0 ? WARMUP_TIMEOUT_MS : WAIT_TIMEOUT_MS;
-		if (!gpu.WaitForIdleFor(timeout)) {
-			g_wait_diagnostics.store(false, std::memory_order_relaxed);
 			if (marker) {
-				(void)marker->Finish();
+				marker->Start(&frame.timed_events);
 			}
-			Fail("the GPU thread did not finish loop " + std::to_string(loop + 1) + " within " +
-			     std::to_string(timeout) + " ms: " + DescribeLastBlockedWait());
-			return 1;
+
+			const auto frame_start = Clock::now();
+			for (size_t i = frame.first; i < frame.first + frame.count; i++) {
+				const auto& submission = submissions[i];
+				switch (static_cast<SubmissionKind>(submission.header.kind)) {
+					case SubmissionKind::Graphics:
+						gpu.Submit(submission.commands, submission.constants);
+						break;
+					case SubmissionKind::Compute:
+						gpu.SubmitCompute(submission.header.queue_id, submission.commands);
+						break;
+					case SubmissionKind::FlipPreparation: {
+						// The recorded request id belongs to the captured run; the replay reserves
+						// its own flip through the path VideoOutSubmitFlip takes.
+						const int result = VideoOut::VideoOutReplaySubmitFlip(handle, flip_index);
+						if (result != 0) {
+							g_wait_diagnostics.store(false, std::memory_order_relaxed);
+							Fail("VideoOutSubmitFlip failed in loop " + std::to_string(loop) + ": " +
+							     std::to_string(result));
+							return 1;
+						}
+						break;
+					}
+					case SubmissionKind::Done: break;
+				}
+			}
+
+			const uint32_t timeout = loop == 0 ? WARMUP_TIMEOUT_MS : WAIT_TIMEOUT_MS;
+			if (!gpu.WaitForIdleFor(timeout)) {
+				g_wait_diagnostics.store(false, std::memory_order_relaxed);
+				if (marker) {
+					(void)marker->Finish();
+				}
+				Fail("the GPU thread did not finish frame " + std::to_string(index + 1) +
+				     " of loop " + std::to_string(loop + 1) + " within " +
+				     std::to_string(timeout) + " ms: " + DescribeLastBlockedWait());
+				return 1;
+			}
+			frame_progress[index] = GuestGpu::Progress();
+			// The marks still waiting are marked now, inside the frame's timing, and counted: a
+			// frame that outran the recorded events is one whose BDA-scan count is too low, and
+			// the report says so.
+			if (marker) {
+				const auto late = marker->Finish();
+				frame_late[index] += late;
+				late_events += late;
+			}
+			// Done() resets the progress clock, so it must come after Finish().
+			gpu.Done();
+			const auto gpu_done = MillisSince(frame_start);
+			// The title flips from its own command stream, so there is no recorded buffer index to
+			// wait on: a frame ends when every flip it queued on the port has been presented.
+			if (!VideoOut::VideoOutReplayWaitFlipsDrained(handle, FLIP_TIMEOUT_MS)) {
+				g_wait_diagnostics.store(false, std::memory_order_relaxed);
+				Fail("the flip queued by frame " + std::to_string(index + 1) + " of loop " +
+				     std::to_string(loop + 1) + " was not presented within " +
+				     std::to_string(FLIP_TIMEOUT_MS) + " ms");
+				return 1;
+			}
+			presented += VideoOut::VideoOutReplayFlipCount(handle) - flips_before;
+			flips_before = VideoOut::VideoOutReplayFlipCount(handle);
+			const auto frame_done = MillisSince(frame_start);
+			frame_gpu_ms[index].push_back(gpu_done);
+			frame_loop_ms[index].push_back(frame_done);
+			gpu_total += gpu_done;
+			loop_total += frame_done;
+
+			// The per-frame images come from the last loop, after its timings are taken, so the
+			// readback costs the measurement nothing.
+			if (!image.empty() && loop + 1 == loops) {
+				auto*          presenter = WindowGetPresenter();
+				PresentedImage readback;
+				if (presenter != nullptr && presenter->ReadLastPresentedFrame(&readback)) {
+					frame_images.push_back(std::move(readback));
+				} else {
+					frame_images.emplace_back();
+				}
+			}
 		}
-		progress_reached.push_back(GuestGpu::Progress());
-		// The marks still waiting are marked now, inside the loop's timing, and counted: a loop that
-		// outran the recorded events is a loop whose BDA-scan count is too low, and the report says so.
-		if (marker) {
-			late_events += marker->Finish();
-		}
-		// Done() resets the progress clock, so it must come after Finish().
-		gpu.Done();
-		const auto gpu_done = MillisSince(loop_start);
-		// The title flips from its own command stream, so there is no recorded buffer index to
-		// wait on: the loop ends when every flip queued on the port has been presented.
-		if (!VideoOut::VideoOutReplayWaitFlipsDrained(handle, FLIP_TIMEOUT_MS)) {
-			g_wait_diagnostics.store(false, std::memory_order_relaxed);
-			Fail("the flip queued by loop " + std::to_string(loop + 1) +
-			     " was not presented within " + std::to_string(FLIP_TIMEOUT_MS) + " ms");
-			return 1;
-		}
-		presented += VideoOut::VideoOutReplayFlipCount(handle) - flips_before;
-		flips_before = VideoOut::VideoOutReplayFlipCount(handle);
-		loop_ms.push_back(MillisSince(loop_start));
-		gpu_ms.push_back(gpu_done);
+		loop_ms.push_back(loop_total);
+		gpu_ms.push_back(gpu_total);
 	}
 	g_wait_diagnostics.store(false, std::memory_order_relaxed);
 	const auto run_ms = MillisSince(run_start);
@@ -900,6 +1039,14 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	const size_t skip       = loop_ms.size() > 1 ? 1 : 0;
 	const auto   loop_stats = Summarize(loop_ms, skip);
 	const auto   gpu_stats  = Summarize(gpu_ms, skip);
+	std::vector<Stats> frame_loop_stats;
+	std::vector<Stats> frame_gpu_stats;
+	frame_loop_stats.reserve(frame_count);
+	frame_gpu_stats.reserve(frame_count);
+	for (size_t i = 0; i < frame_count; i++) {
+		frame_loop_stats.push_back(Summarize(frame_loop_ms[i], skip));
+		frame_gpu_stats.push_back(Summarize(frame_gpu_ms[i], skip));
+	}
 
 	::printf("  loops          %zu (%zu measured, loop 1 excluded), %llu flips presented\n",
 	         loop_ms.size(), loop_ms.size() - skip, static_cast<unsigned long long>(presented));
@@ -908,15 +1055,25 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	}
 	PrintStats("ms/loop", loop_stats);
 	PrintStats("ms/loop gpu", gpu_stats);
+	for (size_t i = 0; i < frame_count; i++) {
+		::printf("  frame %-2zu %-5llu gpu median %8.3f  min %8.3f  max %8.3f | loop median %8.3f",
+		         i + 1, static_cast<unsigned long long>(recorded[i].number),
+		         frame_gpu_stats[i].median, frame_gpu_stats[i].min, frame_gpu_stats[i].max,
+		         frame_loop_stats[i].median);
+		if (use_events) {
+			::printf(" | events %zu (%llu late) | progress %u of %u", recorded[i].timed_events.size(),
+			         static_cast<unsigned long long>(frame_late[i]), frame_progress[i],
+			         recorded[i].progress);
+		}
+		::printf("\n");
+	}
 	if (use_events) {
-		const auto reached = progress_reached.empty() ? 0u : progress_reached.back();
-		::printf("  dirty events   %llu late of %zu timed (%.2f%%), progress %u of %llu recorded\n",
-		         static_cast<unsigned long long>(late_events), timed_events.size() * loop_ms.size(),
-		         timed_events.empty() || loop_ms.empty()
+		::printf("  dirty events   %llu late of %zu timed (%.2f%%)\n",
+		         static_cast<unsigned long long>(late_events), timed_total * loop_ms.size(),
+		         timed_total == 0 || loop_ms.empty()
 		             ? 0.0
 		             : 100.0 * static_cast<double>(late_events) /
-		                   static_cast<double>(timed_events.size() * loop_ms.size()),
-		         reached, static_cast<unsigned long long>(reader.Manifest().progress_events));
+		                   static_cast<double>(timed_total * loop_ms.size()));
 	}
 	::printf("  total          %.3f s\n", run_ms / 1000.0);
 	::fflush(stdout);
@@ -924,23 +1081,75 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	const auto    report_path = dir / "replay-report.json";
 	std::ofstream report(report_path, std::ios::binary | std::ios::trunc);
 	if (report.is_open()) {
+		uint32_t progress_replayed = 0;
+		for (const auto value: frame_progress) {
+			progress_replayed += value;
+		}
 		report << "{\n";
 		report << "  \"capture\": \"" << dir.generic_string() << "\",\n";
 		report << "  \"frame\": " << reader.Manifest().frame << ",\n";
 		report << "  \"loops\": " << loop_ms.size() << ",\n";
 		report << "  \"warmup_loops\": " << skip << ",\n";
+		report << "  \"recorded_frames\": " << recorded.size() << ",\n";
+		report << "  \"frames\": " << frame_count << ",\n";
+		report << "  \"frame_numbers\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << recorded[i].number;
+		}
+		report << "],\n";
 		report << "  \"restore_ranges_ms\": " << ranges_ms << ",\n";
 		report << "  \"restore_pages_ms\": " << pages_ms << ",\n";
 		report << "  \"restore_pages\": " << pages_written << ",\n";
 		report << "  \"restore_bytes\": " << pages_written * kPageSize << ",\n";
-		report << "  \"submissions\": " << submissions.size() << ",\n";
+		report << "  \"submissions\": " << graphics_count + compute_count + flip_count << ",\n";
 		report << "  \"dirty_pages\": " << dirty_pages.size() << ",\n";
 		report << "  \"dirty_events\": " << dirty_events.size() << ",\n";
-		report << "  \"dirty_events_timed\": " << timed_events.size() << ",\n";
+		report << "  \"dirty_events_timed\": " << timed_total << ",\n";
 		report << "  \"dirty_events_late\": " << late_events << ",\n";
-		report << "  \"progress_events_captured\": " << reader.Manifest().progress_events << ",\n";
-		report << "  \"progress_events_replayed\": "
-		       << (progress_reached.empty() ? 0u : progress_reached.back()) << ",\n";
+		report << "  \"progress_events_captured\": " << progress_recorded << ",\n";
+		report << "  \"progress_events_replayed\": " << progress_replayed << ",\n";
+		// Per frame, one entry per replayed frame: the samples, their statistics and what the
+		// frame's CPU-write replay did.
+		report << "  \"frame_gpu_ms\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << JsonSamples(frame_gpu_ms[i]);
+		}
+		report << "],\n";
+		report << "  \"frame_loop_ms\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << JsonSamples(frame_loop_ms[i]);
+		}
+		report << "],\n";
+		report << "  \"frame_gpu_summary\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << JsonStats(frame_gpu_stats[i]);
+		}
+		report << "],\n";
+		report << "  \"frame_summary\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << JsonStats(frame_loop_stats[i]);
+		}
+		report << "],\n";
+		report << "  \"frame_dirty_events_timed\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << recorded[i].timed_events.size();
+		}
+		report << "],\n";
+		report << "  \"frame_dirty_events_late\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << frame_late[i];
+		}
+		report << "],\n";
+		report << "  \"frame_progress_captured\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << recorded[i].progress;
+		}
+		report << "],\n";
+		report << "  \"frame_progress_replayed\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << frame_progress[i];
+		}
+		report << "],\n";
 		report << "  \"loop_ms\": " << JsonSamples(loop_ms) << ",\n";
 		report << "  \"gpu_ms\": " << JsonSamples(gpu_ms) << ",\n";
 		report << "  \"summary\": " << JsonStats(loop_stats) << ",\n";
@@ -952,28 +1161,29 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 		::printf("  report         could not write %s\n", report_path.string().c_str());
 	}
 
-	// 6. Presented image.
+	// 6. Presented images: one per frame of the last loop, plus <path> itself for the last of
+	// them, which is what --replay-image wrote when a capture held a single frame.
 	if (!image.empty()) {
-		auto*          presenter = WindowGetPresenter();
-		PresentedImage readback;
-		if (presenter == nullptr || !presenter->ReadLastPresentedFrame(&readback)) {
+		if (frame_images.empty()) {
 			::printf("  image          not available: the presenter has no last frame\n");
-		} else {
-			std::ofstream raw(image, std::ios::binary | std::ios::trunc);
-			raw.write(reinterpret_cast<const char*>(readback.pixels.data()),
-			          static_cast<std::streamsize>(readback.pixels.size()));
-			raw.close();
-			auto sidecar_path = image;
-			sidecar_path += ".json";
-			std::ofstream sidecar(sidecar_path, std::ios::binary | std::ios::trunc);
-			sidecar << "{\"width\":" << readback.width << ",\"height\":" << readback.height
-			        << ",\"format\":\"" << readback.format
-			        << "\",\"bytes_per_pixel\":" << readback.bytes_per_pixel << ",\"stride\":"
-			        << readback.width * readback.bytes_per_pixel << "}\n";
-			sidecar.close();
-			::printf("  image          %s (%ux%u %s) + %s\n", image.string().c_str(),
+		}
+		for (size_t i = 0; i < frame_images.size(); i++) {
+			const auto& readback = frame_images[i];
+			if (readback.pixels.empty()) {
+				::printf("  image          frame %zu not available\n", i + 1);
+				continue;
+			}
+			const auto path = FrameImagePath(image, i);
+			if (!WritePresentedImage(path, readback)) {
+				::printf("  image          could not write %s\n", path.string().c_str());
+				continue;
+			}
+			::printf("  image          %s (%ux%u %s) + %s.json\n", path.string().c_str(),
 			         readback.width, readback.height, readback.format.c_str(),
-			         sidecar_path.filename().string().c_str());
+			         path.filename().string().c_str());
+			if (i + 1 == frame_images.size() && !WritePresentedImage(image, readback)) {
+				::printf("  image          could not write %s\n", image.string().c_str());
+			}
 		}
 	}
 

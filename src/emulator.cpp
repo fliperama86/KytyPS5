@@ -192,7 +192,8 @@ static void ExecuteReplay() {
 	Common::Thread feeder(
 	    [](void*) {
 		    const int code = Libs::Graphics::Replay::RunReplay(
-		        Config::GetReplayDir(), Config::GetReplayLoops(), Config::GetReplayImage());
+		        Config::GetReplayDir(), Config::GetReplayLoops(), Config::GetReplayFrames(),
+		        Config::GetReplayImage());
 		    std::quick_exit(code);
 	    },
 	    nullptr);

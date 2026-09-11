@@ -65,6 +65,7 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
+		case BindingKind::DescriptorFeedback:
 		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
@@ -820,6 +821,19 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+// Writes the program's DescriptorFeedback slot id into shader data, next to the user-data
+// registers. The slot is the shader's index into the feedback bit buffer; it is packed again
+// after RebindBuffers zeroes the memory-offset tail, which covers the same dwords.
+void RenderExecutor::PackFeedbackSlot(PreparedBindings& prepared) {
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& layout = prepared.runtime->program->bindings;
+	if (layout.feedback_slot_dword == ShaderRecompiler::IR::BindingLayout::NoFeedbackSlot) {
+		return;
+	}
+	EXIT_IF(layout.feedback_slot_dword >= prepared.shader_data.size());
+	prepared.shader_data[layout.feedback_slot_dword] = prepared.runtime->feedback_slot;
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                     PreparedBindings&         prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -845,6 +859,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	PackFeedbackSlot(prepared);
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
@@ -861,6 +876,13 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	prepared.buffer_sources.clear();
 	prepared.buffer_sources.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (program.info.buffers[i].gpu_fetch) {
+			// The shader reads this resource through the BDA page table from a V# it decodes
+			// itself. Nothing is looked up, registered or uploaded for it here, and its
+			// descriptor slot gets a dummy binding in RebindBuffers.
+			prepared.buffer_sources.push_back({});
+			continue;
+		}
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 		const auto address = descriptor.Base48();
 		const auto stride  = descriptor.Stride();
@@ -895,12 +917,21 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[dword] |= offset << shift;
 	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (program.info.buffers[i].gpu_fetch) {
+			// The shader never reads this descriptor slot; the binding only has to be valid.
+			// NULL_BUFFER_ID is the 16-byte dummy the buffer cache allocates once at startup.
+			prepared.buffers.emplace_back(
+			    m_context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16);
+			continue;
+		}
 		uint32_t buffer_offset = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
+	// The memory-offset fill above covers the feedback slot dword, so restore it.
+	PackFeedbackSlot(prepared);
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -981,8 +1012,13 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (bindings.pixel != nullptr) {
 		FindBuffers(*bindings.pixel);
 	}
-	if (bindings.vertex->runtime->program->info.uses_dma ||
-	    (bindings.pixel != nullptr && bindings.pixel->runtime->program->info.uses_dma)) {
+	// A gpu_descriptors stage reads guest memory through the BDA page table exactly as a dma
+	// stage does, so its dirty pages have to be uploaded before the draw too.
+	auto needs_bda = [](const PreparedBindings* stage) {
+		const auto& info = stage->runtime->program->info;
+		return info.uses_dma || info.gpu_descriptors;
+	};
+	if (needs_bda(bindings.vertex) || (bindings.pixel != nullptr && needs_bda(bindings.pixel))) {
 		m_context.GetGpuResources().PrepareBda();
 	}
 	RebindBuffers(*bindings.vertex);
@@ -1140,6 +1176,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						                             : cache.GetFaultBuffer();
 						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
 						                                  bda_buffer->Size());
+						break;
+					}
+					case BindingKind::DescriptorFeedback: {
+						// One shared bit buffer, indexed by the program's feedback slot. The
+						// renderer reads it back with the fault buffer.
+						const auto* feedback =
+						    m_context.GetBufferCache().GetDescriptorFeedbackBuffer();
+						m_descriptor_buffers.emplace_back(feedback->Handle(), 0, feedback->Size());
 						break;
 					}
 					case BindingKind::FlattenedSrt:

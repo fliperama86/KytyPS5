@@ -118,6 +118,48 @@ The pieces the recompiler and the renderer share, so the two sides can be built 
 - Setting: `--gpu-descriptors <t|f>` (`Config::gpu_descriptors_enabled`,
   `GpuDescriptorsEnabled()`). Off: no resource gets `gpu_fetch`, nothing else changes.
 
+### Stage 1 renderer (landed)
+
+Where each piece of the host half lives.
+
+- Feedback buffer: `DescriptorFeedback` (`host_gpu/renderer/cache/descriptorFeedback.{h,cpp}`),
+  owned by `BufferCache` beside `FaultManager`. 65,536 slots, 8 KiB of device-local u32 bits.
+  `GetBuffer()` zeroes it on the first bind, so a session with the setting off records nothing for
+  it. `CommitBindings` (`pipeline/descriptors.cpp`) binds it for every stage whose layout declares
+  `DescriptorFeedback`, exactly where `BdaPagetable` and `FaultBuffer` are bound; the compute path
+  goes through the same function.
+- Readback: `BufferCache::ProcessDescriptorFeedback` from
+  `GpuResourceManager::RunGarbageCollector`, under the same `m_fault_process_pending` gate as
+  `ProcessFaultBuffer`. The bits are copied into one area of an eight-deep host-visible ring and
+  cleared on the GPU right behind the copy, so a bit is cleared exactly when it has been read; the
+  scan runs in a `DeferOperation` callback once that submission retires. No GPU drain. The render
+  context routes each set slot to `PipelineCache::ReportFeedbackSlot`.
+- Slot ids: `ProgramCache::AssignFeedbackSlot` hands a dense id to a program-cache entry the first
+  time one of its permutations compiles with `gpu_descriptors`, and `feedback_slots` maps the id
+  back to the entry (the map is node based, so the pointer is stable and nothing is erased). A
+  program that cannot get a slot has no way to report a mismatch and is pinned to the CPU path.
+  The id travels to the draw on `ShaderStageRuntime::feedback_slot` and is packed into shader data
+  at `bindings.feedback_slot_dword` by `RenderExecutor::PackFeedbackSlot`, called from
+  `PrepareBindings` and again from `RebindBuffers`, whose memory-offset fill covers the same dword.
+- Per-draw policy: `ProgramCache::Get`. The entry keeps `last_specialization`, `cpu_next`,
+  `mismatches` and `pinned_cpu`. A draw takes the GPU path when the entry has `gpu_descriptors`,
+  the setting is on, there is a last specialization and neither `cpu_next` nor `pinned_cpu` is
+  set; `MaterializeResources` then gets a `GpuFetchOverride` naming the `gpu_fetch` buffers and
+  the tuples to keep, so the same permutation is selected whatever the guest has since written to
+  the SRT. Any other draw materializes as before and republishes `last_specialization`.
+- Bindings: `FindBuffers` and `RebindBuffers` skip `gpu_fetch` resources entirely (no descriptor
+  decode, no `FindBuffer`, no `ObtainBuffer`, no dirty upload) and bind the buffer cache's
+  16-byte `NULL_BUFFER_ID` dummy in their descriptor slots. The shader never reads those slots.
+- `PrepareBda` runs before a draw or dispatch when any bound stage has `uses_dma` **or**
+  `gpu_descriptors` (`PrepareGraphicsBindings`, `RenderExecutor::DispatchDirect`). The two compute
+  fill recognizers (`ResolveComputeBufferFill`, `ResolveComputePatternFill`) reject
+  `gpu_descriptors` shaders: they read the snapshot descriptors, which a GPU-fetch shader no
+  longer takes its addresses from.
+- Counters: `KYTY_DEBUG_SRT_STATS` gains `gpu_fetch_draws`, `gpu_fetch_dispatches`,
+  `gpu_fetch_cpu_first`, `gpu_fetch_cpu_feedback`, `gpu_fetch_cpu_pinned`,
+  `gpu_fetch_feedback_bits` and `gpu_fetch_programs_pinned` in the JSON summary, and one console
+  line every 600 frames with the run totals and the window since the previous line.
+
 ### Stage 2: vertex fetch in-shader
 
 The vertex shader reads vertex data through BDA using the V#s from its own roots, fetch-shader

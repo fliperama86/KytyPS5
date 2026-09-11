@@ -42,6 +42,10 @@ struct CompiledShaderInfo;
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
 	ShaderRecompiler::IR::ResourceSnapshot          resources;
+	// DescriptorFeedback slot of the program-cache entry this stage came from, or
+	// BindingLayout::NoFeedbackSlot. The renderer packs it into shader data at
+	// bindings.feedback_slot_dword (docs/gpu-descriptor-fetch.md, stage 1).
+	uint32_t feedback_slot = UINT32_MAX;
 
 	[[nodiscard]] explicit operator bool() const {
 		return program != nullptr;

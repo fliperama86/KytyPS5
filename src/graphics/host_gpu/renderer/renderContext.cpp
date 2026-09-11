@@ -16,6 +16,10 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_gpu_resources(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// A descriptor-feedback bit names a program-cache entry, so route the readback straight into
+	// the pipeline cache (docs/gpu-descriptor-fetch.md, stage 1).
+	GetBufferCache().SetDescriptorFeedbackSink(
+	    [this](uint32_t slot) { m_pipeline_cache.ReportFeedbackSlot(slot); });
 }
 
 RenderContext::~RenderContext() {

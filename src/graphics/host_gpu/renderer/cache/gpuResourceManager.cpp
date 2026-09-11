@@ -117,6 +117,9 @@ void GpuResourceManager::RunGarbageCollector() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
+		// Same schedule and mechanism as the fault buffer: a mismatch a shader reported becomes
+		// visible to the program cache one or more frames later, with no GPU drain.
+		m_buffer_cache.ProcessDescriptorFeedback();
 	}
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();

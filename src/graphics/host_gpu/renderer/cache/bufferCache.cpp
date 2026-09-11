@@ -199,6 +199,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
+      m_descriptor_feedback(graphics, scheduler),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
@@ -691,6 +692,10 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::ProcessDescriptorFeedback() {
+	m_descriptor_feedback.Process();
 }
 
 void BufferCache::InvalidateBda(uint64_t vaddr, uint64_t size) {

@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/cache/descriptorFeedback.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -205,6 +206,10 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// More than this many descriptor-feedback mismatches for one program in a session and speculating
+// on its buffer layout has stopped paying off (docs/gpu-descriptor-fetch.md, stage 1).
+constexpr uint32_t MaxFeedbackMismatches = 8;
+
 // KYTY_DEBUG_SRT_STATS support. Nothing below runs unless the collector is on.
 constexpr uint64_t StatsMix(uint64_t seed, uint64_t value) {
 	return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6u) + (seed >> 2u));
@@ -304,8 +309,36 @@ struct PipelineCache::ProgramCache {
 			permutations.reserve(8);
 		}
 
+		// Takes the GPU-fetch shape from a freshly compiled module. Every permutation of an entry
+		// shares it: gpu_fetch follows the resource plan, not the specialization.
+		void AdoptGpuFetch(const ShaderRecompiler::IR::ShaderInfo& info) {
+			if (!info.gpu_descriptors) {
+				return;
+			}
+			gpu_descriptors = true;
+			gpu_fetch_buffers.assign(info.buffers.size(), 0u);
+			for (uint32_t i = 0; i < info.buffers.size(); i++) {
+				gpu_fetch_buffers[i] = info.buffers[i].gpu_fetch ? 1u : 0u;
+			}
+		}
+
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
 		std::vector<Permutation>           permutations;
+
+		// GPU-side descriptor fetch state (docs/gpu-descriptor-fetch.md, stage 1). All of it is
+		// inert while the plan marks no buffer gpu_fetch, which is every plan with the setting off.
+		std::vector<uint8_t>                        gpu_fetch_buffers;
+		ShaderRecompiler::IR::ResourceSpecialization last_specialization;
+		uint32_t feedback_slot = ShaderRecompiler::IR::BindingLayout::NoFeedbackSlot;
+		uint32_t mismatches    = 0;
+		bool     gpu_descriptors         = false;
+		bool     has_last_specialization = false;
+		// The next draw of this program materializes on the CPU: a shader reported that a runtime
+		// V# no longer matches what it was specialized against.
+		bool cpu_next = false;
+		// Too many mismatches for speculation to pay off. The program stays on the CPU path for
+		// the rest of the session; the shader still fetches its own buffers.
+		bool pinned_cpu = false;
 	};
 
 	struct ProgramKeyHash {
@@ -380,13 +413,49 @@ struct PipelineCache::ProgramCache {
 	RecordStageStats(const char* stage_name, const InputInfo& input_info,
 	                 const ShaderRecompiler::IR::ResourcePlan&           plan,
 	                 const ShaderRecompiler::IR::BindingLayout&          bindings,
-	                 const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	                 const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                 bool gpu_fetch) {
 		auto event = StatsStageEvent(stage_name, plan, bindings, specialization);
+		event.gpu_fetch = gpu_fetch;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			event.vertex_layout_key = StatsVertexLayoutKey(input_info);
 			event.has_vertex_layout = true;
 		}
 		SrtStats::RecordStage(event);
+	}
+
+	// Dense DescriptorFeedback slot for a program that fetches its own buffer descriptors. The
+	// shader sets this bit; the readback routes it back through ReportFeedbackSlot. A program
+	// that cannot get a slot has no way to report a mismatch and stays on the CPU path.
+	void AssignFeedbackSlot(SourceEntry& source) {
+		if (feedback_slots.size() >= DescriptorFeedback::MaxSlots) {
+			source.pinned_cpu = true;
+			return;
+		}
+		source.feedback_slot = static_cast<uint32_t>(feedback_slots.size());
+		feedback_slots.push_back(&source);
+	}
+
+	// One bit the GPU set since the last readback: the program's speculation was wrong.
+	void ReportFeedbackSlot(uint32_t slot) {
+		if (slot >= feedback_slots.size()) {
+			return;
+		}
+		auto& source    = *feedback_slots[slot];
+		source.cpu_next = true;
+		source.mismatches++;
+		if (SrtStats::Enabled()) {
+			SrtStats::RecordGpuDescriptor(SrtStats::GpuDescriptorEvent::FeedbackBit);
+		}
+		if (source.mismatches > MaxFeedbackMismatches && !source.pinned_cpu) {
+			source.pinned_cpu = true;
+			LOGF("GPU descriptors: program pinned to the CPU path after %u mismatches, "
+			     "hash=0x%016" PRIx64 "\n",
+			     source.mismatches, source.resource_plan.shader_hash);
+			if (SrtStats::Enabled()) {
+				SrtStats::RecordGpuDescriptor(SrtStats::GpuDescriptorEvent::ProgramPinned);
+			}
+		}
 	}
 
 	template <typename InputInfo>
@@ -443,13 +512,39 @@ struct PipelineCache::ProgramCache {
 		    .sync_memory                = SyncShaderGuestMemory,
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
+		// GPU-side descriptor fetch, stage 1 (docs/gpu-descriptor-fetch.md). A program whose
+		// shader evaluates its own buffer V#s keeps the variant its last CPU materialization
+		// chose, so the draw resolves image and sampler roots only. Entirely inert, and not even
+		// tested past the entry's own flag, while the setting is off.
+		bool gpu_path = false;
 		if (entry != programs.end()) {
+			auto&      source      = entry->second;
+			const bool gpu_capable = source.gpu_descriptors && Config::GpuDescriptorsEnabled();
+			gpu_path = gpu_capable && source.has_last_specialization && !source.cpu_next &&
+			           !source.pinned_cpu;
+			const ShaderRecompiler::IR::GpuFetchOverride override {
+			    .buffers        = source.gpu_fetch_buffers,
+			    .specialization = &source.last_specialization,
+			};
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
 				ReportMaterialization(label, stage, params.hash, report,
 				                      ShaderRecompiler::IR::MaterializeResources(
-				                          entry->second.resource_plan, runtime, resources,
-				                          specialization, &report));
+				                          source.resource_plan, runtime, resources, specialization,
+				                          &report, gpu_path ? &override : nullptr));
+			}
+			if (gpu_capable && !gpu_path) {
+				if (SrtStats::Enabled()) {
+					SrtStats::RecordGpuDescriptor(
+					    source.pinned_cpu           ? SrtStats::GpuDescriptorEvent::CpuPinned
+					    : source.cpu_next           ? SrtStats::GpuDescriptorEvent::CpuFeedback
+					                                : SrtStats::GpuDescriptorEvent::CpuFirst);
+				}
+				// The tuples this materialization derived are what the next GPU-fetch draw keeps.
+				source.last_specialization.buffers = specialization.buffers;
+				source.last_specialization.images  = specialization.images;
+				source.has_last_specialization     = true;
+				source.cpu_next                    = false;
 			}
 			const auto permutation = [&] {
 				KYTY_PROFILER_BLOCK("ProgramCache::FindPermutation");
@@ -465,10 +560,12 @@ struct PipelineCache::ProgramCache {
 			if (permutation != entry->second.permutations.end()) {
 				if (SrtStats::Enabled()) {
 					RecordStageStats(stage_name, input_info, entry->second.resource_plan,
-					                 permutation->program.bindings, permutation->specialization);
+					                 permutation->program.bindings, permutation->specialization,
+					                 gpu_path);
 				}
-				input_info.stage = {.program   = &permutation->program,
-				                    .resources = std::move(resources)};
+				input_info.stage = {.program       = &permutation->program,
+				                    .resources     = std::move(resources),
+				                    .feedback_slot = source.feedback_slot};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -510,14 +607,33 @@ struct PipelineCache::ProgramCache {
 			                          resource_plan, runtime, resources, specialization, &report));
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
-		const auto& permutation = entry->second.permutations.back();
-		if (SrtStats::Enabled()) {
-			RecordStageStats(stage_name, input_info, entry->second.resource_plan,
-			                 permutation.program.bindings, permutation.specialization);
+		auto& source_entry = entry->second;
+		if (Config::GpuDescriptorsEnabled()) {
+			// A variant compiles against the tuples the CPU just derived; those are the ones a
+			// later GPU-fetch draw keeps.
+			source_entry.last_specialization.buffers = specialization.buffers;
+			source_entry.last_specialization.images  = specialization.images;
+			source_entry.has_last_specialization     = true;
+			source_entry.cpu_next                    = false;
 		}
-		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
+		source_entry.permutations.push_back(CompilePermutation(
+		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+		const auto& permutation = source_entry.permutations.back();
+		source_entry.AdoptGpuFetch(permutation.program.info);
+		if (source_entry.gpu_descriptors &&
+		    source_entry.feedback_slot == ShaderRecompiler::IR::BindingLayout::NoFeedbackSlot) {
+			AssignFeedbackSlot(source_entry);
+			if (SrtStats::Enabled()) {
+				SrtStats::RecordGpuDescriptor(SrtStats::GpuDescriptorEvent::CpuFirst);
+			}
+		}
+		if (SrtStats::Enabled()) {
+			RecordStageStats(stage_name, input_info, source_entry.resource_plan,
+			                 permutation.program.bindings, permutation.specialization, false);
+		}
+		input_info.stage = {.program       = &permutation.program,
+		                    .resources     = std::move(resources),
+		                    .feedback_slot = source_entry.feedback_slot};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::Mesh) + 1> counts {};
@@ -551,6 +667,9 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+	// Indexed by DescriptorFeedback slot. The map is node based, so an entry's address is stable
+	// for the cache's lifetime and nothing is ever erased.
+	std::vector<SourceEntry*> feedback_slots;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -826,6 +945,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
 	return result;
+}
+
+void PipelineCache::ReportFeedbackSlot(uint32_t slot) {
+	Common::LockGuard lock(m_mutex);
+	m_program_cache->ReportFeedbackSlot(slot);
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,

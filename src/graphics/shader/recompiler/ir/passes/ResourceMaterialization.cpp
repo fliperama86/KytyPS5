@@ -1325,7 +1325,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                          MaterializeReport* report) {
+                          MaterializeReport* report, const GpuFetchOverride* gpu_fetch) {
 	if (report != nullptr) {
 		*report = {};
 	}
@@ -1333,8 +1333,24 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (!MaterializeSnapshot(program, runtime, materialized, report)) {
 		return false;
 	}
-	return BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization,
-	                                   report);
+	if (!BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization,
+	                                 report)) {
+		return false;
+	}
+	if (gpu_fetch != nullptr && gpu_fetch->specialization != nullptr) {
+		// Hold the tuples the program was compiled against for every resource the shader fetches
+		// itself, so a V# the guest has rewritten since cannot select or compile a new variant.
+		// The shader compares the runtime V# against the baked constants and reports a mismatch
+		// through DescriptorFeedback; the renderer then puts the program back on the CPU path.
+		const auto& baked = gpu_fetch->specialization->buffers;
+		const auto  count = std::min(gpu_fetch->buffers.size(), specialization.buffers.size());
+		for (size_t index = 0; index < count; index++) {
+			if (gpu_fetch->buffers[index] != 0u && index < baked.size()) {
+				specialization.buffers[index] = baked[index];
+			}
+		}
+	}
+	return true;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

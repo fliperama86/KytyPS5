@@ -143,6 +143,11 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
+	// A DescriptorFeedback bit read back from the GPU: the program-cache entry holding this slot
+	// speculated on a buffer layout that no longer matches the runtime V#. Its next draw goes
+	// back through CPU materialization (docs/gpu-descriptor-fetch.md, stage 1).
+	void ReportFeedbackSlot(uint32_t slot);
+
 	Pipeline&
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,

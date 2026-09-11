@@ -115,7 +115,10 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
                               uint64_t& resolved_size) {
 	const auto& resources = input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
-	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
+	// A gpu_descriptors shader decodes its own V#s, so the snapshot descriptors this recognizer
+	// reads are not what the dispatch would actually write. Execute it instead.
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer ||
+	    input.stage.program->info.gpu_descriptors) {
 		return false;
 	}
 	const auto element_size = fill.words * sizeof(uint32_t);
@@ -161,8 +164,9 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
 	const auto& user_data = resources.user_data;
 	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
 	    !program.info.images.empty() || !program.info.samplers.empty() ||
-	    program.info.uses_dma || input.dispatch_thread_dimensions || mode != 0x41u ||
-	    user_data.size() != 10 || program.user_data_base != 0) {
+	    program.info.uses_dma || program.info.gpu_descriptors ||
+	    input.dispatch_thread_dimensions || mode != 0x41u || user_data.size() != 10 ||
+	    program.user_data_base != 0) {
 		return false;
 	}
 	const auto& resource   = program.info.buffers.front();
@@ -487,7 +491,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
-	if (program.info.uses_dma) {
+	// A gpu_descriptors shader reads guest memory through the BDA page table exactly as a dma
+	// shader does, so its dirty pages have to be uploaded before the dispatch too.
+	if (program.info.uses_dma || program.info.gpu_descriptors) {
 		KYTY_PROFILER_BLOCK("RenderCompute::PrepareBda");
 		m_context.GetGpuResources().PrepareBda();
 	}

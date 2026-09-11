@@ -197,6 +197,8 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	// Packs the stage's DescriptorFeedback slot id into shader data, when it has one.
+	void PackFeedbackSlot(PreparedBindings& prepared);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 

@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <span>
 #include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -50,9 +51,23 @@ struct MaterializeReport {
 	std::string dropped_summary;
 };
 
+// Buffer resources the shader evaluates for itself (docs/gpu-descriptor-fetch.md, stage 1). The
+// host passes this on a draw that keeps the program's last CPU-derived variant: those descriptors
+// are not needed for the draw to be correct, so their specialization tuples come from the last
+// CPU materialization instead of from the runtime V# and the same permutation is selected no
+// matter what the guest has since written into the SRT. A mismatch is reported by the shader
+// through the DescriptorFeedback binding, which puts the program back on the CPU path.
+struct GpuFetchOverride {
+	// One byte per entry in ResourcePlan::info.buffers, non-zero for a gpu_fetch resource.
+	std::span<const uint8_t> buffers;
+	// Tuples of the program's last CPU materialization. Must cover every marked buffer.
+	const ResourceSpecialization* specialization = nullptr;
+};
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                          MaterializeReport* report = nullptr);
+                          MaterializeReport*      report    = nullptr,
+                          const GpuFetchOverride* gpu_fetch = nullptr);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

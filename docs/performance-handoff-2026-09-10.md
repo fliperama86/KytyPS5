@@ -314,3 +314,7 @@ What is left, with honest expectations, all measured or studied rather than gues
 
 Stacked, these reach perhaps 20 FPS in this scene. 30 FPS needs the shader backend to fetch
 descriptors on the GPU, which is a redesign, not an optimization. Decide on that basis.
+
+That redesign was started the same day: [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md). The
+ranked list of everything still open, including the items above, is
+[performance-roadmap.md](performance-roadmap.md).

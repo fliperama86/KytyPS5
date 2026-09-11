@@ -2,7 +2,8 @@
 
 Design for moving per-draw shader resource table (SRT) evaluation from the render thread into the
 shaders. Decided 2026-09-11 after the two spikes below. Everything here is gated by a runtime
-setting, default off, until parity holds.
+setting, default off, until parity holds. Where this sits among the other remaining work, and
+the frame budget it has to meet, is in [performance-roadmap.md](performance-roadmap.md).
 
 ## Why
 

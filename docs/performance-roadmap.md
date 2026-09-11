@@ -41,9 +41,34 @@ stops parsing on the critical path.
 
 ## Item 0: the frame replay harness
 
-Scoped in [frame-replay.md](frame-replay.md). Record one parked-Nexus frame, replay it in a
-loop without the game. Every item below is measured in replay first; one end-to-end run per
-integrated item; the full A/B only at milestones. Build this before item 1.
+Status, September 11, 2026: **built and validated**, with one qualification. Scoped and measured in
+[frame-replay.md](frame-replay.md). Record one parked-Nexus frame, replay it in a loop without the
+game. Every item below is measured in replay first; one end-to-end run per integrated item; the
+full A/B only at milestones.
+
+How to use it: `_Build/replay-des.ps1 -Capture _Runtime/_Diagnostics/replay/nexus-2 -Loops 60
+-Repeats 2 -Configs '<flags A>', '<flags B>'` prints the comparison table and keeps the reports. A
+60-loop run is 10 s plus a 6 s warm-up; a two-configuration, two-repeat bench is four minutes
+against the 40 minutes an end-to-end A/B costs. The capture to use is
+`_Runtime/_Diagnostics/replay/nexus-2` (format version 2, frame 2113, 6.4 GiB, 40 submissions).
+
+What it reproduces: the parked-Nexus render thread at 71 ms a loop against 92 ms measured
+end to end (no guest threads compete in replay), with the frame's zone structure intact — 20 867
+`EvaluateRuntimeSourcesImpl` calls at 24 ms a loop against 20 350 at 28.1 ms a frame, 245
+`CpOpDispatchIndirect::SyncArguments` a loop against 245 a frame. Run-to-run repeatability is 0.05
+to 0.9%. The presented image matches the capture screenshot bar exposure and two streamed HUD icons.
+
+What it does not reproduce: **anything whose cost is the guest's page-write pattern within a frame.**
+The replay re-marks the recorded CPU-dirty set in one batch before each loop, so
+`GpuResourceManager::SynchronizeBdaBuffers` runs 28 times a loop for 0.23 ms instead of 352 times a
+frame for 10.47 ms. That 10.2 ms is the whole of the `--gpu-descriptors` A/B, which therefore comes
+out 1.00 in replay against 1.10 end to end. Items 1, 3 and 4 below do not depend on it and are safe
+to measure in replay; item 2 is not, and needs the end-to-end protocol or the fix below.
+
+Next on the harness, when item 2 is picked up: record the CPU-dirty set **per submission** instead
+of per frame (capture format version 3), so the replay re-marks each slice between submissions and
+the BDA scan runs as often as it does in the game. Evidence and sizing in
+[frame-replay.md](frame-replay.md), "Why the A/B does not reproduce, measured".
 
 ## Items, in recommended order
 
@@ -54,6 +79,11 @@ Measure each item before starting the next; the protocol is at the bottom.
 
 Status: not started. Studied here and in
 [performance-handoff-2026-09-10.md](performance-handoff-2026-09-10.md) ("What is left", item 1).
+Phase C of the replay harness added direct evidence that these readbacks serialize the CPU on the
+device: on the title-screen capture, where the render thread is faster than the GPU, the loop time
+steps from 11 ms to 28 ms as soon as a few loops of work are queued ahead, and every one of those
+16 ms lands in `CpOpDispatchIndirect::SyncArguments`
+([frame-replay.md](frame-replay.md), "The sawtooth").
 
 The game is GPU-driven: its compute shaders write the draw and dispatch arguments, and 8,794 of
 the 9,306 draws per frame are `DRAW_INDIRECT` packets. The emulator reads every argument block

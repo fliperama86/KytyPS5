@@ -3,8 +3,10 @@
 Record one frame of the parked Nexus once, replay it through the real render path in a loop
 without the game. Turns the 40-minute end-to-end measurement into a bench that runs in under a
 minute, deterministic, with Tracy and a screenshot diff. Motivation and the process it serves:
-[performance-roadmap.md](performance-roadmap.md). Status: phase A (capture) implemented,
-phase B (replay) not started.
+[performance-roadmap.md](performance-roadmap.md). Status: phases A (capture), B (replay) and
+C (validation) done. The bench runs from one command, `_Build/replay-des.ps1`, and reproduces the
+parked-Nexus render thread to within a few per cent. The one acceptance test it does **not** pass
+is the `--gpu-descriptors` A/B, and the reason is measured: see *Phase C validation* below.
 
 ## What it must do
 
@@ -156,9 +158,13 @@ an ELF. Everything below lives in `src/graphics/replay/frameReplay.cpp`.
    below it; raise `--vblank-frequency` to shrink the quantum, or steer by `ms/loop gpu`. With Tracy
    attached the render thread's zone totals come from Tracy as usual.
 6. **Image.** `--replay-image <path>` copies the last presented swapchain frame into a host buffer
-   (`Presenter::ReadLastPresentedFrame`) and writes it as raw tightly packed 8-bit BGRA or RGBA,
-   with a `<path>.json` sidecar carrying width, height, format and stride. There is no PNG encoder
-   in the tree outside imgui's stb, so a script converts or diffs the raw file.
+   (`Presenter::ReadLastPresentedFrame`) and writes it raw and tightly packed, in whatever video-out
+   pixel format the guest chose (`VIDEO_OUT_FORMAT_POLICIES`, src/graphics/host_gpu/renderer/image/
+   imageInfo.h), with a `<path>.json` sidecar carrying width, height, format, bytes per pixel and
+   stride. Demon's Souls presents `A2B10G10R10_UNORM_PACK32`; reading that file as BGRA8 produces a
+   picture with the right geometry and psychedelic colours, which is how phase C found that the
+   sidecar used to name every non-RGBA8 format "BGRA8". There is no PNG encoder in the tree outside
+   imgui's stb, so `_Build/replay-image-compare.py` converts and diffs the raw file.
 
 ### Report format
 
@@ -308,19 +314,209 @@ Four things phase B should know before it reads a capture:
   picture lacks streamed detail. Dumping those pages needs a sparse-backing write path on the
   replay side, which the kernel does not have (`TryReadSparseBacking` has no counterpart), so
   closing this means recording the sparse mappings too, not just their contents.
-- **The loop is not flat over tens of loops.** On title-2 the first ten measured loops sit at
-  10.8 to 12.4 ms of GPU-thread time, then loop 12 spikes to 81 to 85 ms and the run settles into
-  a sawtooth: a spike near 28 ms every seven to nine loops, decaying by roughly 2 ms a loop in
-  between. Over 40 loops that is median 20 ms against a floor of 11 ms, so the scope's "jitter
-  under 2%" is not met yet. It is not the replay's own bookkeeping: a run with the dirty-page set
-  emptied (`dirty-pages.bin` replaced by an empty file, everything else hardlinked) reproduces the
-  same shape, spike for spike. Nothing is compiled after the warm-up loop either — all 132
-  "Shaders:" lines fall in loop 1. That leaves the host-side caches: the most likely suspect is the
-  GPU resource garbage collector and its age-based eviction, which in a replay sees the same
-  working set every loop and should never evict. Worth chasing before phase C trusts a median, and
-  worth chasing on its own account: a periodic 80 ms stall in the render path would be visible in
-  the game.
+- **A replay starts with an idle device, so its first loops are too fast.** On title-2 the first
+  eight or nine measured loops sit near 11 ms of GPU-thread time, one loop spikes to 90 ms, and the
+  run then settles at a stable 28 ms. Phase C found the cause and it is not the replay's
+  bookkeeping (an empty dirty-page set reproduces it), not shader compilation (every "Shaders:"
+  line falls in loop 1) and not the GPU resource garbage collector (a build that returns from both
+  `RunGarbageCollector` bodies reproduces it spike for spike, and VRAM peaks at 3.9 GiB against a
+  12 GiB GC trigger). Tracy names it: the whole 16 ms step is
+  `CpOpDispatchIndirect::SyncArguments` (src/graphics/guest_gpu/command_processor/pm4Handlers.cpp),
+  +16.7 ms per loop between the two regimes, 14 calls a loop going from 0.2 ms to 1.2 ms each. That
+  zone is `SyncGpuCleanBacking` → `BufferCache::ReadMemory` → `Scheduler::WaitPriorityOperations`:
+  the CPU reading back GPU-written indirect dispatch arguments, which drains the device. While the
+  device queue is empty the drain returns immediately; once the replay has queued a few loops of
+  work ahead, every drain waits for the device to catch up, and the spike is the first loop that
+  pays off the whole backlog. So the stall is real — it is roadmap item 1, and the game pays it 245
+  times per Nexus frame — but the *fast* loops are the artifact, not the slow ones. Consequences:
+  exclude more than one loop when a capture's CPU cost is below its GPU cost, and read the plateau,
+  not the median, on such a capture. It does not arise on nexus-2, where the render thread needs
+  72 ms and the device only 28: the CPU never gets ahead, and the loop is flat from loop 3.
 - **One machine, console session.** Replays are compared with replays, on the same build type.
+
+## Running the bench
+
+One command per comparison, from the repository root:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File _Build\replay-des.ps1 `
+    -Capture _Runtime\_Diagnostics\replay\nexus-2 -Loops 60 -Repeats 2 -Image `
+    -Configs '--gpu-descriptors false', '--gpu-descriptors true'
+```
+
+`replay-des.ps1` runs each flag set in turn — never two emulator processes at once, and it refuses
+to start if one is already running — moves each `replay-report.json` into a timestamped
+`runs-<date>-<time>` subfolder of the capture as `<config>-run<n>.json`, keeps each run's console
+log beside it, writes `summary.json`, and prints one table: config, run, gpu median, gpu min, gpu
+max, gpu jitter, loop median, report file. Parameters: `-Loops` (default 60), `-Configs` (one string
+per flag set, split on whitespace; `''` means the defaults), `-Repeats` (how many times to walk the
+whole list, so repeats of a configuration interleave instead of clustering), `-VblankFrequency`
+(default 360; see `--vblank-frequency` in [settings.md](settings.md) — presentation is paced by the
+virtual vblank, so at the default 60 Hz every `ms/loop` is quantised to 16.7 ms), `-Image` (writes
+the last presented frame of the first repeat of each configuration next to the reports),
+`-OutputRoot`, `-Exe`.
+
+`_Build/replay-image-compare.py` turns a `--replay-image` dump into a PNG and diffs it against a
+reference screenshot: it decodes every format the presenter can produce, including the packed
+10-bit ones, crops the window grab's title bar off the reference, prints the mean absolute
+difference per channel and writes a side-by-side PNG. It needs Pillow
+(`python -m pip install Pillow`).
+
+For Tracy, run the replay with `--profiler-direction Network` and capture it the usual way
+(`_Build/profiling-tools/capture/tracy-capture.exe -a 127.0.0.1 -p 8086 -s 90 -f -o <file>`, then
+`csvexport/tracy-csvexport.exe -e <file>` piped through `Out-File -Encoding utf8`). The warm-up
+loop is seconds long and swamps a per-loop average, so take two captures at different `-Loops` and
+difference their zone totals; that is what every replay zone number below is.
+
+## Phase C validation, September 11, 2026
+
+Build `646ccdc` plus the presented-format fix in this commit, RTX 5090 / Ryzen 9 9950X3D, Remote
+Desktop session, Release. `ctest --test-dir _Build/windows -R frame_replay` passes. All artifacts
+under `_Runtime/_Diagnostics/replay/`.
+
+### The capture: nexus-2
+
+`nexus-1` is format version 1 and cannot replay. `nexus-2` is the same scene recaptured on this
+build: launch with `--frame-capture <abs>/nexus-2`, navigate with
+`_Build/des-navigate.ps1 -NoElevate -WaitForFrame 1000 -HoldSeconds 4 -Presses 12 -GapSeconds 3`,
+confirm the parked Nexus with `_Build/des-window.ps1 -Show` and then `-Shot` (screenshotting a
+window the launcher left unshown gives a black PNG), save that PNG as `nexus-2/reference.png`, and
+create `nexus-2/trigger`. The emulator exits by itself.
+
+| | nexus-1 (v1) | nexus-2 (v2) |
+| --- | --- | --- |
+| frame | 2069 | 2113 |
+| write time | 5.95 s | 5.50 s |
+| mapped ranges / committed | 7068 / 5673 | 6344 / 4929 |
+| non-zero 16 KiB pages | 455 615 (6.96 GiB) | 420 384 (6.41 GiB) |
+| CPU-dirty pages of the frame | 75 489 | 74 625 |
+| submissions | 40 | 40 (23 graphics, 16 compute, 0 flips) |
+| PRT apertures | — | 1 |
+| shader-map registrations | — | 9821 |
+| buffer bytes flushed back / images | 672 MiB / 107 | 682 MiB / 107 |
+| gaps | 56 | 55 |
+
+Restore: 6344 ranges (9759 MiB committed) in 0.87 s, 420 384 pages (6.4 GiB) in 4.7 s, one aperture
+and 9821 shader registrations in 1 ms. Under 6 s against the 30 s budget. The warm-up loop is 6.0 s
+on a warm driver pipeline cache and carries all 507 `Shaders:` lines; 60 loops end to end take
+10.3 s, so a two-configuration, two-repeat bench is four minutes.
+
+### Acceptance A/B
+
+`--replay-loops 60 --vblank-frequency 360`, two configurations, each run twice, interleaved; the
+whole set run twice, `ab-phasec/` and then `ab-phasec-final/` on the binary this commit builds.
+`ms/loop gpu` medians, loop 1 excluded:
+
+| set | config | run 1 | run 2 | run-to-run | gpu min | median |
+| --- | --- | --- | --- | --- | --- | --- |
+| `ab-phasec/` | `--gpu-descriptors false` | 72.03 | 72.03 | 0.00% | 70.32 | 72.03 |
+| `ab-phasec/` | `--gpu-descriptors true` | 71.25 | 70.58 | 0.95% | 68.85 | 70.92 |
+| `ab-phasec-final/` | `--gpu-descriptors false` | 71.01 | 71.05 | 0.05% | 69.74 | 71.03 |
+| `ab-phasec-final/` | `--gpu-descriptors true` | 71.57 | 70.96 | 0.86% | 69.45 | 71.27 |
+
+Reports:
+`nexus-2/ab-phasec{,-final}/gpudescriptors-{false,true}-run{1,2}.json`, with the printed table in
+`summary.json` beside them.
+
+Ratio true/false: **0.985** in the first set, **1.003** in the second. End to end it is **1.10**
+(102 ms against 92 ms of render thread, 9.81 against 10.85 FPS,
+[gpu-descriptor-fetch.md](gpu-descriptor-fetch.md)). **Acceptance is not met**: the ordering does
+not reproduce, the two configurations are inside each other's run-to-run noise, and the ratio is
+10% off rather than within 10%.
+
+Everything else the scope asked for does hold, and the harness is not noisy — it is the
+measurement that is being asked the wrong question. Restore is 6 s against a 30 s budget. Two runs
+of one configuration land within 0.05% (false) and 0.9% (true) of each other. Across 59 measured
+loops the standard deviation is 0.7 ms around a 71 ms median for `false`, so the scope's "jitter
+under 2%" is met on the standard deviation; on the report's max-minus-min definition it is 4 to 8%
+for `false` and 23% for `true`, in both cases from one or two outlying loops, the first measured
+loop included (79.9 ms while the second is 72.9). Absolute level: 71 ms of replayed render thread
+against 92 ms measured end to end, as the limits predicted, because no guest thread is competing
+for the machine.
+
+### Why the A/B does not reproduce, measured
+
+Tracy self time, per frame in the game (`_Runtime/_Diagnostics/gpufetch/real3-self.csv`, 146 frames,
+`--gpu-descriptors true`) against per loop in the replay (`nexus-2/tracy/nexus2-gd{,5}-*.csv`, a
+30-loop capture minus a 5-loop one, so the warm-up cancels):
+
+| zone | game, gd=true | replay, gd=false | replay, gd=true |
+| --- | --- | --- | --- |
+| `EvaluateRuntimeSourcesImpl` (SrtWalker.cpp) | 28.1 ms, 20 350 calls | 23.9 ms, 20 867 | 24.1 ms, 20 867 |
+| `RenderExecutor::RebindBuffers` (descriptors.cpp) | 4.49 ms, 20 201 | 5.35 ms, 20 726 | 1.37 ms, 20 717 |
+| `CpOpDispatchIndirect::SyncArguments` (pm4Handlers.cpp) | 3.65 ms, 245 | 6.44 ms, 245 | 9.96 ms, 245 |
+| `GpuResourceManager::SynchronizeBdaBuffers` | **10.47 ms, 352 calls** | 0.53 ms, 9 | **0.23 ms, 28** |
+
+The first three lines are the harness working: the same frame, the same call counts to within a few
+per cent (245 indirect-argument syncs on the nose), the same dominant cost, and stage 1 visibly
+doing what it claims — `RebindBuffers` drops by 4 ms and all of descriptors.cpp by 5 ms when
+`--gpu-descriptors` goes on.
+
+The last line is why the A/B fails. The BDA scan runs when the buffer or mapped generation changes.
+In the game those changes come from guest CPU writes faulting pages *during* the frame, 352 times,
+at 30 µs each. The replay re-marks the whole recorded dirty set in one batch before the loop starts,
+so the generation moves 28 times, each scan has less to do, and the total is 0.23 ms instead of
+10.47. That missing **10.2 ms** is almost exactly the **10 ms** that separates the end-to-end `true`
+and `false` frames. The harness is not mismeasuring the render path; it is not modelling *when* the
+guest dirties pages, and this particular A/B is made of nothing else.
+
+Closing it means recording the dirty set per submission instead of per frame: the capture would
+snapshot the memory tracker's CPU-dirty delta at each submission boundary and the replay would
+re-mark each slice between submissions. That is a format version 3 change, so it is written up as
+the next item rather than attempted here. Until then the rule is: **the harness measures
+render-path work faithfully, and must not be used to judge a change whose cost lives in the guest's
+page-write pattern.** Stage 1 of the GPU descriptor fetch is exactly such a change; items 1, 3 and 4
+of the roadmap are not.
+
+### Image
+
+`--replay-image` on one run of each configuration, decoded and diffed with
+`_Build/replay-image-compare.py` against `nexus-2/reference.png`. The scene matches: same camera,
+same geometry, same HUD, same archstone glyphs, same particles, and the two configurations produce
+the same picture. Mean absolute difference against the reference is R 10.9, G 8.7, B 4.7 out of 255,
+from two causes, both predicted under *Limits*: the replay is slightly brighter, because the
+auto-exposure history buffer is among the 940 MiB of gaps the capture could not read back, and two
+item icons in the bottom-left HUD are missing, because their streamed mips live in the sparse part
+of a PRT aperture the capture does not walk. Loop count does not change it — the dumps after 2, 4,
+10 and 60 loops differ by less than 0.1 of a level in mean difference, so the history buffers reach
+their fixed point in the first loop and do not drift. Side by side:
+`nexus-2/ab-phasec-final/gpudescriptors-false-vs-reference.png`.
+
+This is also how phase C found that the image sidecar lied. It named every format that is not
+`R8G8B8A8Unorm` "BGRA8"; this title presents `A2B10G10R10_UNORM_PACK32`, and reading that as BGRA8
+yields a picture with perfect geometry and psychedelic colour, which reads as a rendering bug and is
+not one. `Presenter::ReadLastPresentedFrame` now names the real format and carries its bytes per
+pixel, which also fixes a latent quarter-size readback for the `R16G16B16A16Sfloat` video-out
+policy.
+
+### The sawtooth
+
+Reproduced on title-2 on this build: loops 2 to 9 at 11 to 12 ms of GPU-thread time, one loop at
+90 ms, then a stable plateau at 28 ms for the rest of the run (`title-2/sawtooth/base.json`, 40
+loops: min 11.0, median 27.8, max 91.1). What it is not:
+
+- not the dirty-page re-marking — phase B reproduced it with an empty dirty set;
+- not shader compilation — every `Shaders:` line falls in loop 1;
+- not the GPU resource garbage collector. A build that returns immediately from both
+  `RunGarbageCollector` bodies reproduces it spike for spike (`title-2/sawtooth/gc-off.json`:
+  median 28.11 against 27.97 with the collector on), and `nvidia-smi` polled every 100 ms through a
+  200-loop run shows VRAM peaking at 3.9 GiB against the texture cache's roughly 12 GiB trigger and
+  device utilisation at 21 to 23% (`title-2/sawtooth/gpu-util.csv`). The collector never runs, and
+  the device is not the limit either.
+
+Tracy names it. Differencing the per-zone totals of a 10-loop and a 40-loop capture
+(`title-2/sawtooth/title2-{10,40}.csv`), the extra 30 loops cost **+16.7 ms each in
+`CpOpDispatchIndirect::SyncArguments`** — the entire 16 ms step, in one zone, 14 calls a loop going
+from about 0.2 ms to 1.2 ms each. That zone is `SyncGpuCleanBacking` → `BufferCache::ReadMemory` →
+`DownloadBufferMemory` → `Scheduler::WaitPriorityOperations`: the CPU reading GPU-written indirect
+dispatch arguments back, which drains the device.
+
+So the stall is real and it is roadmap item 1; what is a replay artifact is the *fast* phase. A
+fresh replay starts with an idle GPU, so the early drains return at once; once a few loops of work
+are queued ahead, every drain waits for the device, and the 90 ms loop is the one that pays off the
+backlog. Read the plateau on such a capture, not the median. It does not arise on nexus-2, where the
+render thread needs 71 ms and the device about 28, so the CPU never gets ahead and the loop is flat
+from loop 3 — one more reason the parked Nexus, not the title screen, is the capture to measure on.
 
 ## Phases
 
@@ -328,7 +524,7 @@ Four things phase B should know before it reads a capture:
 | --- | --- | --- |
 | A. Capture | flag, quiesce and flush, sparse memory dump, submission recorder in processing order, state dump, manifest; format in `frameCaptureFormat.h`. Done except the screenshot, which needs a presenter readback path | 1 agent-day |
 | B. Replay | `--replay`, memory and state restore, feeder thread, loop timing and report, image readback | 1 to 2 agent-days |
-| C. Validation | capture the parked Nexus on the current build; 100 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff | half a day |
+| C. Validation | capture the parked Nexus on the current build; 60 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff; one command. Done, and the A/B does not reproduce — see *Phase C validation* above | half a day |
 
 Phase B status, September 11, 2026: `--replay` replays a real capture end to end. On title-2, the
 title screen at frame 300 captured with format version 2, it restores 1190 ranges (6123 MiB) in
@@ -353,8 +549,8 @@ format did not carry:
    followed by a reserved hole, read through `Memory::TryReadPrtBacking`, which refuses outside a
    registered aperture. Restoring the one aperture Demon's Souls registers fixes every such image.
 
-Still open for phase C on nexus-1: that capture is version 1, so it has neither stream; recapture
-it on this build to get `prt.bin` and `shaders.bin`.
+That recapture is done: `nexus-2`, format version 2, is the capture to use; `nexus-1` is kept only
+because its screenshot documents the scene.
 
 Code goes under `src/graphics/replay/` (capture and replay), flags in
 [settings.md](settings.md), the capture format and the report format in this file. Both flags

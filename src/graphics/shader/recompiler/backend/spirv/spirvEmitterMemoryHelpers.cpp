@@ -92,6 +92,17 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	}
 	const auto array_index =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
+	// A gpu_fetch resource has no host binding worth reading: the prologue already decoded its V#
+	// (docs/gpu-descriptor-fetch.md, stage 1), so the access carries the base and the GCN range in
+	// place of the descriptor pointer and its OpArrayLength.
+	if (array_index < state.gpu_fetch_buffers.size() &&
+	    state.gpu_fetch_buffers[array_index].base != 0) {
+		MemoryResourceAccess fetched {.kind = mem.kind};
+		fetched.bda_base    = state.gpu_fetch_buffers[array_index].base;
+		fetched.length      = state.gpu_fetch_buffers[array_index].length;
+		fetched.byte_offset = ConstantU32(state, 0);
+		return fetched;
+	}
 	MemoryResourceAccess access {.kind = mem.kind};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, pointer_type, access.object_pointer, variable,
@@ -137,6 +148,11 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Buffer: {
 			access = PrepareStorageBufferResourceAccess(
 			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
+			if (access.bda_base != 0) {
+				// The byte offset packs where the host bound the range inside a cached buffer;
+				// a shader-fetched descriptor addresses its own base directly.
+				return access;
+			}
 			access.index_offset =
 			    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset,
 			                  ConstantU32(state, 2u));
@@ -182,6 +198,11 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type) {
+	if (access.bda_base != 0) {
+		// Only reads are routed through the page table in stage 1, and those never take a
+		// pointer: MarkGpuFetchBuffers refuses a written or atomic resource.
+		EXIT("shader-fetched buffer descriptor has no storage-buffer pointer\n");
+	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                           ConstantU32(state, 0), index});

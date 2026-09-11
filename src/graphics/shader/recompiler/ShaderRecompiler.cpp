@@ -10,6 +10,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/GpuDescriptorFetch.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -676,6 +677,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
                              uint32_t push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
+	// docs/gpu-descriptor-fetch.md stage 1: decide which buffer descriptors the shader
+	// evaluates itself before the specialization is baked in, so the binding layout and the
+	// emitter agree on the flat roots. A no-op unless --gpu-descriptors is on.
+	IR::MarkGpuFetchBuffers(ir);
 	IR::ApplyResourceSpecialization(ir, specialization);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);

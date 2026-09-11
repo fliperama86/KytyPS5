@@ -957,6 +957,32 @@ struct ScopedLdsWaitcntBarrier {
   bool active = false;
 };
 
+// --gpu-descriptors is off by default; the shader-side descriptor fetch cases
+// turn it on around their own compile (docs/gpu-descriptor-fetch.md, stage 1).
+struct ScopedGpuDescriptors {
+  explicit ScopedGpuDescriptors(bool enabled) : active(enabled) {
+    if (active) {
+      Apply(true);
+    }
+  }
+  ~ScopedGpuDescriptors() {
+    if (active) {
+      Apply(false);
+    }
+  }
+  ScopedGpuDescriptors(const ScopedGpuDescriptors &) = delete;
+  ScopedGpuDescriptors &operator=(const ScopedGpuDescriptors &) = delete;
+
+  static void Apply(bool enabled) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::OutputDirection::Silent;
+    options.gpu_descriptors_enabled = enabled;
+    Config::Load(options);
+  }
+
+  bool active = false;
+};
+
 void EnsureConfigInitialized() {
   static bool config_initialized = false;
   if (!config_initialized) {
@@ -1221,6 +1247,9 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
   bool lds_waitcnt_barrier = false;
+  bool gpu_descriptors = false;
+  // The DescriptorFeedback slot id the host would pack for this program.
+  u32 feedback_slot = 0;
 };
 
 struct GraphicsCase {
@@ -1409,6 +1438,7 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
 
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   const ScopedLdsWaitcntBarrier barrier_setting{test.lds_waitcnt_barrier};
+  const ScopedGpuDescriptors gpu_descriptor_setting{test.gpu_descriptors};
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1534,6 +1564,11 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
+  }
+  if (result.program.bindings.feedback_slot_dword !=
+      ShaderRecompiler::IR::BindingLayout::NoFeedbackSlot) {
+    packed_user_data[result.program.bindings.feedback_slot_dword] =
+        test.feedback_slot;
   }
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
@@ -11872,6 +11907,17 @@ public:
     return ret;
   }
 
+  static constexpr size_t FeedbackBufferDwords = 64;
+
+  // Bits the last dispatch recorded. Both buffers are zeroed by every Dispatch
+  // that binds the BDA page table.
+  std::vector<u32> ReadFaultBits(const char *shader_name, size_t dwords) {
+    return ReadBuffer(shader_name, m_fault_buffer, dwords);
+  }
+  std::vector<u32> ReadFeedbackBits(const char *shader_name) {
+    return ReadBuffer(shader_name, m_feedback_buffer, FeedbackBufferDwords);
+  }
+
   void Dispatch(const TestCase &test, const CompiledShader &compiled,
                 const Buffer &buffer, const Buffer *gds_buffer = nullptr,
                 const Image *sampled_image = nullptr,
@@ -12035,6 +12081,7 @@ public:
     vk::DescriptorBufferInfo gds_info{};
     vk::DescriptorBufferInfo bda_pagetable_info{};
     vk::DescriptorBufferInfo fault_buffer_info{};
+    vk::DescriptorBufferInfo feedback_buffer_info{};
 
     const bool uses_bda = Binding(Kind::BdaPagetable) != nullptr;
     Require(test.name, "dispatch",
@@ -12045,10 +12092,16 @@ public:
       bda_pagetable_info = {m_bda_pagetable_buffer.buffer, 0,
                             m_bda_pagetable_buffer.size};
       fault_buffer_info = {m_fault_buffer.buffer, 0, m_fault_buffer.size};
-      const std::array special_buffers{
-          std::pair{Kind::BdaPagetable, &bda_pagetable_info},
-          std::pair{Kind::FaultBuffer, &fault_buffer_info},
+      feedback_buffer_info = {m_feedback_buffer.buffer, 0,
+                              m_feedback_buffer.size};
+      std::vector<std::pair<Kind, vk::DescriptorBufferInfo *>> special_buffers{
+          {Kind::BdaPagetable, &bda_pagetable_info},
+          {Kind::FaultBuffer, &fault_buffer_info},
       };
+      if (Binding(Kind::DescriptorFeedback) != nullptr) {
+        special_buffers.emplace_back(Kind::DescriptorFeedback,
+                                     &feedback_buffer_info);
+      }
       for (const auto &[kind, info] : special_buffers) {
         vk::WriteDescriptorSet write{};
         write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -12231,7 +12284,8 @@ public:
       cmd.fillBuffer(m_bda_pagetable_buffer.buffer, 0,
                      m_bda_pagetable_buffer.size, 0);
       cmd.fillBuffer(m_fault_buffer.buffer, 0, m_fault_buffer.size, 0);
-      std::array<vk::BufferMemoryBarrier, 2> barriers{};
+      cmd.fillBuffer(m_feedback_buffer.buffer, 0, m_feedback_buffer.size, 0);
+      std::array<vk::BufferMemoryBarrier, 3> barriers{};
       barriers[0].sType = vk::StructureType::eBufferMemoryBarrier;
       barriers[0].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
       barriers[0].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -12245,6 +12299,9 @@ public:
                                   vk::AccessFlagBits::eShaderWrite;
       barriers[1].buffer = m_fault_buffer.buffer;
       barriers[1].size = m_fault_buffer.size;
+      barriers[2] = barriers[1];
+      barriers[2].buffer = m_feedback_buffer.buffer;
+      barriers[2].size = m_feedback_buffer.size;
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
@@ -14165,6 +14222,7 @@ private:
   void Destroy() {
     if (m_device != nullptr) {
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
+      DestroyBuffer(&m_feedback_buffer);
       DestroyBuffer(&m_fault_buffer);
       DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
@@ -14349,7 +14407,8 @@ private:
   }
 
   Buffer CreateDeviceBuffer(const char *shader_name, vk::DeviceSize size,
-                            vk::BufferUsageFlags usage) {
+                            vk::BufferUsageFlags usage,
+                            bool host_visible = false) {
     Buffer ret;
     ret.size = size;
     vk::BufferCreateInfo buffer_info{};
@@ -14364,12 +14423,28 @@ private:
     vk::MemoryRequirements requirements{};
     m_device.getBufferMemoryRequirements(ret.buffer, &requirements);
     u32 memory_type = 0;
-    Require(shader_name, "dispatch",
-            FindMemoryType(requirements.memoryTypeBits,
-                           vk::MemoryPropertyFlagBits::eDeviceLocal,
-                           &memory_type) ||
-                FindMemoryType(requirements.memoryTypeBits, {}, &memory_type),
-            "no memory type for BDA support buffer");
+    if (host_visible) {
+      // The fault and feedback buffers are read back by the tests that assert
+      // on their bits, so they have to live in mappable memory.
+      ret.coherent = FindMemoryType(
+          requirements.memoryTypeBits,
+          vk::MemoryPropertyFlagBits::eHostVisible |
+              vk::MemoryPropertyFlagBits::eHostCoherent,
+          &memory_type);
+      Require(shader_name, "dispatch",
+              ret.coherent ||
+                  FindMemoryType(requirements.memoryTypeBits,
+                                 vk::MemoryPropertyFlagBits::eHostVisible,
+                                 &memory_type),
+              "no host-visible memory type for BDA support buffer");
+    } else {
+      Require(shader_name, "dispatch",
+              FindMemoryType(requirements.memoryTypeBits,
+                             vk::MemoryPropertyFlagBits::eDeviceLocal,
+                             &memory_type) ||
+                  FindMemoryType(requirements.memoryTypeBits, {}, &memory_type),
+              "no memory type for BDA support buffer");
+    }
     vk::MemoryAllocateInfo allocation{};
     allocation.sType = vk::StructureType::eMemoryAllocateInfo;
     allocation.allocationSize = requirements.size;
@@ -14392,7 +14467,11 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage, true);
+    // One bit per program feedback slot; the tests only ever use the low ones.
+    m_feedback_buffer =
+        CreateDeviceBuffer(shader_name, FeedbackBufferDwords * sizeof(u32),
+                           usage, true);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -14470,6 +14549,7 @@ private:
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
+  Buffer m_feedback_buffer;
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
 };
@@ -14794,6 +14874,322 @@ void CheckSrtFlatProgramSpirvLowering(VulkanHarness *vulkan) {
     Fail(name, "comparison", joined);
   }
   std::printf("[srt]     %-30s ok (%zu sources)\n", name, cpu.size());
+}
+
+// Shader-side buffer descriptor fetch (docs/gpu-descriptor-fetch.md, stage 1).
+//
+// One compute shader walks a two-level SRT pointer chain to a V#, reads it raw, structured, out of
+// range and through s_buffer_load, and walks a one-level chain to a second V# for a formatted
+// read. The cases below run it with --gpu-descriptors off and on and require the same dwords out
+// of both, then bend the runtime descriptor and the page mapping to exercise the zeroing, the
+// fault bit and the feedback bit the shader path adds.
+//
+// The host path binds the whole test buffer and applies the shader-data byte offset rather than
+// the V# base, so every descriptor here shares one base and every case sets the matching
+// storage_buffer_offsets entry. That makes the two paths address the same dwords.
+namespace GpuFetch {
+
+// Guest byte address == dword index * 4 for both ReadTestMemory and the {0, 0} BDA mapping, so the
+// host materialization and the shader walk the same memory.
+constexpr u32 PointerDword = 2;   // pointer to the first V#
+constexpr u32 Vsharp1Dword = 4;   // raw / structured / scalar descriptor
+constexpr u32 Vsharp2Dword = 8;   // formatted descriptor
+constexpr u32 OutputDword = 16;   // where the shader's stores land
+constexpr u32 DataADword = 24;    // 16 dwords, eight 16-byte records with the tail
+constexpr u32 DataBDword = 40;    // 8 dwords
+constexpr u32 TotalDwords = 48;
+
+constexpr u32 BufferBase = OutputDword * 4u;  // 64, the base both descriptors carry
+constexpr u32 RecordStride = 16;
+constexpr u32 RecordCount = 8;  // 128 bytes, the rest of the buffer
+constexpr u32 Vsharp2Bytes = 128;
+
+constexpr u32 PointerByte = PointerDword * 4u;
+constexpr u32 Vsharp1Byte = Vsharp1Dword * 4u;
+constexpr u32 Vsharp2Byte = Vsharp2Dword * 4u;
+
+// Byte offsets relative to BufferBase, which is how the shader addresses the buffer.
+constexpr u32 DataAOffset = (DataADword - OutputDword) * 4u;
+constexpr u32 DataBOffset = (DataBDword - OutputDword) * 4u;
+
+constexpr u32 FeedbackSlot = 37;  // word 1, bit 5: proves the slot id reaches the shader
+
+u32 DataA(u32 index) { return 0xa0000000u + index; }
+u32 DataB(u32 index) { return 0xb0000000u + index; }
+
+u32 DescriptorDword3() {
+  return DstSel(4, 5, 6, 7) |
+         (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+}
+
+std::vector<u32> MakeGuestMemory() {
+  std::vector<u32> memory(TotalDwords, 0);
+  memory[PointerDword] = Vsharp1Byte;
+  memory[Vsharp1Dword + 0u] = BufferBase;
+  memory[Vsharp1Dword + 1u] = RecordStride << 16u;
+  memory[Vsharp1Dword + 2u] = RecordCount;
+  memory[Vsharp1Dword + 3u] = DescriptorDword3();
+  memory[Vsharp2Dword + 0u] = BufferBase;
+  memory[Vsharp2Dword + 1u] = 0;
+  memory[Vsharp2Dword + 2u] = Vsharp2Bytes;
+  memory[Vsharp2Dword + 3u] = DescriptorDword3();
+  for (u32 i = 0; i < DataBDword - DataADword; i++) {
+    memory[DataADword + i] = DataA(i);
+  }
+  for (u32 i = 0; i < TotalDwords - DataBDword; i++) {
+    memory[DataBDword + i] = DataB(i);
+  }
+  return memory;
+}
+
+std::array<u32, 64> MakeUserData() {
+  std::array<u32, 64> user_data{};
+  user_data[8] = PointerByte;   // -> pointer -> V#1
+  user_data[10] = Vsharp2Byte;  // -> V#2
+  user_data[50] = TotalDwords * sizeof(u32);  // the output V#'s num_records
+  return user_data;
+}
+
+TestCase MakeCase(const char *name) {
+  std::vector<u32> code;
+  // s[4:5] = *user_data[8:9]; s[24:27] = *s[4:5]; s[28:31] = *user_data[10:11].
+  // SMEM soffset 125 is the null register, so none of these pick up an SGPR.
+  code.push_back(EncodeSmem0(0x01u, 4, 4));
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSmem0(0x02u, 24, 2));
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSmem0(0x02u, 28, 5));
+  code.push_back(EncodeSmem1(0, 125));
+  // s20 = s_buffer_load_dword s[24:27], DataAOffset + 16
+  code.push_back(EncodeSmem0(0x08u, 20, 12));
+  code.push_back(EncodeSmem1(DataAOffset + 16u, 125));
+
+  // raw: DataA(2)
+  AppendVMovU32(&code, 20, DataAOffset + 8u);
+  code.push_back(EncodeMubuf0(0x0cu, 0, false, true));
+  code.push_back(EncodeMubuf1(0, 6, 20));
+  // structured: record 4 byte 4, which is DataA(9)
+  AppendVMovU32(&code, 21, (DataAOffset + 36u) / RecordStride);
+  code.push_back(EncodeMubuf0(0x0cu, (DataAOffset + 36u) % RecordStride, true, false));
+  code.push_back(EncodeMubuf1(1, 6, 21));
+  // structured, past num_records and past the bound range alike
+  AppendVMovU32(&code, 22, RecordCount);
+  code.push_back(EncodeMubuf0(0x0cu, 4, true, false));
+  code.push_back(EncodeMubuf1(2, 6, 22));
+  // formatted through the second descriptor: DataB(1)
+  AppendVMovU32(&code, 23, DataBOffset + 4u);
+  code.push_back(EncodeMubuf0(0x00u, 0, false, true));
+  code.push_back(EncodeMubuf1(3, 7, 23));
+
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendStoreVgpr(&code, 2, 2);
+  AppendStoreVgpr(&code, 3, 3);
+  AppendStoreSgpr(&code, 20, 4);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = std::move(code);
+  test.initial = MakeGuestMemory();
+  test.user_data = MakeUserData();
+  test.has_user_data = true;
+  test.bda_mappings = {{0, 0}};
+  test.feedback_slot = FeedbackSlot;
+  test.storage_buffer_offsets = {BufferBase, BufferBase, BufferBase,
+                                 BufferBase};
+  test.expected = test.initial;
+  test.expected[OutputDword + 0u] = DataA(2);
+  test.expected[OutputDword + 1u] = DataA(9);
+  test.expected[OutputDword + 2u] = 0;
+  test.expected[OutputDword + 3u] = DataB(1);
+  test.expected[OutputDword + 4u] = DataA(4);
+  return test;
+}
+
+// Compiles and dispatches one case, optionally against guest memory that differs from the one the
+// specialization was baked against, and returns what the shader left in the buffer.
+CompiledShader Run(VulkanHarness *vulkan, const TestCase &test,
+                   const std::vector<u32> &runtime_memory,
+                   std::vector<u32> *out_dwords) {
+  auto compiled = CompileCase(test, vulkan->SubgroupSize());
+  const auto dwords = std::max<size_t>(
+      {test.initial.size(), runtime_memory.size(), test.expected.size()});
+  auto buffer =
+      vulkan->CreateStorageBuffer(test.name, runtime_memory, dwords, true);
+  vulkan->Dispatch(test, compiled, buffer);
+  *out_dwords = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
+  vulkan->DestroyBuffer(&buffer);
+  return compiled;
+}
+
+bool HasBinding(const CompiledShader &compiled,
+                ShaderRecompiler::IR::DescriptorBindingKind kind) {
+  return ShaderRecompiler::IR::FindBinding(compiled.program.bindings, kind) !=
+         nullptr;
+}
+
+u32 FetchedBuffers(const CompiledShader &compiled) {
+  u32 count = 0;
+  for (const auto &buffer : compiled.program.info.buffers) {
+    count += buffer.gpu_fetch ? 1u : 0u;
+  }
+  return count;
+}
+
+bool SlotBitSet(const std::vector<u32> &bits, u32 slot) {
+  const auto word = slot / 32u;
+  return word < bits.size() && (bits[word] & (1u << (slot % 32u))) != 0u;
+}
+
+bool AnyBitSet(const std::vector<u32> &bits) {
+  return std::any_of(bits.begin(), bits.end(),
+                     [](u32 word) { return word != 0u; });
+}
+
+} // namespace GpuFetch
+
+void CheckGpuDescriptorFetch(VulkanHarness *vulkan) {
+  using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+  using ShaderRecompiler::IR::BindingLayout;
+
+  // With the setting off the program keeps the shape it had before the pass existed.
+  std::vector<u32> host_dwords;
+  {
+    const char *name = "GpuFetchDisabled";
+    auto test = GpuFetch::MakeCase(name);
+    test.forbidden_spirv = {"descriptor_feedback"};
+    const auto compiled =
+        GpuFetch::Run(vulkan, test, test.initial, &host_dwords);
+    Require(name, "bindings", !compiled.program.info.gpu_descriptors,
+            "gpu_descriptors was set while --gpu-descriptors is off");
+    Require(name, "bindings", GpuFetch::FetchedBuffers(compiled) == 0u,
+            "a buffer was marked gpu_fetch while --gpu-descriptors is off");
+    // The SRT chain is itself a scalar guest read, so this shader already carries the BDA
+    // bindings; only the feedback binding belongs to the GPU descriptor path.
+    Require(name, "bindings",
+            !GpuFetch::HasBinding(compiled, Kind::DescriptorFeedback),
+            "a feedback binding appeared while --gpu-descriptors is off");
+    Require(name, "bindings",
+            compiled.program.bindings.feedback_slot_dword ==
+                BindingLayout::NoFeedbackSlot,
+            "a feedback slot was allocated while --gpu-descriptors is off");
+    CompareWords(test, "readback", test.expected, host_dwords);
+    std::printf("[gpufetch] %-30s ok\n", name);
+  }
+
+  // The same shader with the setting on: same dwords, descriptors fetched in-shader.
+  {
+    const char *name = "GpuFetchDescriptorParity";
+    auto test = GpuFetch::MakeCase(name);
+    test.gpu_descriptors = true;
+    test.required_spirv = {"descriptor_feedback"};
+    std::vector<u32> actual;
+    const auto compiled = GpuFetch::Run(vulkan, test, test.initial, &actual);
+    Require(name, "bindings", compiled.program.info.gpu_descriptors,
+            "the shader did not take the GPU descriptor path");
+    Require(name, "bindings", GpuFetch::FetchedBuffers(compiled) >= 2u,
+            "the read-only descriptors were not fetched in-shader");
+    Require(name, "bindings",
+            GpuFetch::HasBinding(compiled, Kind::BdaPagetable) &&
+                GpuFetch::HasBinding(compiled, Kind::FaultBuffer) &&
+                GpuFetch::HasBinding(compiled, Kind::DescriptorFeedback),
+            "the GPU descriptor path is missing one of its bindings");
+    Require(name, "bindings",
+            compiled.program.bindings.feedback_slot_dword !=
+                BindingLayout::NoFeedbackSlot,
+            "the program has no DescriptorFeedback slot dword");
+    // The written descriptor stays on the host path, and every slot keeps its place in the
+    // buffer array so the renderer can bind a dummy to the fetched ones.
+    Require(name, "bindings",
+            GpuFetch::FetchedBuffers(compiled) <
+                compiled.program.info.buffers.size(),
+            "the written descriptor was fetched in-shader");
+    const auto *buffers = ShaderRecompiler::IR::FindBinding(
+        compiled.program.bindings, Kind::Buffers);
+    Require(name, "bindings",
+            buffers != nullptr && buffers->resources.size() ==
+                                      compiled.program.info.buffers.size(),
+            "a shader-fetched resource was dropped from the buffer array");
+    CompareWords(test, "readback", test.expected, actual);
+    Require(name, "readback", actual == host_dwords,
+            "the shader-fetched descriptors read different dwords than the "
+            "host path");
+    Require(name, "feedback",
+            !GpuFetch::AnyBitSet(vulkan->ReadFeedbackBits(name)),
+            "a matching descriptor reported a specialization mismatch");
+    Require(name, "faults", !GpuFetch::AnyBitSet(vulkan->ReadFaultBits(name, 8)),
+            "a mapped descriptor recorded a page fault");
+    std::printf("[gpufetch] %-30s ok\n", name);
+  }
+
+  // A runtime descriptor whose stride is not the one the module baked.
+  {
+    const char *name = "GpuFetchStrideMismatch";
+    auto test = GpuFetch::MakeCase(name);
+    test.gpu_descriptors = true;
+    auto runtime = test.initial;
+    runtime[GpuFetch::Vsharp1Dword + 1u] = (GpuFetch::RecordStride * 2u) << 16u;
+    runtime[GpuFetch::Vsharp1Dword + 2u] = GpuFetch::RecordCount / 2u;
+    std::vector<u32> actual;
+    GpuFetch::Run(vulkan, test, runtime, &actual);
+    const auto feedback = vulkan->ReadFeedbackBits(name);
+    Require(name, "feedback",
+            GpuFetch::SlotBitSet(feedback, GpuFetch::FeedbackSlot),
+            "the stride change did not set the program's feedback bit");
+    std::printf("[gpufetch] %-30s ok\n", name);
+  }
+
+  // num_records is not part of the specialization, so shrinking it only zeroes the reads that
+  // fall outside the GCN range.
+  {
+    const char *name = "GpuFetchOutOfRange";
+    auto test = GpuFetch::MakeCase(name);
+    test.gpu_descriptors = true;
+    auto runtime = test.initial;
+    runtime[GpuFetch::Vsharp1Dword + 2u] = (GpuFetch::DataAOffset + 32u) /
+                                           GpuFetch::RecordStride;
+    test.expected[GpuFetch::OutputDword + 1u] = 0;  // DataA(9), now past the end
+    std::vector<u32> actual;
+    GpuFetch::Run(vulkan, test, runtime, &actual);
+    // The buffer still holds the runtime descriptor, not the one the module baked.
+    test.expected[GpuFetch::Vsharp1Dword + 2u] =
+        runtime[GpuFetch::Vsharp1Dword + 2u];
+    CompareWords(test, "readback", test.expected, actual);
+    Require(name, "feedback",
+            !GpuFetch::AnyBitSet(vulkan->ReadFeedbackBits(name)),
+            "a record count change was reported as a specialization mismatch");
+    Require(name, "faults", !GpuFetch::AnyBitSet(vulkan->ReadFaultBits(name, 8)),
+            "an out-of-range read recorded a page fault");
+    std::printf("[gpufetch] %-30s ok\n", name);
+  }
+
+  // A descriptor pointing at a page the table does not map reads zero and faults.
+  {
+    const char *name = "GpuFetchUnmappedPage";
+    // The {0, 0} mapping covers only the pages the backing buffer spans, and it is far smaller
+    // than one page.
+    constexpr uint64_t UnmappedByte = 0x00100000ull;
+    constexpr u32 UnmappedPage = UnmappedByte / BufferCache::CACHING_PAGESIZE;
+    auto test = GpuFetch::MakeCase(name);
+    test.gpu_descriptors = true;
+    auto runtime = test.initial;
+    runtime[GpuFetch::Vsharp1Dword] = static_cast<u32>(UnmappedByte);
+    test.expected[GpuFetch::Vsharp1Dword] = runtime[GpuFetch::Vsharp1Dword];
+    test.expected[GpuFetch::OutputDword + 0u] = 0;
+    test.expected[GpuFetch::OutputDword + 1u] = 0;
+    test.expected[GpuFetch::OutputDword + 4u] = 0;
+    std::vector<u32> actual;
+    GpuFetch::Run(vulkan, test, runtime, &actual);
+    CompareWords(test, "readback", test.expected, actual);
+    const auto faults = vulkan->ReadFaultBits(name, UnmappedPage / 32u + 2u);
+    Require(name, "faults", GpuFetch::SlotBitSet(faults, UnmappedPage),
+            "reading an unmapped page did not record its fault bit");
+    Require(name, "feedback",
+            !GpuFetch::AnyBitSet(vulkan->ReadFeedbackBits(name)),
+            "an unmapped descriptor page was reported as a mismatch");
+    std::printf("[gpufetch] %-30s ok\n", name);
+  }
 }
 
 enum class CoverageClass {
@@ -30127,6 +30523,7 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -30450,6 +30847,11 @@ int main(int argc, char **argv) {
     CheckSrtFlatProgramSpirvLowering(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-descriptors-only") == 0) {
+    VulkanHarness vulkan;
+    CheckGpuDescriptorFetch(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -30615,6 +31017,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   CheckSrtFlatProgramSpirvLowering(&vulkan);
+  CheckGpuDescriptorFetch(&vulkan);
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);

@@ -202,6 +202,10 @@ void DefineDescriptorVariables(EmitterState& state) {
 		state.fault_buffer_variable = state.builder.DefineGlobalVariable(
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::DescriptorFeedback) != nullptr) {
+		state.descriptor_feedback_variable = state.builder.DefineGlobalVariable(
+		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
+	}
 	if (state.program.bindings.UsesPushData() || state.stage == ShaderType::Mesh) {
 		const auto pointer_type =
 		    TypePointer(state, StorageClassPushConstant, PushConstantBlockType(state));
@@ -603,6 +607,10 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 		Decorate(state.fault_buffer_variable, "fault_buffer",
 		         IR::DescriptorBindingKind::FaultBuffer);
 	}
+	if (state.descriptor_feedback_variable != 0) {
+		Decorate(state.descriptor_feedback_variable, "descriptor_feedback",
+		         IR::DescriptorBindingKind::DescriptorFeedback);
+	}
 	for (const auto& binding: state.program.bindings.descriptors) {
 		if (IR::ImageBindingResourceClass(binding.kind) == IR::ImageResourceClass::None) {
 			continue;
@@ -659,7 +667,7 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(CapabilityShader);
 	state.builder.RequireCapability(CapabilitySignedZeroInfNanPreserve);
-	if (state.program.info.uses_dma) {
+	if (state.program.info.uses_dma || state.program.info.gpu_descriptors) {
 		state.builder.RequireCapability(CapabilityInt64);
 		state.builder.RequireCapability(CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -714,8 +722,9 @@ void DefineModule(EmitterState& state) {
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
 	state.builder.AddMemoryModel(
-	    {state.program.info.uses_dma ? AddressingModelPhysicalStorageBuffer64
-	                                 : AddressingModelLogical,
+	    {state.program.info.uses_dma || state.program.info.gpu_descriptors
+	         ? AddressingModelPhysicalStorageBuffer64
+	         : AddressingModelLogical,
 	     MemoryModelGLSL450});
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.

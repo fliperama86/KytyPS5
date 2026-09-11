@@ -74,9 +74,12 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (uses_gds) {
 		Expect(Kind::Gds);
 	}
-	if (program.info.uses_dma) {
+	if (program.info.uses_dma || program.info.gpu_descriptors) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
+	}
+	if (program.info.gpu_descriptors) {
+		Expect(Kind::DescriptorFeedback);
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||

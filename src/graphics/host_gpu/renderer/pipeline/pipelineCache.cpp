@@ -1,4 +1,4 @@
-#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+﻿#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -55,7 +55,9 @@ bool GpuFetchStubEnabled() {
 }
 
 void MarkGpuFetchStub(ShaderRecompiler::IR::ResourcePlan& plan) {
-	if (!GpuFetchStubEnabled()) {
+	// Compute stays on the CPU path: a compute plan failed to materialize with its buffer roots
+	// skipped, and materialization failure is fatal.
+	if (!GpuFetchStubEnabled() || plan.stage == ShaderType::Compute) {
 		return;
 	}
 	bool any = false;
@@ -577,10 +579,24 @@ struct PipelineCache::ProgramCache {
 			};
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
-				ReportMaterialization(label, stage, params.hash, report,
-				                      ShaderRecompiler::IR::MaterializeResources(
-				                          source.resource_plan, runtime, resources, specialization,
-				                          &report, gpu_path ? &override : nullptr));
+				bool ok = ShaderRecompiler::IR::MaterializeResources(
+				    source.resource_plan, runtime, resources, specialization, &report,
+				    gpu_path ? &override : nullptr);
+				if (!ok && gpu_path) {
+					// Stage 1 bring-up: find out whether the failure is caused by the skipped
+					// roots. A CPU retry that succeeds means it is; one that fails means the
+					// memory itself is bad.
+					const std::string first_reason = report.reason;
+					ok = ShaderRecompiler::IR::MaterializeResources(
+					    source.resource_plan, runtime, resources, specialization, &report);
+					LOGF("gpu-descriptors: materialization failed on the GPU path for %s "
+					     "0x%016" PRIx64 " (%s); CPU retry %s\n",
+					     stage_name, params.hash, first_reason.c_str(), ok ? "succeeded" : "failed");
+					std::fflush(stdout);
+					gpu_path        = false;
+					source.cpu_next = true;
+				}
+				ReportMaterialization(label, stage, params.hash, report, ok);
 			}
 			if (gpu_capable && !gpu_path) {
 				if (SrtStats::Enabled()) {
@@ -658,6 +674,39 @@ struct PipelineCache::ProgramCache {
 			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
 		}
 		auto& source_entry = entry->second;
+		if (!source_entry.permutations.empty() && Config::GpuDescriptorsEnabled()) {
+			// Diagnostic for the stage 1 bring-up: a new permutation for a known program means the
+			// specialization did not match any compiled one. Name the first difference.
+			const auto& first = source_entry.permutations.front().specialization;
+			std::string why;
+			const auto  nb = std::min(first.buffers.size(), specialization.buffers.size());
+			for (size_t i = 0; i < nb && why.empty(); i++) {
+				const auto& a = first.buffers[i];
+				const auto& b = specialization.buffers[i];
+				if (!(a == b)) {
+					why = fmt::format("buffer[{}] stride {:#x}->{:#x} format {}->{} swizzle {:#x}->{:#x}",
+					                  i, a.packed_stride, b.packed_stride,
+					                  static_cast<int>(a.descriptor_format),
+					                  static_cast<int>(b.descriptor_format), a.descriptor_swizzle,
+					                  b.descriptor_swizzle);
+				}
+			}
+			if (why.empty() && first.buffers.size() != specialization.buffers.size()) {
+				why = fmt::format("buffer count {}->{}", first.buffers.size(),
+				                  specialization.buffers.size());
+			}
+			if (why.empty() && !(first.images == specialization.images)) {
+				why = fmt::format("images differ (count {}->{})", first.images.size(),
+				                  specialization.images.size());
+			}
+			if (why.empty()) {
+				why = "push data start";
+			}
+			LOGF("gpu-descriptors: new permutation #%zu for %s 0x%016" PRIx64 " gpu_path=%d: %s\n",
+			     source_entry.permutations.size() + 1, stage_name, params.hash, gpu_path ? 1 : 0,
+			     why.c_str());
+			std::fflush(stdout);
+		}
 		CopyGpuFetchStub(source_entry.resource_plan.info, translated.program.info);
 		if (Config::GpuDescriptorsEnabled()) {
 			// A variant compiles against the tuples the CPU just derived; those are the ones a

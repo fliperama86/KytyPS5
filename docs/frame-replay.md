@@ -477,8 +477,11 @@ of the roadmap are not.
 
 `--replay-image` on one run of each configuration, decoded and diffed with
 `_Build/replay-image-compare.py` against `nexus-2/reference.png`. The scene matches: same camera,
-same geometry, same HUD, same archstone glyphs, same particles, and the two configurations produce
-the same picture. Mean absolute difference against the reference is R 10.9, G 8.7, B 4.7 out of 255,
+same geometry, same HUD, same archstone glyphs, same particles. The two configurations agree to the
+eye and nearly bit for bit: 1.3% of sampled pixels differ at all, by 0.018 of a level out of 1023
+averaged over every sampled channel, worst case 74 — floating-point ordering in the fetched path,
+not a rendering difference. Mean absolute difference against the reference is R 10.9, G 8.7, B 4.7
+out of 255,
 from two causes, both predicted under *Limits*: the replay is slightly brighter, because the
 auto-exposure history buffer is among the 940 MiB of gaps the capture could not read back, and two
 item icons in the bottom-left HUD are missing, because their streamed mips live in the sparse part

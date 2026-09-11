@@ -22,6 +22,7 @@ Fork of KytyPS5 focused on getting Demon's Souls (PPSA01342) to run well. Read
 - Push only to the `fliperama86` fork. Never push to `origin` (official KytyPS5) or `upstream`.
 - Work on `main`. Keep any branch short-lived. Game-specific or experimental behaviour goes behind
   a compile flag or a runtime setting so `main` stays safe for other games.
+- Every such gate is listed in [docs/settings.md](docs/settings.md); add new ones there.
 - No attribution lines in commit messages or pull request descriptions.
 - Steer performance work by frame rate and Tracy zone self time on the render thread, not by
   whole-process CPU share or by sampled symbol names (this LTO build mis-attributes them).

@@ -71,6 +71,14 @@ bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }
 
+bool ShaderLdsWaitcntBarrierEnabled() {
+	return g_config->shader_lds_waitcnt_barrier_enabled;
+}
+
+bool ShaderStorageImageBoundsCheckEnabled() {
+	return g_config->shader_storage_image_bounds_check_enabled;
+}
+
 ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }

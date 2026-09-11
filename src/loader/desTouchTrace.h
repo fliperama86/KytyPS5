@@ -129,7 +129,13 @@ inline void Install(const Program* program) {
 	    !SystemContentParamSfoGetString("TITLE_ID", &title) || title != "PPSA01342" ||
 	    !SystemContentParamSfoGetString("APP_VER", &version) || version != "01.005.000" ||
 	    program->mapped_size < 0xd8c42f) {
-		EXIT("DesTouchTrace: game/version mismatch; refusing to instrument\n");
+		// The probes are hard-coded RVAs for Demon's Souls PPSA01342 01.005.000. Any other
+		// title leaves base == 0, so Handle() stays inert and the game runs unmodified.
+		::printf("DesTouchTrace: not Demon's Souls PPSA01342 01.005.000 (title=%s version=%s);"
+		         " not instrumenting\n",
+		         title.empty() ? "?" : title.c_str(), version.empty() ? "?" : version.c_str());
+		std::fflush(stdout);
+		return;
 	}
 	// MOV/XCHG probes preserve flags and SIMD state. XCHG is reproduced atomically.
 	struct Probe { uint64_t rva; size_t size; uint8_t expected[7]; };

@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -244,6 +245,10 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 	};
 	const auto WriteAt = [&](uint32_t index) {
 		const auto descriptor = LoadAt(index);
+		if (!Config::ShaderStorageImageBoundsCheckEnabled()) {
+			state.builder.AddFunction({OpImageWrite, descriptor, coord, texel});
+			return;
+		}
 		state.builder.RequireCapability(CapabilityImageQuery);
 		const auto size = state.builder.AllocateId();
 		state.builder.AddFunction(

@@ -515,9 +515,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	m_context.GetGraphics().RecordShaderCheckpoint(vk_buffer, program.shader_hash);
-	if (GpuFaultTrace::Enabled() &&
-	    (program.shader_hash == 0xdf890e8a1a32c65aull ||
-	     program.shader_hash == 0x92760f03dce9b80dull)) {
+	if (GpuFaultTrace::Enabled()) {
 		auto trace = fmt::format(
 		    "shader={:016x} frame={} tick={} groups={}x{}x{} local={}x{}x{} indirect={:016x}\n",
 		    program.shader_hash, frame_num, m_context.GetCommandScheduler().CurrentTick(),

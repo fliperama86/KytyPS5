@@ -928,6 +928,32 @@ std::string VulkanResultName(vk::Result result) {
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
 
+// --shader-lds-waitcnt-barrier is off by default; cases that exercise the
+// implicit LDS ordering opt in for the duration of their own compile.
+struct ScopedLdsWaitcntBarrier {
+  explicit ScopedLdsWaitcntBarrier(bool enabled) : active(enabled) {
+    if (active) {
+      Apply(true);
+    }
+  }
+  ~ScopedLdsWaitcntBarrier() {
+    if (active) {
+      Apply(false);
+    }
+  }
+  ScopedLdsWaitcntBarrier(const ScopedLdsWaitcntBarrier &) = delete;
+  ScopedLdsWaitcntBarrier &operator=(const ScopedLdsWaitcntBarrier &) = delete;
+
+  static void Apply(bool enabled) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::OutputDirection::Silent;
+    options.shader_lds_waitcnt_barrier_enabled = enabled;
+    Config::Load(options);
+  }
+
+  bool active = false;
+};
+
 void EnsureConfigInitialized() {
   static bool config_initialized = false;
   if (!config_initialized) {
@@ -1191,6 +1217,7 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
+  bool lds_waitcnt_barrier = false;
 };
 
 struct GraphicsCase {
@@ -1378,6 +1405,7 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
 }
 
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
+  const ScopedLdsWaitcntBarrier barrier_setting{test.lds_waitcnt_barrier};
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -22980,6 +23008,7 @@ TestCase WaveWaitcntLdsExchange(u32 wave_size) {
                   O::V_XOR_B32, O::DS_WRITE_B32, O::S_WAITCNT,
                   O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpControlBarrier"};
+  test.lds_waitcnt_barrier = true;
   test.compute_info.threads_num[0] = wave_size * 2;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;

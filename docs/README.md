@@ -9,6 +9,7 @@ The source for the Demon's Souls documentation lives in this repository. Add new
 - [Performance measurements and optimization validation](demons-souls-performance.md)
 - [Local runtime folder and launchers](local-runtime.md)
 - [Reaching the Nexus: navigation and measurement procedure](reaching-the-nexus.md)
+- [Settings: command-line flags and environment variables](settings.md)
 
 ## Investigation archive
 

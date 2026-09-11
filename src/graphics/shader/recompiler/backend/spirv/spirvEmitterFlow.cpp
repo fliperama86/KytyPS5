@@ -1,3 +1,4 @@
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
@@ -531,7 +532,9 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::TtraceData:
 		case IR::ValueOpcode::InstPrefetch: return true;
 		case IR::ValueOpcode::Waitcnt: {
-			if (ctx.half != 0 || ShaderWorkgroupInput(state.stage, state.input_info) == nullptr ||
+			// Off by default: only titles that rely on the implicit LDS ordering need it.
+			if (!Config::ShaderLdsWaitcntBarrierEnabled() || ctx.half != 0 ||
+			    ShaderWorkgroupInput(state.stage, state.input_info) == nullptr ||
 			    !std::ranges::any_of(state.program.memory_info, [](const auto& memory) {
 				    return memory.kind == IR::ResourceKind::Lds;
 			    })) {

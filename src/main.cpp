@@ -60,6 +60,10 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
+	::printf("  --shader-lds-waitcnt-barrier <t|f>   Emit a subgroup barrier at every S_WAITCNT\n"
+	         "                                       in an LDS compute shader. Default: false.\n");
+	::printf("  --shader-storage-bounds-check <t|f>  Bounds-check storage image writes in the\n"
+	         "                                       generated SPIR-V. Default: true.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -258,6 +262,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--shader-validation") {
 			if (!ParseBool(value, options.config.shader_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--shader-lds-waitcnt-barrier") {
+			if (!ParseBool(value, options.config.shader_lds_waitcnt_barrier_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--shader-storage-bounds-check") {
+			if (!ParseBool(value, options.config.shader_storage_image_bounds_check_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

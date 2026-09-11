@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <fmt/format.h>
 #include <atomic>
 #include <cstddef>
 #include <cstdlib>
@@ -876,6 +877,40 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+std::string DescribeGpuAddress(uint64_t vaddr) {
+	std::string backing = "unreadable";
+	uint32_t    word    = 0;
+	if (TryReadBacking(vaddr, &word, sizeof(word))) {
+		backing = fmt::format("{:#010x}", word);
+	}
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, sizeof(uint32_t))) {
+		return fmt::format("address={:#x} backing={} (no GPU cache view)", vaddr, backing);
+	}
+	auto&      cache = GetGpuResources().GetBufferCache();
+	const auto probe = cache.ProbeAddress(vaddr);
+	std::string writers;
+	for (const auto& write: cache.FindShaderWrites(vaddr)) {
+		writers += fmt::format(" {}{:016x}/stage{}/gpu_fetch={}{}",
+		                       write.dma ? "dma:" : "buf:", write.hash, write.stage,
+		                       write.gpu_fetch ? 1 : 0,
+		                       write.size != 0
+		                           ? fmt::format("@[{:#x},{:#x})", write.address,
+		                                         write.address + write.size)
+		                           : std::string());
+	}
+	return fmt::format(
+	    "address={:#x} backing={} page={:#x} bda_mapped={} buffer={} range=[{:#x},{:#x}) "
+	    "deleted={} covers_dword={} gpu_modified={} cpu_modified={} gpu_dirty={} "
+	    "faulted={} fault_hits={} fault_first_pass={} fault_last_pass={} fault_ring={} "
+	    "fault_passes={} fault_pages_total={} fault_pages_known={} writers=[{}]",
+	    vaddr, backing, probe.page, probe.page_mapped ? 1 : 0, probe.buffer_found ? 1 : 0,
+	    probe.buffer_start, probe.buffer_start + probe.buffer_size, probe.buffer_deleted ? 1 : 0,
+	    probe.registered ? 1 : 0, probe.gpu_modified ? 1 : 0, probe.cpu_modified ? 1 : 0,
+	    probe.gpu_dirty ? 1 : 0, probe.fault.seen ? 1 : 0, probe.fault.hits,
+	    probe.fault.first_pass, probe.fault.last_pass, probe.fault.ring_pages, probe.fault.passes,
+	    probe.fault.pages_total, probe.fault.pages_known, writers);
 }
 
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {

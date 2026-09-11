@@ -690,6 +690,71 @@ void BufferCache::RunGarbageCollector() {
 	}
 }
 
+void BufferCache::RecordShaderWrite(uint64_t hash, uint32_t stage, uint64_t address,
+                                    uint64_t size, bool dma, bool formatted, bool gpu_fetch) {
+	if (m_shader_writes.size() < ShaderWriteRingSize) {
+		m_shader_writes.resize(ShaderWriteRingSize);
+	}
+	m_shader_writes[m_shader_write_next % ShaderWriteRingSize] = {
+	    hash, address, size, m_shader_write_next, stage, dma, formatted, gpu_fetch};
+	m_shader_write_next++;
+}
+
+std::vector<BufferCache::ShaderWrite> BufferCache::FindShaderWrites(uint64_t address,
+                                                                    size_t dma_tail) const {
+	std::vector<ShaderWrite> found;
+	if (m_shader_writes.empty()) {
+		return found;
+	}
+	const auto count = std::min<uint64_t>(m_shader_write_next, ShaderWriteRingSize);
+	for (uint64_t step = 0; step < count; step++) {
+		const auto& record = m_shader_writes[(m_shader_write_next - 1 - step) % ShaderWriteRingSize];
+		if (record.size != 0 && address >= record.address &&
+		    address - record.address < record.size) {
+			found.push_back(record);
+		}
+	}
+	size_t dma_seen = 0;
+	for (uint64_t step = 0; step < count && dma_seen < dma_tail; step++) {
+		const auto& record = m_shader_writes[(m_shader_write_next - 1 - step) % ShaderWriteRingSize];
+		if (!record.dma) {
+			continue;
+		}
+		if (std::ranges::none_of(found, [&](const ShaderWrite& other) {
+			    return other.hash == record.hash && other.dma;
+		    })) {
+			found.push_back(record);
+			dma_seen++;
+		}
+	}
+	return found;
+}
+
+BufferCache::AddressProbe BufferCache::ProbeAddress(uint64_t address) {
+	AddressProbe probe {};
+	probe.address = address;
+	probe.page    = address >> PageTable::kPageBits;
+	probe.fault   = m_fault_manager.QueryFaultedPage(address);
+	if (address == 0) {
+		return probe;
+	}
+	if (const auto* owner = m_page_table.Find(probe.page); owner != nullptr && *owner) {
+		const auto& buffer  = m_slot_buffers[*owner];
+		probe.page_mapped   = true;
+		probe.buffer_found  = true;
+		probe.buffer_start  = buffer.CpuAddress();
+		probe.buffer_size   = buffer.Size();
+		probe.buffer_deleted = buffer.is_deleted;
+		probe.registered    = buffer.IsInBounds(address, sizeof(uint32_t));
+	}
+	if (GuestRange {address, sizeof(uint32_t)}.Valid()) {
+		probe.gpu_modified = m_memory_tracker.IsRegionGpuModified(address, sizeof(uint32_t));
+		probe.cpu_modified = m_memory_tracker.IsRegionCpuModified(address, sizeof(uint32_t));
+		probe.gpu_dirty    = m_gpu_modified_ranges.Intersects(address, sizeof(uint32_t));
+	}
+	return probe;
+}
+
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }

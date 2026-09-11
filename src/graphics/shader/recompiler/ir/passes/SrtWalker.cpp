@@ -23,6 +23,109 @@ namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
+// Stage 1 diagnostics (docs/gpu-descriptor-fetch.md): the last failed evaluation on this thread.
+// Only the failure path touches it.
+SrtFailure& ThreadFailure() {
+	static thread_local SrtFailure failure;
+	return failure;
+}
+
+const char* SrtFlatOpName(SrtFlatOp op) {
+	switch (op) {
+		case SrtFlatOp::Imm: return "Imm";
+		case SrtFlatOp::UserData: return "UserData";
+		case SrtFlatOp::ShaderBase: return "ShaderBase";
+		case SrtFlatOp::ReadAddress: return "ReadAddress";
+		case SrtFlatOp::ReadBuffer: return "ReadBuffer";
+		case SrtFlatOp::ExtractU64: return "ExtractU64";
+		case SrtFlatOp::AddCarry: return "AddCarry";
+		case SrtFlatOp::ConstructU64: return "ConstructU64";
+		case SrtFlatOp::IAdd32: return "IAdd32";
+		case SrtFlatOp::IAdd64: return "IAdd64";
+		case SrtFlatOp::ISub32: return "ISub32";
+		case SrtFlatOp::ISub64: return "ISub64";
+		case SrtFlatOp::IMul32: return "IMul32";
+		case SrtFlatOp::IMul64: return "IMul64";
+		case SrtFlatOp::UMin32: return "UMin32";
+		case SrtFlatOp::ConvertF32U32: return "ConvertF32U32";
+		case SrtFlatOp::ConvertU32F32: return "ConvertU32F32";
+		case SrtFlatOp::FPMul32: return "FPMul32";
+		case SrtFlatOp::FPTrunc32: return "FPTrunc32";
+		case SrtFlatOp::FPIsNan32: return "FPIsNan32";
+		case SrtFlatOp::FPOrdLessThanEqual32: return "FPOrdLessThanEqual32";
+		case SrtFlatOp::FPOrdGreaterThanEqual32: return "FPOrdGreaterThanEqual32";
+		case SrtFlatOp::BitwiseAnd32: return "BitwiseAnd32";
+		case SrtFlatOp::BitwiseAnd64: return "BitwiseAnd64";
+		case SrtFlatOp::BitwiseOr32: return "BitwiseOr32";
+		case SrtFlatOp::BitwiseXor32: return "BitwiseXor32";
+		case SrtFlatOp::BitwiseNot32: return "BitwiseNot32";
+		case SrtFlatOp::BitCount32: return "BitCount32";
+		case SrtFlatOp::FindILsb32: return "FindILsb32";
+		case SrtFlatOp::FindUMsb32: return "FindUMsb32";
+		case SrtFlatOp::ShiftLeftLogical32: return "ShiftLeftLogical32";
+		case SrtFlatOp::ShiftLeftLogical64: return "ShiftLeftLogical64";
+		case SrtFlatOp::ShiftRightLogical32: return "ShiftRightLogical32";
+		case SrtFlatOp::ShiftRightLogical64: return "ShiftRightLogical64";
+		case SrtFlatOp::ShiftRightArithmetic32: return "ShiftRightArithmetic32";
+		case SrtFlatOp::ShiftRightArithmetic64: return "ShiftRightArithmetic64";
+		case SrtFlatOp::BitFieldUExtract: return "BitFieldUExtract";
+		case SrtFlatOp::BitFieldSExtract: return "BitFieldSExtract";
+		case SrtFlatOp::BitFieldInsert: return "BitFieldInsert";
+		case SrtFlatOp::Select: return "Select";
+		case SrtFlatOp::IEqual32: return "IEqual32";
+		case SrtFlatOp::INotEqual32: return "INotEqual32";
+		case SrtFlatOp::ULessThan32: return "ULessThan32";
+		case SrtFlatOp::UGreaterThan32: return "UGreaterThan32";
+		case SrtFlatOp::LogicalAnd: return "LogicalAnd";
+		case SrtFlatOp::LogicalOr: return "LogicalOr";
+		case SrtFlatOp::LogicalXor: return "LogicalXor";
+		case SrtFlatOp::LogicalNot: return "LogicalNot";
+	}
+	return "?";
+}
+
+void ResetFailure(SrtFailure& failure) {
+	failure.valid         = false;
+	failure.flat          = false;
+	failure.kind          = "";
+	failure.index         = UINT32_MAX;
+	failure.root_first    = 0;
+	failure.root_count    = 0;
+	failure.root_valid    = false;
+	failure.inst_index    = UINT32_MAX;
+	failure.op_name       = "";
+	failure.arg_count     = 0;
+	failure.args          = {};
+	failure.arg_values    = {};
+	failure.arg_defined   = {};
+	failure.imm           = 0;
+	failure.clean         = false;
+	failure.address_valid = false;
+	failure.address       = 0;
+	failure.memory_op     = false;
+	failure.base          = 0;
+	failure.byte_offset   = 0;
+	failure.records       = 0;
+	failure.stride        = 0;
+	failure.bound         = 0;
+	failure.user_data.clear();
+	failure.user_data_size = 0;
+	failure.trace.clear();
+}
+
+// Names the failing slot. The flat machine has already filled the instruction detail; the IR
+// walker has none, so its record carries the slot only.
+void TagFailure(const char* kind, uint32_t index, bool flat) {
+	auto& failure = ThreadFailure();
+	if (!flat) {
+		ResetFailure(failure);
+	}
+	failure.valid = true;
+	failure.flat  = flat;
+	failure.kind  = kind;
+	failure.index = index;
+}
+
 const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return "vertex";
@@ -1635,6 +1738,7 @@ public:
 	// so shared work between roots is done once; a failure leaves earlier registers valid.
 	bool Run(const SrtFlatRoot& root) {
 		if (!root.valid) {
+			RecordFailure(root, UINT32_MAX);
 			return false;
 		}
 		const auto* schedule = m_program.schedule.data() + root.first;
@@ -1644,7 +1748,9 @@ public:
 				continue;
 			}
 			uint64_t result = 0;
+			m_address_valid = false;
 			if (!Execute(m_program.insts[index], result)) {
+				RecordFailure(root, index);
 				return false;
 			}
 			m_values[index] = result;
@@ -1661,7 +1767,10 @@ private:
 	static uint64_t Float32Bits(float value) { return std::bit_cast<uint32_t>(value); }
 
 	bool Read(const SrtFlatInst& inst, uint64_t address, uint64_t& result) const {
-		uint32_t word = 0;
+		// Kept for the failure record; overwritten on every read and never looked at on success.
+		m_address       = address;
+		m_address_valid = true;
+		uint32_t word   = 0;
 		if (inst.clean != 0u) {
 			if (m_runtime.read_specialization_memory == nullptr ||
 			    !m_runtime.read_specialization_memory(m_runtime.userdata, address, &word)) {
@@ -1868,11 +1977,148 @@ private:
 		return false;
 	}
 
+	// Address a memory op used, recomputed from the operand values the run produced.
+	static bool MemoryAddress(const SrtFlatInst& inst, const SrtTraceEntry& entry,
+	                          uint64_t& address) {
+		if (inst.op == SrtFlatOp::ReadBuffer && inst.arg_count >= 4) {
+			const auto base = ((entry.arg_values[1] << 32u) |
+			                   static_cast<uint32_t>(entry.arg_values[0])) &
+			                  AddressMask;
+			const auto byte_offset = inst.imm + static_cast<uint32_t>(entry.arg_values[3]);
+			address                = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+			return true;
+		}
+		if (inst.op == SrtFlatOp::ReadAddress && inst.arg_count >= 3) {
+			const auto base = ((entry.arg_values[1] << 32u) |
+			                   static_cast<uint32_t>(entry.arg_values[0])) &
+			                  AddressMask;
+			const auto immediate = static_cast<int64_t>(inst.imm);
+			const auto relative  = (immediate & ~int64_t {3}) +
+			                      static_cast<int64_t>(static_cast<uint32_t>(entry.arg_values[2]) &
+			                                           ~3u);
+			address = (base & ~uint64_t {3}) + static_cast<uint64_t>(relative);
+			return true;
+		}
+		return false;
+	}
+
+	// The failing root's schedule, so the chain that produced a zero descriptor is visible.
+	void RecordTrace(SrtFailure& failure, const SrtFlatRoot& root, uint32_t failing) const {
+		if (!root.valid) {
+			return;
+		}
+		constexpr uint32_t MaxTrace = 128;
+		const auto*        schedule = m_program.schedule.data() + root.first;
+		for (uint32_t step = 0; step < root.count && failure.trace.size() < MaxTrace; step++) {
+			const auto  index = schedule[step];
+			const auto& inst  = m_program.insts[index];
+			SrtTraceEntry entry;
+			entry.inst_index = index;
+			entry.op_name    = SrtFlatOpName(inst.op);
+			entry.arg_count  = inst.arg_count;
+			entry.imm        = inst.imm;
+			entry.clean      = inst.clean != 0u;
+			entry.failing    = index == failing;
+			for (uint32_t arg = 0; arg < inst.arg_count && arg < SrtFlatInst::MaxArgs; arg++) {
+				const auto reg         = inst.args[arg];
+				const bool defined     = reg < m_program.insts.size() && m_stamps[reg] == m_epoch;
+				entry.args[arg]        = reg;
+				entry.arg_defined[arg] = defined ? 1u : 0u;
+				entry.arg_values[arg]  = defined ? m_values[reg] : 0u;
+			}
+			entry.defined = m_stamps[index] == m_epoch;
+			entry.value   = entry.defined ? m_values[index] : 0u;
+			entry.memory  = inst.op == SrtFlatOp::ReadBuffer || inst.op == SrtFlatOp::ReadAddress;
+			if (entry.memory) {
+				entry.address_valid = MemoryAddress(inst, entry, entry.address);
+			}
+			failure.trace.push_back(entry);
+		}
+	}
+
+	// Fills the thread's failure record. Runs once, after a root has already failed.
+	void RecordFailure(const SrtFlatRoot& root, uint32_t index) const {
+		auto& failure = ThreadFailure();
+		ResetFailure(failure);
+		failure.valid          = true;
+		failure.flat           = true;
+		failure.root_first     = root.first;
+		failure.root_count     = root.count;
+		failure.root_valid     = root.valid;
+		failure.user_data_size = static_cast<uint32_t>(m_runtime.user_data.size());
+		if (root.valid) {
+			const auto* schedule = m_program.schedule.data() + root.first;
+			for (uint32_t step = 0; step < root.count; step++) {
+				const auto& scheduled = m_program.insts[schedule[step]];
+				if (scheduled.op != SrtFlatOp::UserData) {
+					continue;
+				}
+				const auto reg = static_cast<uint32_t>(scheduled.imm);
+				failure.user_data.emplace_back(
+				    reg, reg < m_runtime.user_data.size() ? m_runtime.user_data[reg] : 0u);
+			}
+		}
+		RecordTrace(failure, root, index);
+		if (index >= m_program.insts.size()) {
+			return;
+		}
+		const auto& inst   = m_program.insts[index];
+		failure.inst_index = index;
+		failure.op_name    = SrtFlatOpName(inst.op);
+		failure.arg_count  = inst.arg_count;
+		failure.imm        = inst.imm;
+		failure.clean      = inst.clean != 0u;
+		for (uint32_t arg = 0; arg < inst.arg_count && arg < SrtFlatInst::MaxArgs; arg++) {
+			const auto reg           = inst.args[arg];
+			const bool defined       = reg < m_program.insts.size() && m_stamps[reg] == m_epoch;
+			failure.args[arg]        = reg;
+			failure.arg_defined[arg] = defined ? 1u : 0u;
+			failure.arg_values[arg]  = defined ? m_values[reg] : 0u;
+		}
+		failure.address_valid = m_address_valid;
+		failure.address       = m_address;
+		if (inst.op == SrtFlatOp::ReadBuffer && inst.arg_count >= 4) {
+			const auto low      = failure.arg_values[0];
+			const auto high     = failure.arg_values[1];
+			const auto records  = failure.arg_values[2];
+			const auto offset   = failure.arg_values[3];
+			failure.memory_op   = true;
+			failure.base        = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+			failure.byte_offset = inst.imm + static_cast<uint32_t>(offset);
+			failure.stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+			failure.records     = static_cast<uint32_t>(records);
+			failure.bound =
+			    failure.stride == 0u ? failure.records : failure.stride * failure.records;
+			if (!failure.address_valid) {
+				failure.address =
+				    ((failure.base & ~uint64_t {3}) + failure.byte_offset) & ~uint64_t {3};
+				failure.address_valid = true;
+			}
+		} else if (inst.op == SrtFlatOp::ReadAddress && inst.arg_count >= 3) {
+			const auto low       = failure.arg_values[0];
+			const auto high      = failure.arg_values[1];
+			const auto offset    = failure.arg_values[2];
+			failure.memory_op    = true;
+			failure.base         = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+			const auto immediate = static_cast<int64_t>(inst.imm);
+			const auto relative  = (immediate & ~int64_t {3}) +
+			                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+			failure.byte_offset = static_cast<uint64_t>(relative);
+			if (!failure.address_valid) {
+				failure.address       = (failure.base & ~uint64_t {3}) + failure.byte_offset;
+				failure.address_valid = true;
+			}
+		}
+	}
+
 	const SrtFlatProgram& m_program;
 	const SrtRuntime&     m_runtime;
 	uint64_t*             m_values = nullptr;
 	uint64_t*             m_stamps = nullptr;
 	uint64_t              m_epoch  = 0;
+	// Address of the most recent read attempt, cleared before every instruction.
+	mutable uint64_t m_address       = 0;
+	mutable bool     m_address_valid = false;
 };
 
 // The compiled normal context routes ReadConst through the plan's own clean table, so a caller
@@ -1988,6 +2234,7 @@ bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> s
 		if (!skipped && (!evaluate_flat || active[source_index])) {
 			for (uint32_t index = 0; index < source->dword_count; index++) {
 				if (!evaluator.Evaluate(source->dwords[index], value.dwords[index])) {
+					TagFailure("source", source_index, false);
 					return false;
 				}
 			}
@@ -2004,6 +2251,7 @@ bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> s
 			auto&      selected = clean ? clean_evaluator : evaluator;
 			if (read.flat_offset >= flattened.size() ||
 			    !selected.Evaluate(read.value, flattened[read.flat_offset])) {
+				TagFailure("flat-read", read.flat_offset, false);
 				return false;
 			}
 		}
@@ -2050,7 +2298,7 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
 			}
 			const auto& condition = flat.conditions[index];
 			if (!block.condition.IsEmpty() && runtime.read_specialization_memory != nullptr &&
-			    machine.Run(condition)) {
+			    machine.Run(condition)) { // a failed condition is not fatal: both successors run
 				const auto taken = machine.Result(condition.result) != 0u;
 				pending.push_back(block.successors[taken ? 0u : 1u]);
 			} else {
@@ -2074,6 +2322,7 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
 		if (!skipped && (!evaluate_flat || active[source_index])) {
 			const auto& root = flat.sources[source_index];
 			if (!machine.Run(root)) {
+				TagFailure("source", source_index, true);
 				return false;
 			}
 			for (uint32_t index = 0; index < source->dword_count; index++) {
@@ -2092,6 +2341,7 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
 			                   clean_flat_slots[read.flat_offset] != 0u;
 			const auto& root = clean ? flat.clean_flat_reads[index] : flat.flat_reads[index];
 			if (read.flat_offset >= flattened.size() || !machine.Run(root)) {
+				TagFailure("flat-read", static_cast<uint32_t>(index), true);
 				return false;
 			}
 			flattened[read.flat_offset] = machine.Result(root.result);
@@ -2110,10 +2360,12 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	KYTY_PROFILER_BLOCK("EvaluateRuntimeSourcesImpl");
 #endif
 	if (!program.srt_plan_complete) {
+		TagFailure("plan-incomplete", UINT32_MAX, false);
 		return false;
 	}
 	if (runtime.read_specialization_memory == nullptr &&
 	    std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; })) {
+		TagFailure("no-clean-reader", UINT32_MAX, false);
 		return false;
 	}
 	// Nested use cannot happen today (materialization calls this sequentially), but fall back to
@@ -2158,6 +2410,65 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 		*reason = validator.Reason();
 	}
 	return false;
+}
+
+const SrtFailure& LastSrtFailure() {
+	return ThreadFailure();
+}
+
+std::string FormatSrtFailure(const SrtFailure& failure) {
+	if (!failure.valid) {
+		return "no recorded SRT failure";
+	}
+	std::string text = fmt::format("slot={}[{}] evaluator={} root=[{}..{}) root_valid={}",
+	                               failure.kind, failure.index, failure.flat ? "flat" : "walker",
+	                               failure.root_first, failure.root_first + failure.root_count,
+	                               failure.root_valid ? 1 : 0);
+	if (failure.inst_index != UINT32_MAX) {
+		text += fmt::format(" inst=#{} op={} imm={:#x} clean={}", failure.inst_index,
+		                    failure.op_name, failure.imm, failure.clean ? 1 : 0);
+		for (uint32_t arg = 0; arg < failure.arg_count && arg < failure.args.size(); arg++) {
+			text += fmt::format(" arg{}=r{}{}", arg, failure.args[arg],
+			                    failure.arg_defined[arg] != 0u
+			                        ? fmt::format("({:#x})", failure.arg_values[arg])
+			                        : std::string("(undef)"));
+		}
+	}
+	if (failure.memory_op) {
+		text += fmt::format(" base={:#x} byte_offset={:#x} stride={} records={} bound={:#x}",
+		                    failure.base, failure.byte_offset, failure.stride, failure.records,
+		                    failure.bound);
+	}
+	if (failure.address_valid) {
+		text += fmt::format(" address={:#x}", failure.address);
+	}
+	text += fmt::format(" user_data_size={}", failure.user_data_size);
+	if (!failure.trace.empty()) {
+		text += fmt::format(" trace({})", failure.trace.size());
+		for (const auto& entry: failure.trace) {
+			text += fmt::format("\n    {}#{} {} imm={:#x} clean={}", entry.failing ? "*" : " ",
+			                    entry.inst_index, entry.op_name, entry.imm, entry.clean ? 1 : 0);
+			for (uint32_t arg = 0; arg < entry.arg_count && arg < entry.args.size(); arg++) {
+				text += fmt::format(" a{}=r{}{}", arg, entry.args[arg],
+				                    entry.arg_defined[arg] != 0u
+				                        ? fmt::format("({:#x})", entry.arg_values[arg])
+				                        : std::string("(undef)"));
+			}
+			if (entry.address_valid) {
+				text += fmt::format(" @{:#x}", entry.address);
+			}
+			text += entry.defined ? fmt::format(" -> {:#x}", entry.value) : std::string(" -> undef");
+		}
+	}
+	if (!failure.user_data.empty()) {
+		text += " user_data=";
+		bool first = true;
+		for (const auto& [reg, value]: failure.user_data) {
+			text += fmt::format("{}s{}={:#x}", first ? "" : ",", reg, value);
+			first = false;
+		}
+	}
+	return text;
 }
 
 void BuildSrtPlan(Program& program) {

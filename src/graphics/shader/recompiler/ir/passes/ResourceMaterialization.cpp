@@ -600,6 +600,28 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
 	                            flattened_srt, program.clean_flat_slots, active_sources,
 	                            skip_sources)) {
+		if (report != nullptr) {
+			const auto& failure        = LastSrtFailure();
+			report->failure_detail     = FormatSrtFailure(failure);
+			report->failure_address    = failure.address;
+			report->failure_address_valid = failure.address_valid;
+			report->failure_source     = failure.index;
+			for (const auto& entry: failure.trace) {
+				if (entry.address_valid &&
+				    std::ranges::find(report->failure_addresses, entry.address) ==
+				        report->failure_addresses.end()) {
+					report->failure_addresses.push_back(entry.address);
+				}
+			}
+			for (size_t index = 0; index < skip_sources.size(); index++) {
+				if (skip_sources[index] != 0u) {
+					if (!report->skipped_sources.empty()) {
+						report->skipped_sources += ',';
+					}
+					report->skipped_sources += fmt::format("{}", index);
+				}
+			}
+		}
 		return fail("a descriptor source did not evaluate");
 	}
 

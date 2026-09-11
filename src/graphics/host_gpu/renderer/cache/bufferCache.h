@@ -77,6 +77,46 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
+	// Stage 1 diagnostics (docs/gpu-descriptor-fetch.md): everything the caches know about one
+	// guest address, for a materialization failure to print before it exits. Read-only: it never
+	// creates or touches a buffer.
+	struct AddressProbe {
+		uint64_t address        = 0;
+		uint64_t page           = 0;
+		bool     page_mapped    = false; // a BDA page-table entry exists for the 16 KiB page
+		bool     buffer_found   = false;
+		uint64_t buffer_start   = 0;
+		uint64_t buffer_size    = 0;
+		bool     buffer_deleted = false;
+		bool     registered     = false; // a cached buffer covers the dword
+		bool     gpu_modified   = false; // memory tracker: the GPU wrote this page
+		bool     cpu_modified   = false;
+		bool     gpu_dirty      = false; // m_gpu_modified_ranges: unread GPU writes
+		FaultManager::FaultPageStatus fault {};
+	};
+	[[nodiscard]] AddressProbe ProbeAddress(uint64_t address);
+
+	// Stage 1 diagnostics: the last few hundred shader stages that could have written guest
+	// memory, so a stale read can be traced to a writer. Recorded only while --gpu-descriptors
+	// is on. A uses_dma / gpu_descriptors stage stores through the BDA page table and has no
+	// CPU-visible range, so it is recorded with size 0.
+	struct ShaderWrite {
+		uint64_t hash    = 0;
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t serial  = 0;
+		uint32_t stage   = 0;
+		bool     dma     = false;
+		bool     formatted = false;
+		// The stage reads some of its own buffer descriptors in-shader through the BDA page
+		// table, so an unmapped page makes it read zero instead of failing.
+		bool gpu_fetch = false;
+	};
+	void RecordShaderWrite(uint64_t hash, uint32_t stage, uint64_t address, uint64_t size,
+	                       bool dma, bool formatted, bool gpu_fetch);
+	// Writers whose range covers the address, newest first, plus the newest DMA stages.
+	[[nodiscard]] std::vector<ShaderWrite> FindShaderWrites(uint64_t address,
+	                                                        size_t   dma_tail = 8) const;
 	// Reads back and clears the shader descriptor-feedback bits, on the fault-buffer schedule.
 	void               ProcessDescriptorFeedback();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
@@ -158,6 +198,9 @@ private:
 	// faults or invalidates memory, drained on the GPU thread.
 	std::mutex m_bda_dirty_mutex;
 	RangeSet   m_bda_dirty_ranges;
+	static constexpr size_t             ShaderWriteRingSize = 4096;
+	std::vector<ShaderWrite>            m_shader_writes;
+	uint64_t                            m_shader_write_next = 0;
 };
 
 } // namespace Libs::Graphics

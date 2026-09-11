@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <string>
+
 namespace Libs::Graphics {
 class GpuResourceManager;
 enum class PageFaultAccess;
@@ -112,6 +114,10 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
+// Stage 1 diagnostics (docs/gpu-descriptor-fetch.md): what the GPU caches know about one guest
+// address (BDA page-table mapping, owning buffer, dirty state, recent page faults) plus the dword
+// the CPU would read there. GPU thread only; empty when the GPU is not up.
+[[nodiscard]] std::string DescribeGpuAddress(uint64_t vaddr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);

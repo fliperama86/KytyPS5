@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -8,8 +9,10 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -139,6 +142,7 @@ void FaultManager::ProcessFaultBuffer() {
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
+		RecordFaults(std::span(faults + 1, std::min<size_t>(count, MaxPageFaults - 1)));
 		for (uint32_t index = 1; index <= count; ++index) {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
@@ -152,6 +156,57 @@ void FaultManager::ProcessFaultBuffer() {
 
 	m_fault_areas[m_current_area++] = m_scheduler.CurrentTick();
 	m_current_area %= MaxPendingFaults;
+}
+
+// One record per faulted page, newest last. Called from the deferred callback that compacts a
+// processed fault area, so it runs on the thread that retires the submission.
+void FaultManager::RecordFaults(std::span<const uint64_t> pages) {
+	m_fault_passes++;
+	m_window_passes++;
+	m_fault_pages += pages.size();
+	m_window_pages += pages.size();
+	for (const auto address: pages) {
+		const auto page = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+		m_fault_ring[m_fault_ring_next % FaultRingSize] = {page, m_fault_passes};
+		m_fault_ring_next++;
+		constexpr size_t MaxHistory = 1u << 20u;
+		if (m_fault_history.size() < MaxHistory || m_fault_history.contains(page)) {
+			auto& history = m_fault_history[page];
+			if (history.hits == 0) {
+				history.first_pass = m_fault_passes;
+			}
+			history.hits++;
+			history.last_pass = m_fault_passes;
+		}
+	}
+	// Stage 1 bring-up: how much of the guest memory a shader touches is one or more frames late.
+	if (Config::GpuDescriptorsEnabled() && (m_fault_passes % 60) == 0) {
+		std::printf("gpu-descriptors: fault pages %" PRIu64 " in the last %" PRIu64
+		            " processing passes (total %" PRIu64 " over %" PRIu64 ")\n",
+		            m_window_pages, m_window_passes, m_fault_pages, m_fault_passes);
+		std::fflush(stdout);
+		LOGF("gpu-descriptors: fault pages %" PRIu64 " in the last %" PRIu64
+		     " processing passes (total %" PRIu64 " over %" PRIu64 ")\n",
+		     m_window_pages, m_window_passes, m_fault_pages, m_fault_passes);
+		m_window_pages  = 0;
+		m_window_passes = 0;
+	}
+}
+
+FaultManager::FaultPageStatus FaultManager::QueryFaultedPage(uint64_t page) const {
+	FaultPageStatus status {};
+	status.passes      = m_fault_passes;
+	status.pages_total = m_fault_pages;
+	status.ring_pages  = std::min<uint64_t>(m_fault_ring_next, FaultRingSize);
+	status.pages_known = m_fault_history.size();
+	const auto aligned = page & ~(BufferCache::CACHING_PAGESIZE - 1);
+	if (const auto found = m_fault_history.find(aligned); found != m_fault_history.end()) {
+		status.seen       = true;
+		status.hits       = found->second.hits;
+		status.first_pass = found->second.first_pass;
+		status.last_pass  = found->second.last_pass;
+	}
+	return status;
 }
 
 } // namespace Libs::Graphics

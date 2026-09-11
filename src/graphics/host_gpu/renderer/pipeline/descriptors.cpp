@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -860,6 +861,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
 	PackFeedbackSlot(prepared);
+	// Stage 1 diagnostics: a DMA / GPU-fetch stage stores through the BDA page table, so the CPU
+	// sees no range for it. Record the stage itself.
+	if (Config::GpuDescriptorsEnabled() && (program.info.uses_dma || program.info.gpu_descriptors)) {
+		m_context.GetBufferCache().RecordShaderWrite(program.shader_hash,
+		                                             static_cast<uint32_t>(program.stage), 0, 0,
+		                                             program.info.uses_dma, false,
+		                                             program.info.gpu_descriptors);
+	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
@@ -929,6 +938,14 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               program.info.buffers[i], program.stage, i,
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
+		// Stage 1 diagnostics: remember who can have written this range.
+		if (Config::GpuDescriptorsEnabled() && program.info.buffers[i].written &&
+		    prepared.buffer_sources[i].size != 0) {
+			m_context.GetBufferCache().RecordShaderWrite(
+			    program.shader_hash, static_cast<uint32_t>(program.stage),
+			    prepared.buffer_sources[i].address, prepared.buffer_sources[i].size, false,
+			    program.info.buffers[i].formatted, program.info.gpu_descriptors);
+		}
 	}
 	// The memory-offset fill above covers the feedback slot dword, so restore it.
 	PackFeedbackSlot(prepared);

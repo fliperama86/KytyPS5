@@ -3,8 +3,10 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -49,6 +51,16 @@ struct MaterializeReport {
 	uint32_t    dropped_candidates = 0;
 	uint32_t    dropped_shapes     = 0;
 	std::string dropped_summary;
+	// Stage 1 diagnostics (docs/gpu-descriptor-fetch.md): set when a descriptor source failed to
+	// evaluate, so the renderer can say what happened to the page the walk tried to read.
+	std::string failure_detail;
+	uint64_t    failure_address       = 0;
+	bool        failure_address_valid = false;
+	uint32_t    failure_source        = UINT32_MAX;
+	// Skipped (gpu_fetch) sources of the plan that failed, as "3,7" or empty.
+	std::string skipped_sources;
+	// Every guest address the failing root read, oldest first, for the caller to look up.
+	std::vector<uint64_t> failure_addresses;
 };
 
 // Buffer resources the shader evaluates for itself (docs/gpu-descriptor-fetch.md, stage 1). The

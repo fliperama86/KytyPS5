@@ -168,6 +168,25 @@ bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
 void ReportMaterialization(const char* label, ShaderType stage, uint64_t hash,
                            const ShaderRecompiler::IR::MaterializeReport& report, bool ok) {
 	if (!ok) {
+		// Stage 1 bring-up (docs/gpu-descriptor-fetch.md). The failure is fatal either way; before
+		// going down, name the read that failed and say what the GPU caches know about its page,
+		// so a dropped GPU write to an unmapped BDA page can be told apart from a bad walk.
+		if (!report.failure_detail.empty()) {
+			PipelineCacheLog("gpu-descriptors: materialization failure stage={} hash={:#018x} "
+			                 "skipped_sources=[{}] {}",
+			                 static_cast<uint32_t>(stage), hash, report.skipped_sources,
+			                 report.failure_detail);
+			if (report.failure_address_valid) {
+				PipelineCacheLog("gpu-descriptors: failing read {}",
+				                 Libs::LibKernel::Memory::DescribeGpuAddress(
+				                     report.failure_address));
+			}
+			for (const auto address: report.failure_addresses) {
+				PipelineCacheLog("gpu-descriptors: walked read {}",
+				                 Libs::LibKernel::Memory::DescribeGpuAddress(address));
+			}
+			std::fflush(stdout);
+		}
 		EXIT("shader resource materialization failed: stage=%u hash=0x%016" PRIx64 " reason=%s\n",
 		     static_cast<uint32_t>(stage), hash, report.reason.c_str());
 	}

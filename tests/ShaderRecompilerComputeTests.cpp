@@ -39,6 +39,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -51,6 +52,8 @@
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.hpp"
+
+#include "SrtSyntheticPlans.h"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
 #error "legacy render-target barrier API must remain deleted"
@@ -14635,6 +14638,162 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
   std::printf("[graphics] %-31s ok\n", test.name);
+}
+
+// Runs every descriptor source of a synthetic plan twice: once through the CPU evaluator
+// (CompileSrtPlan's flat program, cross-checked against the IR walker) and once through the
+// SPIR-V lowering of the same flat program, then compares the eight dwords bit for bit.
+//
+// Guest memory is one page at a low fake guest address mapped into the BDA page table, so the
+// CPU side must read it through the evaluator's read_memory callback: the page table only covers
+// 40 bits and host pointers sit far above that, so the direct-dereference path production uses
+// cannot be exercised here.
+void CheckSrtFlatProgramSpirvLowering(VulkanHarness *vulkan) {
+  namespace SpirvEmitter = ShaderRecompiler::Spirv::Emitter;
+  namespace SrtIR = ShaderRecompiler::IR;
+  static_assert(SrtSynthetic::PageBytes == BufferCache::CACHING_PAGESIZE,
+                "the synthetic guest page must match the BDA page size");
+  const char *name = "SrtFlatProgramSpirv";
+
+  auto built = SrtSynthetic::BuildSyntheticPlan();
+  Require(name, "flat program", built.plan.flat.compiled,
+          "CompileSrtPlan did not lower the synthetic plan");
+  Require(name, "flat program",
+          built.plan.flat.sources.size() == built.plan.descriptor_sources.size(),
+          "the flat program has the wrong descriptor source count");
+  Require(name, "flat program",
+          built.case_names.size() * SrtSynthetic::SourceStride <=
+              SrtSynthetic::OutputDwords,
+          "the synthetic plan needs more output space than the backing page");
+
+  // ---- CPU reference ------------------------------------------------------
+  const SrtIR::SrtRuntime runtime{
+      .user_data = built.user_data,
+      .shader_base = SrtSynthetic::ShaderBase,
+      .read_memory = SrtSynthetic::ReadGuestMemory,
+      .userdata = &built.backing,
+  };
+  struct Reference {
+    bool ok = false;
+    std::array<u32, 8> dwords{};
+    u32 count = 0;
+  };
+  std::vector<Reference> cpu(built.plan.descriptor_sources.size());
+  for (u32 index = 0; index < cpu.size(); index++) {
+    SrtIR::DescriptorValue flat_value;
+    built.plan.flat.compiled = true;
+    const bool flat_ok =
+        SrtIR::EvaluateDescriptorSource(built.plan, index, runtime, flat_value);
+    SrtIR::DescriptorValue walker_value;
+    built.plan.flat.compiled = false;
+    const bool walker_ok = SrtIR::EvaluateDescriptorSource(built.plan, index,
+                                                           runtime, walker_value);
+    built.plan.flat.compiled = true;
+    Require(name, "flat vs walker",
+            flat_ok == walker_ok && (!flat_ok || flat_value == walker_value),
+            built.case_names[index] +
+                ": the flat program disagrees with the IR walker");
+    cpu[index].ok = flat_ok;
+    cpu[index].dwords = flat_value.dwords;
+    cpu[index].count = built.dword_counts[index];
+  }
+
+  // ---- a stub shader, only to obtain a matching binding layout ------------
+  // The SRT module reuses the compiled program's descriptor groups, so the stub has to request
+  // the same ones: user data registers 0..7, the BDA page table and one storage buffer.
+  std::vector<u32> code;
+  for (u32 reg = 0; reg < 8u; reg++) {
+    AppendStoreSgpr(&code, reg, reg);
+  }
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeFlat0(0x0c, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendStoreVgpr(&code, 0, 8);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = name;
+  test.code = std::move(code);
+  test.initial = built.backing;
+  test.user_data = built.user_data;
+  // The stub's BUFFER_STORE_DWORD reads its V# from user data 48..51.
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.bda_mappings = {
+      {SrtSynthetic::GuestBase, SrtSynthetic::OutputDwords * 4u}};
+
+  auto compiled = CompileCase(test, vulkan->SubgroupSize());
+  using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+  Require(name, "bindings",
+          ShaderRecompiler::IR::FindBinding(compiled.program.bindings,
+                                            Kind::BdaPagetable) != nullptr,
+          "the stub shader did not request the BDA page table");
+  Require(name, "bindings",
+          compiled.program.bindings.user_data_registers.size() >= 8 &&
+              compiled.program.user_data_base == 0,
+          "the stub shader did not pin user data registers 0..7");
+
+  auto compute_info = test.compute_info;
+  compute_info.host_subgroup_size = vulkan->SubgroupSize();
+  ShaderStageInputInfo input_info{};
+  input_info.compute = &compute_info;
+
+  SpirvEmitter::SrtLoweringInputs inputs{};
+  inputs.shader_base = SrtSynthetic::ShaderBase;
+  compiled.spirv = SpirvEmitter::EmitSrtFlatProgramTestModule(
+      compiled.program, input_info, built.plan.flat, built.dword_counts, inputs,
+      SrtSynthetic::SourceStride);
+  Require(name, "SPIR-V emit", !compiled.spirv.empty(),
+          "the SRT lowering produced an empty module");
+  ValidateSpirv(name, compiled.spirv);
+
+  auto buffer = vulkan->CreateStorageBuffer(name, test.initial,
+                                            SrtSynthetic::BackingDwords, true);
+  vulkan->Dispatch(test, compiled, buffer);
+  const auto actual =
+      vulkan->ReadBuffer(name, buffer, SrtSynthetic::OutputDwords);
+  vulkan->DestroyBuffer(&buffer);
+
+  std::vector<std::string> differences;
+  for (u32 index = 0; index < cpu.size(); index++) {
+    const auto base = index * SrtSynthetic::SourceStride;
+    const auto &title = built.case_names[index];
+    Require(name, "lowering",
+            actual[base + SrtSynthetic::LoweredSlot] != 0u,
+            title + ": the SPIR-V lowering rejected a step of this root");
+    const bool gpu_ok = actual[base + SrtSynthetic::ValidWordSlot] != 0u;
+    if (gpu_ok != cpu[index].ok) {
+      differences.push_back(title + ": CPU " +
+                            (cpu[index].ok ? "produced values" : "failed") +
+                            " but the shader " +
+                            (gpu_ok ? "produced values" : "failed"));
+      std::printf("[srt]     %-30s FAIL (validity)\n", title.c_str());
+      continue;
+    }
+    bool matched = true;
+    if (cpu[index].ok) {
+      for (u32 dword = 0; dword < cpu[index].count; dword++) {
+        if (actual[base + dword] != cpu[index].dwords[dword]) {
+          differences.push_back(title + ": dword " + std::to_string(dword) +
+                                " cpu=" + Hex(cpu[index].dwords[dword]) +
+                                " gpu=" + Hex(actual[base + dword]));
+          matched = false;
+        }
+      }
+    }
+    std::printf("[srt]     %-30s %s (%s)\n", title.c_str(),
+                matched ? "ok" : "FAIL",
+                cpu[index].ok ? "values" : "both reject");
+  }
+  if (!differences.empty()) {
+    std::string joined;
+    for (const auto &difference : differences) {
+      joined += "\n  " + difference;
+    }
+    Fail(name, "comparison", joined);
+  }
+  std::printf("[srt]     %-30s ok (%zu sources)\n", name, cpu.size());
 }
 
 enum class CoverageClass {
@@ -30286,6 +30445,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaGenerationCaching();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--srt-flat-spirv-only") == 0) {
+    VulkanHarness vulkan;
+    CheckSrtFlatProgramSpirvLowering(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -30450,6 +30614,7 @@ int main(int argc, char **argv) {
 #endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
+  CheckSrtFlatProgramSpirvLowering(&vulkan);
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);

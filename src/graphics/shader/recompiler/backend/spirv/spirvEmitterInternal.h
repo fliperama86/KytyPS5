@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -780,6 +781,41 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+
+// Resolves a guest address through the BDA page table, shared with the SRT lowering. The result
+// is zero when the page is not resident, and the lookup records a fault for the host to service.
+uint32_t EmitBdaPointer(ValueEmitContext& ctx, uint32_t address);
+
+// SRT flat-program lowering (spike, see spirvEmitterSrt.cpp). FlatMachine in SrtWalker.cpp is the
+// specification these emit against.
+struct SrtLoweringInputs {
+	// GetShaderBase is a per-draw constant on the CPU side; the caller supplies its value.
+	uint64_t shader_base = 0;
+};
+
+struct SrtLoweredRoot {
+	// One id per result register, each a scalar 64-bit unsigned holding the bits FlatMachine
+	// would have left in that register.
+	std::array<uint32_t, 8> results {};
+	uint32_t                count = 0;
+	// Bool id, false exactly where FlatMachine::Run would have returned false.
+	uint32_t                valid = 0;
+	// False when the root contains a step with no shader-side lowering at all.
+	bool                    supported = true;
+};
+
+SrtLoweredRoot EmitSrtFlatRoot(ValueEmitContext& ctx, const IR::SrtFlatProgram& program,
+                               const IR::SrtFlatRoot& root, std::span<const uint32_t> results,
+                               const SrtLoweringInputs& inputs);
+
+// Test-only standalone compute module: runs every descriptor-source root and stores each source's
+// dwords, its validity word and its "lowered" word into storage buffer 0 at `source_stride`.
+std::vector<uint32_t> EmitSrtFlatProgramTestModule(const IR::Program& program,
+                                                   ShaderStageInputInfo      input_info,
+                                                   const IR::SrtFlatProgram& flat,
+                                                   std::span<const uint32_t> dword_counts,
+                                                   const SrtLoweringInputs&  inputs,
+                                                   uint32_t                  source_stride);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

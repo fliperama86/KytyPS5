@@ -1008,6 +1008,10 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 
 } // namespace
 
+uint32_t EmitBdaPointer(ValueEmitContext& ctx, uint32_t address) {
+	return GetBdaPointer(ctx, address);
+}
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;

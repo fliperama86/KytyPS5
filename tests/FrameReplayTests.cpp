@@ -4,9 +4,10 @@
 //   frame_replay_tests --write-capture D  writes a minimal valid capture into directory D
 //
 // The synthetic capture is what src/graphics/replay/frameReplay.cpp is exercised against without
-// the game: three committed ranges, a handful of non-zero pages, an empty dirty set, a zeroed
-// graphics register file, one video-out registration of a small 2D buffer, and a submission
-// stream of NOP packets followed by a flip preparation and a Done. See docs/frame-replay.md.
+// the game: three committed ranges, a handful of non-zero pages, an empty dirty-page set, a few
+// CPU-dirty events, a zeroed graphics register file, one video-out registration of a small 2D
+// buffer, and a submission stream of NOP packets followed by a flip preparation and a Done. See
+// docs/frame-replay.md.
 
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/replay/frameCaptureReader.h"
@@ -118,6 +119,18 @@ RangeRecord MakeRange(uint64_t vaddr, uint64_t size, uint32_t prot, uint32_t typ
 	return record;
 }
 
+// The frame's CPU-dirty marks: one before the first draw, then two during it. `submission` is
+// carried for people reading the stream; nothing in the reader looks at it.
+std::vector<DirtyEventRecord> DirtyEvents() {
+	std::vector<DirtyEventRecord> events;
+	events.push_back({0, 0, SCRATCH_ADDRESS, 0x1000});
+	events.push_back({3, 1, SCRATCH_ADDRESS + 0x1000, 0x40});
+	events.push_back({17, 2, DISPLAY_ADDRESS, 0x2000});
+	return events;
+}
+
+constexpr uint32_t PROGRESS_EVENTS = 21;
+
 // A PM4 type-3 NOP: KYTY_PM4(2, IT_NOP, 0) followed by one payload dword the parser skips.
 constexpr uint32_t PM4_NOP_HEADER = 0xc0001000u;
 
@@ -175,11 +188,23 @@ bool WriteCapture(const std::filesystem::path& dir) {
 		page_count++;
 	}
 
-	// The captured frame dirtied nothing on the CPU.
+	// The captured frame leaves nothing CPU-dirty at its end, so dirty-pages.bin is empty; the
+	// v3 event stream still carries the marks that arrived during it, one before the first draw
+	// and two keyed to the progress clock.
 	{
 		Writer writer(dir / "dirty-pages.bin");
 		if (!writer.Ok()) {
 			return false;
+		}
+	}
+
+	{
+		Writer writer(dir / "dirty-events.bin");
+		if (!writer.Ok()) {
+			return false;
+		}
+		for (const auto& event: DirtyEvents()) {
+			writer.Value(event);
 		}
 	}
 
@@ -282,6 +307,8 @@ bool WriteCapture(const std::filesystem::path& dir) {
 		manifest << "  \"width\": " << DISPLAY_WIDTH << ", \"height\": " << DISPLAY_HEIGHT << ",\n";
 		manifest << "  \"ranges\": " << ranges.size() << ", \"pages\": " << page_count
 		         << ", \"dirty_pages\": 0, \"submissions\": " << submission_count << ",\n";
+		manifest << "  \"dirty_events\": " << DirtyEvents().size()
+		         << ", \"progress_events\": " << PROGRESS_EVENTS << ",\n";
 		manifest << "  \"gaps\": []\n";
 		manifest << "}\n";
 	}
@@ -317,7 +344,12 @@ void RunTests(const std::filesystem::path& root) {
 	CHECK(manifest.frame == 7);
 	CHECK(CaptureReader::ParseManifest("{\"format_version\": 1}", &manifest, &error));
 	CHECK(manifest.format_version == 1);
-	CHECK(!CaptureReader::ParseManifest("{\"format_version\": 3}", &manifest, &error));
+	CHECK(CaptureReader::ParseManifest(
+	    "{\"format_version\": 3, \"dirty_events\": 12, \"progress_events\": 34}", &manifest,
+	    &error));
+	CHECK(manifest.dirty_events == 12);
+	CHECK(manifest.progress_events == 34);
+	CHECK(!CaptureReader::ParseManifest("{\"format_version\": 4}", &manifest, &error));
 	CHECK(error.find("version") != std::string::npos);
 	CHECK(!CaptureReader::ParseManifest("{\"frame\": 1}", &manifest, &error));
 
@@ -336,6 +368,22 @@ void RunTests(const std::filesystem::path& root) {
 	std::vector<uint64_t> dirty;
 	CHECK(reader.ReadDirtyPages(&dirty, &error));
 	CHECK(dirty.empty());
+
+	CHECK(reader.Manifest().dirty_events == DirtyEvents().size());
+	CHECK(reader.Manifest().progress_events == PROGRESS_EVENTS);
+
+	std::vector<DirtyEventRecord> events;
+	bool                          events_present = false;
+	CHECK(reader.ReadDirtyEvents(&events, &events_present, &error));
+	CHECK(events_present);
+	CHECK(events.size() == 3);
+	CHECK(events[0].progress == 0);
+	CHECK(events[0].vaddr == SCRATCH_ADDRESS);
+	CHECK(events[0].size == 0x1000);
+	CHECK(events[1].progress == 3);
+	CHECK(events[1].submission == 1);
+	CHECK(events[2].progress == 17);
+	CHECK(events[2].vaddr == DISPLAY_ADDRESS);
 
 	std::vector<CaptureRegisterFile> register_files;
 	CHECK(reader.ReadRegisterFiles(&register_files, &error));
@@ -424,6 +472,7 @@ void RunTests(const std::filesystem::path& root) {
 	CopyCapture(good, legacy);
 	std::filesystem::remove(legacy / "prt.bin", ec);
 	std::filesystem::remove(legacy / "shaders.bin", ec);
+	std::filesystem::remove(legacy / "dirty-events.bin", ec);
 	ReplaceManifestVersion(legacy, "{\"format_version\": 1, \"frame\": 5}\n");
 	{
 		CaptureReader legacy_reader;
@@ -438,6 +487,12 @@ void RunTests(const std::filesystem::path& root) {
 		CHECK(legacy_reader.ReadShaders(&no_shaders, &legacy_present, &error));
 		CHECK(!legacy_present);
 		CHECK(no_shaders.empty());
+		std::vector<DirtyEventRecord> no_events;
+		CHECK(legacy_reader.ReadDirtyEvents(&no_events, &legacy_present, &error));
+		CHECK(!legacy_present);
+		CHECK(no_events.empty());
+		CHECK(legacy_reader.Manifest().dirty_events == 0);
+		CHECK(legacy_reader.Manifest().progress_events == 0);
 	}
 
 	// A truncated optional stream is still an error.
@@ -450,6 +505,16 @@ void RunTests(const std::filesystem::path& root) {
 		bool                           short_present = false;
 		CHECK(!short_reader.ReadPrtApertures(&records, &short_present, &error));
 		CHECK(error.find("prt.bin") != std::string::npos);
+	}
+	{
+		const auto size = std::filesystem::file_size(truncated / "dirty-events.bin", ec);
+		TruncateFile(truncated / "dirty-events.bin", size - 7);
+		CaptureReader short_reader;
+		CHECK(short_reader.Open(truncated, &error));
+		std::vector<DirtyEventRecord> records;
+		bool                          short_present = false;
+		CHECK(!short_reader.ReadDirtyEvents(&records, &short_present, &error));
+		CHECK(error.find("dirty-events.bin") != std::string::npos);
 	}
 
 	// A capture from a different format version is rejected before anything is restored.

@@ -18,10 +18,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -330,6 +333,121 @@ void Fail(const std::string& message) {
 	LOGF_COLOR(Log::Color::BrightRed, "replay: %s\n", message.c_str());
 }
 
+// A guest range the memory tracker will accept (regionDefinitions.h, GuestRange::Valid). A
+// recorded event always satisfies it, but a hand-edited stream must not take the process down.
+constexpr uint64_t GUEST_ADDRESS_LIMIT = 1ull << 40u;
+
+bool IsMarkableRange(uint64_t vaddr, uint64_t size) noexcept {
+	return vaddr != 0 && size != 0 && vaddr < GUEST_ADDRESS_LIMIT &&
+	       size <= GUEST_ADDRESS_LIMIT - vaddr;
+}
+
+// The marker thread spins on the GPU thread's progress counter, which moves tens of thousands of
+// times per loop, so latency matters more than the core it costs; it yields occasionally anyway
+// so it cannot starve the machine if the counter stalls.
+void SpinPause() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	YieldProcessor();
+#else
+	std::this_thread::yield();
+#endif
+}
+
+// Replays the frame's CPU writes *when* they happened (docs/frame-replay.md, phase D).
+//
+// In the game the guest dirties pages throughout the frame, interleaved with the GPU thread's
+// draws, and every mark advances the BDA generation, so PrepareBda rescans hundreds of times a
+// frame. A replay that re-marks the whole recorded set in one batch before the frame bumps the
+// generation a couple of dozen times and misses most of that cost. This thread walks the recorded
+// events in arrival order, waits until the GPU thread's progress clock has reached the value the
+// event carries, and marks the range the way the game's invalidation path does.
+//
+// A loop that outruns the events is not an error: Finish() stops the waiting, marks whatever is
+// left at once and reports how many were late, which is what the replay report prints.
+class DirtyEventMarker final {
+public:
+	DirtyEventMarker(BufferCache& cache, std::vector<DirtyEventRecord> events)
+	    : m_cache(cache), m_events(std::move(events)) {
+		m_thread = std::thread([this] { Run(); });
+	}
+
+	~DirtyEventMarker() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_quit = true;
+		}
+		m_start.notify_one();
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(DirtyEventMarker);
+
+	void Start() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_abandon.store(false, std::memory_order_relaxed);
+			m_late    = 0;
+			m_running = true;
+		}
+		m_start.notify_one();
+	}
+
+	[[nodiscard]] uint64_t Finish() {
+		m_abandon.store(true, std::memory_order_relaxed);
+		std::unique_lock lock(m_mutex);
+		m_finished.wait(lock, [this] { return !m_running; });
+		return m_late;
+	}
+
+private:
+	void Run() {
+		for (;;) {
+			std::unique_lock lock(m_mutex);
+			m_start.wait(lock, [this] { return m_running || m_quit; });
+			if (m_quit) {
+				return;
+			}
+			lock.unlock();
+
+			uint64_t late = 0;
+			for (const auto& event: m_events) {
+				uint32_t spins = 0;
+				while (GuestGpu::Progress() < event.progress) {
+					if (m_abandon.load(std::memory_order_relaxed)) {
+						late++;
+						break;
+					}
+					if ((++spins & 0x3ffu) == 0) {
+						std::this_thread::yield();
+					} else {
+						SpinPause();
+					}
+				}
+				m_cache.MarkRegionAsCpuModified(event.vaddr, event.size);
+			}
+
+			lock.lock();
+			m_late    = late;
+			m_running = false;
+			lock.unlock();
+			m_finished.notify_one();
+		}
+	}
+
+	BufferCache&                  m_cache;
+	std::vector<DirtyEventRecord> m_events;
+	std::thread                   m_thread;
+	std::mutex                    m_mutex;
+	std::condition_variable       m_start;
+	std::condition_variable       m_finished;
+	std::atomic_bool              m_abandon {false};
+	uint64_t                      m_late    = 0;
+	bool                          m_running = false;
+	bool                          m_quit    = false;
+};
+
 // One contiguous run of recorded dirty pages, so a loop re-marks them with a handful of calls.
 std::vector<RestoredRange> CoalescePages(std::vector<uint64_t> pages) {
 	std::sort(pages.begin(), pages.end());
@@ -629,6 +747,27 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	}
 	const auto dirty_ranges = CoalescePages(dirty_pages);
 
+	// 3e. Dirty events (format version 3): the same CPU writes with the moment they arrived, keyed
+	// to the GPU thread's progress clock. Without them the loop can only re-mark everything in one
+	// batch, which is why the phase C A/B did not reproduce (docs/frame-replay.md).
+	std::vector<DirtyEventRecord> dirty_events;
+	bool                          dirty_events_present = false;
+	if (!reader.ReadDirtyEvents(&dirty_events, &dirty_events_present, &error)) {
+		Fail(error);
+		return 1;
+	}
+	std::vector<DirtyEventRecord> pre_events;
+	std::vector<DirtyEventRecord> timed_events;
+	uint64_t                      skipped_events = 0;
+	for (const auto& event: dirty_events) {
+		if (!IsMarkableRange(event.vaddr, event.size)) {
+			skipped_events++;
+			continue;
+		}
+		(event.progress == 0 ? pre_events : timed_events).push_back(event);
+	}
+	const bool use_events = dirty_events_present && !dirty_events.empty();
+
 	::printf("  registers      %zu command processors, %zu bytes each\n", register_files.size(),
 	         expected_register_size);
 	::printf("  video-out      %zu registrations, handle %d, flip index %d\n", video_out.size(),
@@ -636,6 +775,16 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	::printf("  submissions    %zu records (%zu graphics, %zu compute, %zu flips)\n",
 	         submissions.size(), graphics_count, compute_count, flip_count);
 	::printf("  dirty pages    %zu in %zu ranges\n", dirty_pages.size(), dirty_ranges.size());
+	if (use_events) {
+		::printf("  dirty events   %zu (%zu before the first draw, %zu timed) over %llu draws%s\n",
+		         dirty_events.size(), pre_events.size(), timed_events.size(),
+		         static_cast<unsigned long long>(reader.Manifest().progress_events),
+		         skipped_events != 0 ? " (some out of range, skipped)" : "");
+	} else {
+		::printf("  dirty events   none recorded (format version %u); the whole dirty set is "
+		         "re-marked in one batch, which under-counts the BDA scan\n",
+		         reader.Manifest().format_version);
+	}
 	::fflush(stdout);
 
 	// 4. Loop.
@@ -649,8 +798,27 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	gpu_ms.reserve(loops);
 	const auto run_start = Clock::now();
 
+	std::unique_ptr<DirtyEventMarker> marker;
+	if (use_events) {
+		marker = std::make_unique<DirtyEventMarker>(buffer_cache, timed_events);
+	}
+	uint64_t              late_events = 0;
+	std::vector<uint32_t> progress_reached;
+	progress_reached.reserve(loops);
+
 	for (uint32_t loop = 0; loop < loops; loop++) {
-		if (!dirty_ranges.empty()) {
+		if (use_events) {
+			// Everything the guest wrote before the frame's first draw, on the GPU thread and outside
+			// the timing, exactly where the batch path used to put the whole set.
+			if (!pre_events.empty()) {
+				gpu.SendCommandSync([&]() {
+					for (const auto& event: pre_events) {
+						buffer_cache.MarkRegionAsCpuModified(event.vaddr, event.size);
+					}
+				});
+			}
+			marker->Start();
+		} else if (!dirty_ranges.empty()) {
 			gpu.SendCommandSync([&]() {
 				for (const auto& range: dirty_ranges) {
 					buffer_cache.MarkRegionAsCpuModified(range.start, range.size);
@@ -686,10 +854,20 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 		const uint32_t timeout = loop == 0 ? WARMUP_TIMEOUT_MS : WAIT_TIMEOUT_MS;
 		if (!gpu.WaitForIdleFor(timeout)) {
 			g_wait_diagnostics.store(false, std::memory_order_relaxed);
+			if (marker) {
+				(void)marker->Finish();
+			}
 			Fail("the GPU thread did not finish loop " + std::to_string(loop + 1) + " within " +
 			     std::to_string(timeout) + " ms: " + DescribeLastBlockedWait());
 			return 1;
 		}
+		progress_reached.push_back(GuestGpu::Progress());
+		// The marks still waiting are marked now, inside the loop's timing, and counted: a loop that
+		// outran the recorded events is a loop whose BDA-scan count is too low, and the report says so.
+		if (marker) {
+			late_events += marker->Finish();
+		}
+		// Done() resets the progress clock, so it must come after Finish().
 		gpu.Done();
 		const auto gpu_done = MillisSince(loop_start);
 		// The title flips from its own command stream, so there is no recorded buffer index to
@@ -721,6 +899,16 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	}
 	PrintStats("ms/loop", loop_stats);
 	PrintStats("ms/loop gpu", gpu_stats);
+	if (use_events) {
+		const auto reached = progress_reached.empty() ? 0u : progress_reached.back();
+		::printf("  dirty events   %llu late of %zu timed (%.2f%%), progress %u of %llu recorded\n",
+		         static_cast<unsigned long long>(late_events), timed_events.size() * loop_ms.size(),
+		         timed_events.empty() || loop_ms.empty()
+		             ? 0.0
+		             : 100.0 * static_cast<double>(late_events) /
+		                   static_cast<double>(timed_events.size() * loop_ms.size()),
+		         reached, static_cast<unsigned long long>(reader.Manifest().progress_events));
+	}
 	::printf("  total          %.3f s\n", run_ms / 1000.0);
 	::fflush(stdout);
 
@@ -738,6 +926,12 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 		report << "  \"restore_bytes\": " << pages_written * kPageSize << ",\n";
 		report << "  \"submissions\": " << submissions.size() << ",\n";
 		report << "  \"dirty_pages\": " << dirty_pages.size() << ",\n";
+		report << "  \"dirty_events\": " << dirty_events.size() << ",\n";
+		report << "  \"dirty_events_timed\": " << timed_events.size() << ",\n";
+		report << "  \"dirty_events_late\": " << late_events << ",\n";
+		report << "  \"progress_events_captured\": " << reader.Manifest().progress_events << ",\n";
+		report << "  \"progress_events_replayed\": "
+		       << (progress_reached.empty() ? 0u : progress_reached.back()) << ",\n";
 		report << "  \"loop_ms\": " << JsonSamples(loop_ms) << ",\n";
 		report << "  \"gpu_ms\": " << JsonSamples(gpu_ms) << ",\n";
 		report << "  \"summary\": " << JsonStats(loop_stats) << ",\n";

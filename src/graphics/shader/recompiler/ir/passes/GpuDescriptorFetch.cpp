@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "graphics/shader/recompiler/ir/passes/GpuDescriptorFetch.h"
 
 #include "common/emulatorConfig.h"
@@ -22,6 +23,20 @@ void MarkGpuFetchBuffers(Program& program) {
 	// lowers. Building it twice costs a little compile time and keeps the two sides identical.
 	auto plan = ExtractResourcePlan(program);
 	if (!plan.flat.compiled) {
+		return;
+	}
+	// A shader with side effects stays on the CPU path entirely. A fetched read that misses
+	// (unmapped page, invalid root) yields zero, which is one wrong frame for a consumer but
+	// permanent for a producer: docs/investigations/gpu-descriptors-stage1-crash-2026-09-11.md
+	// shows a compute shader storing a null V# it derived from such a read, which a later CPU
+	// walk then dies on.
+	const bool side_effects =
+	    program.info.uses_dma ||
+	    std::ranges::any_of(program.info.buffers,
+	                        [](const BufferResource& b) { return b.written || b.atomic; }) ||
+	    std::ranges::any_of(program.info.images,
+	                        [](const ImageResource& i) { return i.written || i.atomic; });
+	if (side_effects) {
 		return;
 	}
 	bool any = false;

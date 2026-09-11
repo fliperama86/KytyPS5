@@ -160,6 +160,46 @@ Where each piece of the host half lives.
   `gpu_fetch_feedback_bits` and `gpu_fetch_programs_pinned` in the JSON summary, and one console
   line every 600 frames with the run totals and the window since the previous line.
 
+### Stage 1 measured, September 11, 2026
+
+Parked Nexus, Remote Desktop session, same build, 4 minute warm-up, 30 s sample:
+
+| run | FPS | GPU busy |
+| --- | --- | --- |
+| `--gpu-descriptors false` | 10.85 | 27% |
+| `--gpu-descriptors true` | 9.81 | 29% |
+
+The GPU path was taken for about 9,300 draws per frame, with zero feedback mismatches and zero
+pinned programs, and the picture is correct (`_Runtime/_Diagnostics/gpufetch/real3.png`). Compute
+shaders are excluded: a fetched read that misses yields zero, which is one wrong frame for a
+consumer but permanent for a producer, and the game's descriptor-building compute shader stored a
+null V# that a later CPU walk died on
+(investigations/gpu-descriptors-stage1-crash-2026-09-11.md).
+
+The Tracy self-time profile of the steady state (`real3-self.csv`) says why it is slower, not
+faster:
+
+- `EvaluateRuntimeSourcesImpl` is still 26% of the render thread at 1.4 µs per stage event,
+  unchanged. The flattened SRT scalar reads (`srt_reads`, about two thirds of the reads per
+  event in the stats dump) still run on the CPU, and they share the pointer chase with the
+  descriptor roots. Skipping the roots only saves the four adjacent V# dwords at the end of a
+  chain that is walked anyway.
+- `GpuResourceManager::SynchronizeBdaBuffers` is 10%, new: `PrepareBda` runs before every draw
+  of a fetched program and the generation changes often enough for about 340 real scans per
+  frame at 30 µs each.
+
+What stage 1 needs to pay off, both foreseeable from the stats dump:
+
+1. Move the flattened SRT reads in-shader as well: the same lowering over the `flat_reads`
+   roots, the shader reading through BDA instead of the `FlattenedSrt` binding. Then the CPU
+   evaluation for a fetched program is images, samplers and conditions only.
+2. Make the per-draw dirty sync cheap: track dirtied pages as a small list instead of scanning
+   dirty ranges against mapped ranges on every generation change.
+
+Projected from the profile: 26% + 10% of the thread down to a few percent, about 16 FPS in this
+scene. Bring-up diagnostics (permutation log, CPU retry, fault ring, stub) are in the tree behind
+the setting and are cheap to keep until the stage is settled.
+
 ### Stage 2: vertex fetch in-shader
 
 The vertex shader reads vertex data through BDA using the V#s from its own roots, fetch-shader

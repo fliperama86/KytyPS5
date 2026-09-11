@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/guestPageWatch.h"
 #if defined(TRACY_ENABLE)
 #include "common/profiler.h"
 #endif
@@ -17,6 +18,7 @@
 #include <memory_resource>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -1240,6 +1242,16 @@ public:
 		     index++) {
 			ValueRoot(out.uniform_values[index], fill.values[index], CleanContext);
 		}
+		// Collected after every root is lowered, so it covers the whole instruction array.
+		for (const auto& inst: out.insts) {
+			if (inst.op == SrtFlatOp::UserData) {
+				out.user_data_regs.push_back(static_cast<uint32_t>(inst.imm));
+			}
+		}
+		std::ranges::sort(out.user_data_regs);
+		out.user_data_regs.erase(
+		    std::unique(out.user_data_regs.begin(), out.user_data_regs.end()),
+		    out.user_data_regs.end());
 		out.compiled = m_supported;
 	}
 
@@ -1600,6 +1612,70 @@ private:
 	bool                                   m_supported  = true;
 };
 
+// Largest number of distinct guest pages one evaluation may touch and still be cacheable. The
+// probe measured a median of four and a maximum of fourteen per key in the parked Nexus.
+constexpr uint32_t MaxTracedPages = 16;
+
+// A page whose generation moved this often within one frame is written per draw. Re-arming it
+// would turn every draw into a page fault, which costs more than evaluating.
+constexpr uint32_t HotPageBumps = 8;
+
+bool HotPage(uint64_t page, uint32_t generation) noexcept;
+
+// Records which guest pages one evaluation read, arms each of them before the load that reads it,
+// and remembers the generation it saw. A clean read goes through the GPU caches, whose state no
+// page generation describes, so an evaluation that took one is never cached.
+struct SrtPageTrace {
+	// Deliberately uninitialised: only the first `count` entries are ever read, and zeroing both
+	// arrays costs more than the evaluation saves on the calls that never cache.
+	std::array<uint64_t, MaxTracedPages> pages;
+	std::array<uint32_t, MaxTracedPages> generations;
+	uint32_t                             count       = 0;
+	bool                                 uncacheable = false;
+	bool                                 clean_read  = false;
+
+	void Touch(uint64_t page) noexcept {
+		for (uint32_t index = 0; index < count; index++) {
+			if (pages[index] == page) {
+				return;
+			}
+		}
+		if (count == MaxTracedPages) {
+			uncacheable = true;
+			return;
+		}
+		// Asked before arming: a hot page must not be re-armed, or the next store to it faults
+		// again for nothing.
+		if (HotPage(page, Common::GuestPageWatch::Generation(page))) {
+			uncacheable = true;
+			Common::GuestPageWatch::CountHotSkip();
+			return;
+		}
+		const auto armed = Common::GuestPageWatch::Arm(page);
+		if (!armed.armed) {
+			uncacheable = true;
+			return;
+		}
+		pages[count]       = page;
+		generations[count] = armed.generation;
+		count++;
+	}
+
+	void Record(uint64_t address) noexcept {
+		if (uncacheable) {
+			return;
+		}
+		const auto page = address >> Common::GuestPageWatch::PAGE_SHIFT;
+		Touch(page);
+		// A dword that straddles a page boundary belongs to both pages. ReadAddress and
+		// ReadBuffer align to four bytes, so this cannot happen today; it costs one compare.
+		const auto last = (address + sizeof(uint32_t) - 1) >> Common::GuestPageWatch::PAGE_SHIFT;
+		if (last != page) {
+			Touch(last);
+		}
+	}
+};
+
 // Per-thread register file for FlatMachine. Registers are stamped with the epoch of the run that
 // wrote them, so nothing is cleared between draws and the file only grows to the largest plan.
 struct FlatRegisters {
@@ -1616,8 +1692,9 @@ struct FlatRegisters {
 
 class FlatMachine {
 public:
-	FlatMachine(const SrtFlatProgram& program, const SrtRuntime& runtime, FlatRegisters& registers)
-	    : m_program(program), m_runtime(runtime) {
+	FlatMachine(const SrtFlatProgram& program, const SrtRuntime& runtime, FlatRegisters& registers,
+	            SrtPageTrace* trace = nullptr)
+	    : m_program(program), m_runtime(runtime), m_trace(trace) {
 		const auto count = program.insts.size();
 		if (registers.values.size() < count) {
 			registers.values.resize(count);
@@ -1663,15 +1740,35 @@ private:
 	bool Read(const SrtFlatInst& inst, uint64_t address, uint64_t& result) const {
 		uint32_t word = 0;
 		if (inst.clean != 0u) {
+			if (m_trace != nullptr) {
+				// One clean read makes the whole evaluation uncacheable, so stop arming pages for
+				// it: an entry that is never inserted would only pay for the faults.
+				m_trace->clean_read = true;
+				m_trace             = nullptr;
+			}
 			if (m_runtime.read_specialization_memory == nullptr ||
 			    !m_runtime.read_specialization_memory(m_runtime.userdata, address, &word)) {
 				return false;
 			}
 		} else if (m_runtime.read_memory != nullptr) {
+			if (m_trace != nullptr) {
+				m_trace->clean_read = true;
+				m_trace             = nullptr;
+			}
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
 				return false;
 			}
 		} else {
+			// The page is armed before the load, so a store that changes the word either
+			// precedes the load or faults and bumps the page generation.
+			if (m_trace != nullptr) {
+				m_trace->Record(address);
+				if (m_trace->uncacheable) {
+					// Nothing more to collect: drop the pointer so the remaining reads cost one
+					// predicted branch instead of a second load.
+					m_trace = nullptr;
+				}
+			}
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
 		result = word;
@@ -1870,6 +1967,7 @@ private:
 
 	const SrtFlatProgram& m_program;
 	const SrtRuntime&     m_runtime;
+	mutable SrtPageTrace* m_trace  = nullptr;
 	uint64_t*             m_values = nullptr;
 	uint64_t*             m_stamps = nullptr;
 	uint64_t              m_epoch  = 0;
@@ -1924,6 +2022,252 @@ struct FlatRegistersLease {
 	FlatRegistersLease(const FlatRegistersLease&)            = delete;
 	FlatRegistersLease& operator=(const FlatRegistersLease&) = delete;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Per-frame flattened-SRT cache.
+//
+// A probe over 2,152 frames of the parked Nexus measured 20,000 evaluations per frame against
+// 3,500 distinct keys, so five out of six repeat a key already evaluated in the same frame, while
+// only 3.9% of keys survive into the next frame unchanged. The cache therefore lives on the
+// render thread, is keyed on everything one evaluation reads that is not guest memory, is
+// invalidated by the write generations of the guest pages it did read, and is thrown away every
+// frame by an epoch stamp rather than being carried forward.
+// ---------------------------------------------------------------------------------------------
+struct SrtCacheKey {
+	const void*     plan          = nullptr;
+	uint64_t        shader_hash   = 0;
+	uint64_t        shader_base   = 0;
+	const uint32_t* sources       = nullptr;
+	const uint8_t*  clean_slots   = nullptr;
+	uint32_t        source_count  = 0;
+	uint32_t        clean_count   = 0;
+	uint32_t        stage         = 0;
+	bool            evaluate_flat = false;
+
+	bool operator==(const SrtCacheKey&) const = default;
+};
+
+struct SrtCacheEntry {
+	SrtCacheKey                          key;
+	std::vector<uint32_t>                user_values;
+	std::vector<DescriptorValue>         results;
+	std::vector<uint32_t>                flat;
+	std::vector<uint8_t>                 active;
+	std::array<uint64_t, MaxTracedPages> pages {};
+	std::array<uint32_t, MaxTracedPages> generations {};
+	uint32_t                             page_count = 0;
+};
+
+struct HotPageEntry {
+	uint64_t page  = 0;
+	uint32_t first = 0;
+	uint32_t epoch = 0;
+};
+
+// The lookup tag. Four tags share one cache line, so a miss costs one line instead of walking
+// entries that are a few hundred bytes each.
+struct SrtCacheTag {
+	uint64_t hash  = 0;
+	uint32_t epoch = 0;
+	uint32_t used  = 0;
+};
+
+class SrtCache {
+public:
+	static constexpr uint32_t Capacity    = 8192; // power of two
+	static constexpr uint32_t Ways        = 4;    // one cache line of tags
+	static constexpr uint32_t HotCapacity = 4096; // power of two
+
+	static SrtCache& Thread() {
+		static thread_local SrtCache cache;
+		return cache;
+	}
+
+	void BeginCall() { m_epoch = Common::GuestPageWatch::FrameEpoch(); }
+
+	// True once a page's generation has moved more than HotPageBumps times since the first look
+	// this frame. Monotone: the generation only grows, so a hot page stays hot for the frame.
+	bool Hot(uint64_t page, uint32_t generation) {
+		auto&      entries = HotEntries();
+		const auto bucket  = static_cast<uint32_t>(Mix(page)) & (HotCapacity - 1);
+		for (uint32_t probe = 0; probe < Ways; probe++) {
+			auto& entry = entries[(bucket + probe) & (HotCapacity - 1)];
+			if (entry.epoch == m_epoch && entry.page == page) {
+				return generation - entry.first > HotPageBumps;
+			}
+			if (entry.epoch != m_epoch) {
+				entry = {page, generation, m_epoch};
+				return false;
+			}
+		}
+		// The frame's hot table is full of live pages; treat this one as cold, which only risks
+		// re-arming a page that keeps moving.
+		return false;
+	}
+
+	static uint64_t Mix(uint64_t value) {
+		value ^= value >> 33u;
+		value *= 0xff51afd7ed558ccdull;
+		value ^= value >> 33u;
+		return value;
+	}
+
+	static uint64_t Hash(const SrtCacheKey& key, std::span<const uint32_t> regs,
+	                     std::span<const uint32_t> user_data) {
+		uint64_t   hash = 1469598103934665603ull;
+		const auto mix  = [&hash](uint64_t value) {
+            hash = (hash ^ value) * 1099511628211ull;
+            hash ^= hash >> 29u;
+		};
+		mix(reinterpret_cast<uintptr_t>(key.plan));
+		mix(key.shader_hash);
+		mix(key.shader_base);
+		mix(reinterpret_cast<uintptr_t>(key.sources));
+		mix(reinterpret_cast<uintptr_t>(key.clean_slots));
+		mix(uint64_t {key.source_count} | (uint64_t {key.clean_count} << 32u));
+		mix(uint64_t {key.stage} | (key.evaluate_flat ? uint64_t {1} << 32u : 0));
+		for (const auto reg: regs) {
+			mix(reg < user_data.size() ? user_data[reg] : 0xdeadbeefull);
+		}
+		return hash;
+	}
+
+	// Copies a live entry into the caller's vectors. The destinations are untouched unless the
+	// whole key and every page generation still match.
+	bool Lookup(uint64_t hash, const SrtCacheKey& key, std::span<const uint32_t> regs,
+	            std::span<const uint32_t> user_data, std::vector<DescriptorValue>& results,
+	            std::vector<uint32_t>& flat, std::vector<uint8_t>& active_sources) {
+		const auto base = Group(hash);
+		auto&      tags = Tags();
+		for (uint32_t way = 0; way < Ways; way++) {
+			const auto slot = base + way;
+			if (tags[slot].used == 0 || tags[slot].epoch != m_epoch || tags[slot].hash != hash) {
+				continue;
+			}
+			auto& entry = Entries()[slot];
+			if (!(entry.key == key) || !SameUserData(entry.user_values, regs, user_data)) {
+				continue;
+			}
+			// A page that lost its watch had its generation bumped first, so equal generations
+			// mean the page has been watched, and therefore write-protected, ever since.
+			for (uint32_t index = 0; index < entry.page_count; index++) {
+				if (Common::GuestPageWatch::Generation(entry.pages[index]) !=
+				    entry.generations[index]) {
+					return false;
+				}
+			}
+			results.assign(entry.results.begin(), entry.results.end());
+			active_sources.assign(entry.active.begin(), entry.active.end());
+			if (key.evaluate_flat) {
+				flat.assign(entry.flat.begin(), entry.flat.end());
+			}
+			return true;
+		}
+		return false;
+	}
+
+	void Insert(uint64_t hash, const SrtCacheKey& key, std::span<const uint32_t> regs,
+	            std::span<const uint32_t> user_data, const SrtPageTrace& trace,
+	            const std::vector<DescriptorValue>& results, const std::vector<uint32_t>& flat,
+	            const std::vector<uint8_t>& active_sources) {
+		if (trace.uncacheable || trace.clean_read) {
+			return;
+		}
+		// Second look at every page. The entry is only sound if the page stayed watched for the
+		// whole evaluation, so a page that lost its watch in the middle of it fails here.
+		for (uint32_t index = 0; index < trace.count; index++) {
+			if (!Common::GuestPageWatch::IsArmed(trace.pages[index]) ||
+			    Common::GuestPageWatch::Generation(trace.pages[index]) !=
+			        trace.generations[index]) {
+				return;
+			}
+		}
+		const auto base   = Group(hash);
+		auto&      tags   = Tags();
+		uint32_t   chosen = base;
+		for (uint32_t way = 0; way < Ways; way++) {
+			const auto slot = base + way;
+			if (tags[slot].used == 0 || tags[slot].epoch != m_epoch || tags[slot].hash == hash) {
+				chosen = slot;
+				break;
+			}
+		}
+		tags[chosen] = {hash, m_epoch, 1};
+		auto& entry  = Entries()[chosen];
+		entry.key    = key;
+		entry.user_values.clear();
+		for (const auto reg: regs) {
+			entry.user_values.push_back(reg < user_data.size() ? user_data[reg] : 0xdeadbeefu);
+		}
+		entry.results.assign(results.begin(), results.end());
+		entry.active.assign(active_sources.begin(), active_sources.end());
+		if (key.evaluate_flat) {
+			entry.flat.assign(flat.begin(), flat.end());
+		} else {
+			entry.flat.clear();
+		}
+		entry.page_count  = trace.count;
+		entry.pages       = trace.pages;
+		entry.generations = trace.generations;
+		if (Common::GuestPageWatch::Reporting()) {
+			Common::GuestPageWatch::CountInsert();
+		}
+	}
+
+private:
+	static uint32_t Group(uint64_t hash) {
+		return (static_cast<uint32_t>(hash) & (Capacity - 1)) & ~(Ways - 1);
+	}
+
+	static bool SameUserData(const std::vector<uint32_t>& stored, std::span<const uint32_t> regs,
+	                         std::span<const uint32_t> user_data) {
+		if (stored.size() != regs.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < regs.size(); index++) {
+			const auto reg   = regs[index];
+			const auto value = reg < user_data.size() ? user_data[reg] : 0xdeadbeefu;
+			if (stored[index] != value) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	std::vector<SrtCacheTag>& Tags() {
+		if (m_tags.empty()) {
+			m_tags.resize(Capacity);
+		}
+		return m_tags;
+	}
+
+	std::vector<SrtCacheEntry>& Entries() {
+		if (m_entries.empty()) {
+			m_entries.resize(Capacity);
+		}
+		return m_entries;
+	}
+
+	std::vector<HotPageEntry>& HotEntries() {
+		if (m_hot.empty()) {
+			m_hot.resize(HotCapacity);
+		}
+		return m_hot;
+	}
+
+	std::vector<SrtCacheTag>   m_tags;
+	std::vector<SrtCacheEntry> m_entries;
+	std::vector<HotPageEntry>  m_hot;
+	uint32_t                   m_epoch = 0;
+};
+
+bool HotPage(uint64_t page, uint32_t generation) noexcept {
+	return SrtCache::Thread().Hot(page, generation);
+}
+
+bool AnyCleanSlot(std::span<const uint8_t> clean_flat_slots) {
+	return std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; });
+}
 
 bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> sources,
                         const SrtRuntime& runtime, bool evaluate_flat,
@@ -2011,10 +2355,11 @@ bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> s
 // per-source and per-slot evaluation order, same transactional failure.
 bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32_t> sources,
                              const SrtRuntime& runtime, bool evaluate_flat,
-                             std::span<const uint8_t> clean_flat_slots, SourceScratch& scratch) {
+                             std::span<const uint8_t> clean_flat_slots, SourceScratch& scratch,
+                             SrtPageTrace* trace) {
 	const auto&        flat = program.flat;
 	FlatRegistersLease lease;
-	FlatMachine        machine(flat, runtime, lease.registers);
+	FlatMachine        machine(flat, runtime, lease.registers, trace);
 
 	auto& active = scratch.active;
 	active.clear();
@@ -2119,12 +2464,47 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 		~ScratchGuard() { owned.in_use = false; }
 	} guard {scratch};
 
-	const bool evaluated =
-	    FlatPlanUsable(program, clean_flat_slots)
-	        ? EvaluateWithFlatProgram(program, sources, runtime, evaluate_flat, clean_flat_slots,
-	                                  scratch)
-	        : EvaluateWithWalker(program, sources, runtime, evaluate_flat, clean_flat_slots,
-	                             scratch);
+	const bool flat_usable = FlatPlanUsable(program, clean_flat_slots);
+	// The clean reader answers from the GPU caches, whose state no page generation describes, so
+	// a request for one is evaluated and never remembered. So is the IR walker, which has no
+	// compiled user-data register list to key on.
+	SrtCache* cache = nullptr;
+	if (flat_usable && Common::GuestPageWatch::Active() && runtime.read_memory == nullptr &&
+	    !AnyCleanSlot(clean_flat_slots)) {
+		cache = &SrtCache::Thread();
+		cache->BeginCall();
+	}
+	const SrtCacheKey key {.plan          = &program,
+	                       .shader_hash   = program.shader_hash,
+	                       .shader_base   = runtime.shader_base,
+	                       .sources       = sources.data(),
+	                       .clean_slots   = clean_flat_slots.data(),
+	                       .source_count  = static_cast<uint32_t>(sources.size()),
+	                       .clean_count   = static_cast<uint32_t>(clean_flat_slots.size()),
+	                       .stage         = static_cast<uint32_t>(program.stage),
+	                       .evaluate_flat = evaluate_flat};
+	uint64_t hash = 0;
+	if (cache != nullptr) {
+		hash = SrtCache::Hash(key, program.flat.user_data_regs, runtime.user_data);
+		if (cache->Lookup(hash, key, program.flat.user_data_regs, runtime.user_data, results, flat,
+		                  active_sources)) {
+			if (Common::GuestPageWatch::Reporting()) {
+				Common::GuestPageWatch::CountHit();
+			}
+			return true;
+		}
+		if (Common::GuestPageWatch::Reporting()) {
+			Common::GuestPageWatch::CountMiss();
+		}
+	}
+
+	SrtPageTrace trace;
+	const bool   evaluated =
+	    flat_usable ? EvaluateWithFlatProgram(program, sources, runtime, evaluate_flat,
+                                                clean_flat_slots, scratch,
+                                                cache != nullptr ? &trace : nullptr)
+                      : EvaluateWithWalker(program, sources, runtime, evaluate_flat,
+                                           clean_flat_slots, scratch);
 	if (!evaluated) {
 		return false;
 	}
@@ -2133,6 +2513,10 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	active_sources.swap(scratch.active);
 	if (evaluate_flat) {
 		flat.swap(scratch.flattened);
+	}
+	if (cache != nullptr) {
+		cache->Insert(hash, key, program.flat.user_data_regs, runtime.user_data, trace, results,
+		              flat, active_sources);
 	}
 	return true;
 }

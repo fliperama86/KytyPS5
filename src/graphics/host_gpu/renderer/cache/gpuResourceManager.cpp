@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/guestPageWatch.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -16,8 +17,12 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	// Answered before the mapped-range gate: the watch is the only owner of a page it protected
+	// on its own, and leaving such a fault unhandled kills the process.
+	const bool watched = access == PageFaultAccess::Write &&
+	                     Common::GuestPageWatch::InvalidateOnFault(fault_vaddr);
 	if (!IsMapped(fault_vaddr, fault_size)) {
-		return false;
+		return watched;
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -32,6 +37,7 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	Common::GuestPageWatch::Invalidate(vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
@@ -45,7 +51,26 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+// Only a mapped page may be watched. The address space silently skips the unmapped parts of a
+// protection request, so an unmapped page would be recorded as watched and never fault; a page
+// outside the mapped set also has no owner to answer its fault.
+bool GpuResourceManager::CanWatchPage(uint64_t page_address) const noexcept {
+	return IsMapped(page_address, Common::GuestPageWatch::PAGE_SIZE);
+}
+
+bool GpuResourceManager::WatchPage(uint64_t page_address, bool arm) noexcept {
+	constexpr uint64_t page_size = Common::GuestPageWatch::PAGE_SIZE;
+	if (arm) {
+		m_page_manager.UpdatePageWatchers<true>(page_address, page_size);
+	} else {
+		m_page_manager.UpdatePageWatchers<false>(page_address, page_size);
+	}
+	return true;
+}
+
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
+	// A fresh mapping holds different bytes; nothing may still be watching the old ones.
+	Common::GuestPageWatch::Invalidate(vaddr, size);
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
@@ -62,6 +87,9 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// Before the mapping goes away, and before m_mapped_ranges_mutex is taken: arming needs
+		// that lock, so the watch must never be dropped while it is held.
+		Common::GuestPageWatch::Invalidate(vaddr, size);
 		if (m_scheduler.Active()) {
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Finish();

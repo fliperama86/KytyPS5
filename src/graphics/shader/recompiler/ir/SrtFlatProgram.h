@@ -105,6 +105,10 @@ struct SrtFlatProgram {
 	std::vector<SrtFlatValueRoot>  clean_flat_reads; // srt_reads flagged clean, clean context
 	std::vector<SrtFlatValueRoot>  conditions;       // control_flow conditions, clean context
 	std::array<SrtFlatValueRoot, 4> uniform_values {}; // uniform_fill.values, clean context
+	// Every user-SGPR the program can load, ascending and without duplicates. A cache keyed on
+	// one evaluation's inputs compares these registers' values and nothing else, because nothing
+	// else the program reads comes from the register file.
+	std::vector<uint32_t>          user_data_regs;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

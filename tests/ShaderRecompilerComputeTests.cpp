@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
+#include "common/guestPageWatch.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -42,6 +43,8 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -4528,6 +4531,242 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "BDA-generation direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+
+  // The per-frame SRT cache answers a repeated evaluation from its own copy, and must stop doing
+  // so the moment anything can have changed the guest words it read: a CPU store into a watched
+  // page, a GPU readback through the backing alias, a host invalidation, or the next frame. An
+  // evaluation that reads more pages than one entry can record is never cached at all.
+  void CheckSrtCacheInvalidation() {
+    constexpr const char *name = "SrtCacheInvalidation";
+    constexpr uint64_t base = 0x0000000203d00000ull;
+    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    namespace IR = Libs::Graphics::ShaderRecompiler::IR;
+    namespace Watch = Common::GuestPageWatch;
+
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    CommandScheduler scheduler(context, m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "SRT-cache direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "SRT-cache fixed direct-memory mapping failed");
+    for (uint64_t offset = 0; offset < allocation_size; offset += sizeof(uint32_t)) {
+      const auto value = static_cast<uint32_t>(0xc0de0000u + offset / sizeof(uint32_t));
+      std::memcpy(static_cast<uint8_t *>(mapped) + offset, &value, sizeof(value));
+    }
+
+    // A post-planning plan whose descriptor dwords are plain SRT loads, `stride` bytes apart, so
+    // one plan stays inside a single guest page and another spreads over more pages than an entry
+    // can hold.
+    struct Built {
+      IR::ResourcePlan plan;
+      std::vector<uint32_t> sources;
+      std::vector<uint32_t> user_data;
+    };
+    const auto BuildPlan = [](uint64_t table, uint32_t buffers, uint32_t stride) {
+      IR::Program program;
+      program.stage = Libs::Graphics::ShaderType::Pixel;
+      program.srt_plan_complete = true;
+      program.resource_tracking_complete = true;
+      program.user_data_base = 0;
+      auto block = std::make_unique<IR::Block>();
+      auto *value_block = block.get();
+      program.blocks.push_back(value_block);
+      program.block_info.push_back({.id = 0});
+      program.block_storage.push_back(std::move(block));
+
+      IR::MemoryInfo memory;
+      memory.kind = IR::ResourceKind::ScalarAddress;
+      memory.planning_only = true;
+      program.memory_info.push_back(memory);
+
+      auto &low = value_block->AppendNewInst(IR::ValueOpcode::GetUserData,
+                                             {IR::Value(IR::ScalarReg(0))});
+      auto &high = value_block->AppendNewInst(IR::ValueOpcode::GetUserData,
+                                              {IR::Value(IR::ScalarReg(1))});
+      auto &root = value_block->AppendNewInst(IR::ValueOpcode::GetAddressResource,
+                                              {IR::Value(&low), IR::Value(&high)});
+      auto &srt = value_block->AppendNewInst(IR::ValueOpcode::GetSrtResource);
+
+      const uint32_t dword_total = buffers * 4u;
+      std::vector<IR::Value> slot_values;
+      slot_values.reserve(dword_total);
+      for (uint32_t slot = 0; slot < dword_total; slot++) {
+        auto &raw = value_block->AppendNewInst(
+            IR::ValueOpcode::LoadAddressU32,
+            {IR::Value(&root), IR::Value(slot * stride), IR::Value(0u), IR::Value(true)});
+        raw.SetFlags(IR::MemoryFlags{.index = 0, .pc = 0x1000u + slot});
+        program.srt_reads.push_back({IR::Value(&raw), slot});
+        auto &flat = value_block->AppendNewInst(IR::ValueOpcode::ReadConst,
+                                                {IR::Value(&srt), IR::Value(slot)});
+        slot_values.push_back(IR::Value(&flat));
+      }
+      uint32_t cursor = 0;
+      for (uint32_t index = 0; index < buffers; index++) {
+        IR::DescriptorSource source;
+        source.dword_count = 4;
+        for (uint32_t dword = 0; dword < 4u; dword++) {
+          source.dwords[dword] = slot_values[cursor++];
+        }
+        program.descriptor_sources.push_back(source);
+      }
+
+      Built built;
+      built.plan = IR::ExtractResourcePlan(program);
+      built.plan.clean_flat_slots.assign(built.plan.srt_reads.size(), 0u);
+      IR::CompileSrtPlan(built.plan);
+      built.sources.resize(built.plan.descriptor_sources.size());
+      for (uint32_t index = 0; index < built.sources.size(); index++) {
+        built.sources[index] = index;
+      }
+      built.user_data.assign(16, 0u);
+      built.user_data[0] = static_cast<uint32_t>(table);
+      built.user_data[1] = static_cast<uint32_t>(table >> 32u);
+      return built;
+    };
+
+    auto narrow = BuildPlan(base, 2, sizeof(uint32_t));
+    auto wide = BuildPlan(base, 5, 0x1000);
+    Require(name, "plans compiled",
+            narrow.plan.flat.compiled && wide.plan.flat.compiled &&
+                narrow.plan.flat.user_data_regs.size() == 2 &&
+                narrow.plan.flat.user_data_regs[0] == 0 &&
+                narrow.plan.flat.user_data_regs[1] == 1,
+            "the synthetic plans did not lower into flat programs with a user-data list");
+
+    const bool reporting_was_on = Watch::Reporting();
+    Watch::SetReporting(true);
+    {
+      GpuResourceManager resources(m_runtime_context, scheduler);
+      resources.SetGpu(&gpu);
+      namespace Exception = Common::HostException;
+      // Not checked: another case in this binary may already own the handler, and the route it
+      // installs is the same one.
+      (void)Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
+        if (info.type != Exception::ExceptionType::AccessViolation ||
+            (info.access_violation_type != Exception::AccessViolationType::Read &&
+             info.access_violation_type != Exception::AccessViolationType::Write)) {
+          return false;
+        }
+        const auto access =
+            info.access_violation_type == Exception::AccessViolationType::Write
+                ? PageFaultAccess::Write
+                : PageFaultAccess::Read;
+        return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+      });
+      LibKernel::Memory::InstallGpuResources(&resources);
+      resources.MapMemory(base, allocation_size);
+
+      std::vector<uint32_t> flat;
+      const auto Evaluate = [&](Built &built) {
+        std::vector<IR::DescriptorValue> results;
+        std::vector<uint8_t> active;
+        const IR::SrtRuntime runtime{.user_data = built.user_data, .shader_base = 0};
+        flat.clear();
+        return IR::EvaluateRuntimeSources(built.plan, built.sources, runtime, results, flat,
+                                          built.plan.clean_flat_slots, active);
+      };
+      // Returns how the counters moved across one evaluation.
+      const auto Run = [&](Built &built) {
+        const auto before = Watch::Snapshot();
+        Require(name, "evaluation", Evaluate(built), "the synthetic plan did not evaluate");
+        const auto after = Watch::Snapshot();
+        return std::pair<uint64_t, uint64_t>{after.hits - before.hits,
+                                             after.misses - before.misses};
+      };
+
+      const auto first = Run(narrow);
+      Require(name, "first evaluation misses", first.first == 0 && first.second == 1,
+              "the first evaluation of a key was not a miss");
+      const auto initial_value = flat[0];
+      const auto second = Run(narrow);
+      Require(name, "repeat evaluation hits",
+              second.first == 1 && second.second == 0 && flat[0] == initial_value,
+              "a repeated evaluation of the same key in the same frame was not a hit");
+
+      // A CPU store into a watched page faults, which drops the watch and bumps the page
+      // generation before the store completes.
+      constexpr uint32_t cpu_value = 0x5a5a0001u;
+      const auto faults_before = Watch::Snapshot().faults;
+      *static_cast<volatile uint32_t *>(mapped) = cpu_value;
+      Require(name, "watch fault counted", Watch::Snapshot().faults == faults_before + 1,
+              "a store into a watched page did not reach the watch through the fault handler");
+      const auto after_cpu = Run(narrow);
+      Require(name, "CPU write invalidates",
+              after_cpu.first == 0 && after_cpu.second == 1 && flat[0] == cpu_value,
+              "a CPU store into a read page did not invalidate the cached evaluation");
+      Require(name, "CPU write re-armed", Run(narrow).first == 1,
+              "the page was not watched again after the store that invalidated it");
+
+      // A GPU readback writes guest memory through the backing alias, which never faults.
+      constexpr uint32_t gpu_value = 0x5a5a0002u;
+      LibKernel::Memory::WriteBacking(base, &gpu_value, sizeof(gpu_value));
+      const auto after_gpu = Run(narrow);
+      Require(name, "GPU write invalidates",
+              after_gpu.first == 0 && after_gpu.second == 1 && flat[0] == gpu_value,
+              "a backing-alias write did not invalidate the cached evaluation");
+
+      // The host-side "these bytes changed" notification, used by file reads and unmapping.
+      Require(name, "notification hits first", Run(narrow).first == 1,
+              "the entry was not re-established before the invalidation test");
+      LibKernel::Memory::InvalidateMemory(base, sizeof(uint32_t));
+      Require(name, "notification invalidates", Run(narrow).second == 1,
+              "a host invalidation notification did not invalidate the cached evaluation");
+
+      // A new frame throws the whole table away.
+      Require(name, "frame hit", Run(narrow).first == 1,
+              "the entry was not re-established before the frame test");
+      Watch::MarkFrame();
+      Require(name, "frame epoch invalidates", Run(narrow).second == 1,
+              "a frame boundary did not invalidate the cached evaluation");
+
+      // Twenty distinct pages is more than one entry records, so it is never cached.
+      Require(name, "wide plan misses", Run(wide).second == 1,
+              "the wide plan's first evaluation was not a miss");
+      Require(name, "wide plan stays uncached", Run(wide).second == 1,
+              "an evaluation touching more than sixteen pages was cached");
+
+      // Turning the cache off stops both the hits and the watching.
+      Watch::SetEnabled(false);
+      Require(name, "disabled stops caching",
+              Run(narrow).first == 0 && Run(narrow).first == 0 &&
+                  Watch::Snapshot().armed_pages == 0,
+              "the cache still answered, or still watched pages, while disabled");
+      Watch::SetEnabled(true);
+
+      resources.SetGpu(nullptr);
+      resources.UnmapMemory(base, allocation_size);
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      scheduler.Finish();
+    }
+    Watch::SetReporting(reporting_was_on);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "SRT-cache direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "SRT-cache direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -30286,6 +30525,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaGenerationCaching();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--srt-cache-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSrtCacheInvalidation();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -30447,6 +30691,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRasterization(false);
   vulkan.CheckRasterization(false, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
+  vulkan.CheckSrtCacheInvalidation();
 #endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

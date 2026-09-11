@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/guestPageWatch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -319,6 +320,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
+	Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(dw_num) * 4);
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
@@ -374,10 +376,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 
 	if (write_one_address) {
+		Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst), sizeof(uint32_t));
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
 		}
 	} else {
+		Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(dw_num) * sizeof(uint32_t));
 		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 	}
 }
@@ -389,6 +393,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	Common::GuestPageWatch::Invalidate(dst_address, num_bytes);
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
 	     dst_address, value, num_bytes);
@@ -1256,6 +1261,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
+		Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst), sizeof(data));
 		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -1280,6 +1286,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				if (eop_event_type == 0x2f && cache_action == 0x00 && event_index == 0x06) {
 					auto* dst = static_cast<uint32_t*>(dst_gpu_addr);
 					SynchronizeGpu();
+					Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst),
+					                                    static_cast<uint64_t>(value >> 16u) * 4u);
 					Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(), dst, value & 0xffffu,
 					              value >> 16u);
 					Sync::WriteAtEndOfPipeGds32(m_submit_id, CurrentBuffer(), dst, value & 0xffffu,
@@ -1306,6 +1314,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
+					Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst), sizeof(value));
 					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -1396,6 +1405,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
 				const auto clock = Sync::ReadReferenceClock();
 				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
+				Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst), sizeof(clock));
 				std::memcpy(dst, &clock, sizeof(clock));
 				switch (cache_action) {
 					case 0x00:
@@ -1549,6 +1559,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			// ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
+			Common::GuestPageWatch::Invalidate(event_address, 16u * 2u * sizeof(uint64_t));
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
 			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
 			for (uint32_t db = 0; db < 16u; db++) {
@@ -1587,6 +1598,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
+	Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value));
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
@@ -1613,6 +1625,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
+	Common::GuestPageWatch::Invalidate(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value));
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,

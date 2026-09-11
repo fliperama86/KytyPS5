@@ -27,6 +27,10 @@ public:
 	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Write-protects one guest page for the shader resource-table cache, or gives the write
+	// access back. Refcounted alongside the buffer and image watchers on the same page.
+	[[nodiscard]] bool CanWatchPage(uint64_t page_address) const noexcept;
+	bool               WatchPage(uint64_t page_address, bool arm) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

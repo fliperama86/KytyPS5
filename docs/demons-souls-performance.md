@@ -206,8 +206,78 @@ every one of them for the same shader on every draw. At 1.37 microseconds for 23
 plus 21.4 scattered reads, the zone is paying roughly 60 nanoseconds per step, which is memory
 latency, not arithmetic. The next experiment is therefore to cache the flattened SRT contents per
 shader and user-data pointer and invalidate it from the page writes that can change it, rather than
-to make the individual read cheaper. `RenderExecutor::RebindBuffers` remains the second-largest
-zone at 1.38 s over 4.3 million calls; the note above on why its memo was rejected still applies.
+to make the individual read cheaper. That experiment is the next section. `RenderExecutor::RebindBuffers`
+remains the second-largest zone at 1.38 s over 4.3 million calls; the note above on why its memo was
+rejected still applies.
+
+### Per-frame SRT cache, measured and kept off the critical path
+
+`EvaluateRuntimeSourcesImpl` re-reads the same scattered guest dwords for the same shader on every
+draw, so the next experiment was to remember the result for the rest of the frame and let guest
+page writes invalidate it. A throwaway probe over 2,152 frames of the parked Nexus
+(`_Runtime/_Diagnostics/flat-plan/srt-probe-console.log`) sized the idea: about 20,000 evaluations
+per frame against 3,500 distinct keys, so 82.8% of calls repeat a key already evaluated in the same
+frame; 11.1% of keys see the words they read change inside the frame; a key reads a median of four
+and at most fourteen distinct 4 KiB pages; and only 3.9% of keys recur in the next frame with
+identical words. A per-frame cache, then, never carried across frames.
+
+The cache is an 8192-entry four-way table on the render thread inside the flat path, stamped with a
+frame epoch so a new frame resets it for free. The key is the plan identity, its hash and stage, the
+values of the user-SGPRs the compiled flat program actually loads (`SrtFlatProgram::user_data_regs`,
+collected at compile time), the shader base, the identity of the source and clean-slot spans, and
+the flat-evaluation flag. The value is a copy of the descriptor results, the flattened SRT and the
+active-source flags, plus up to sixteen (page, generation) pairs.
+
+Invalidation is a write generation per 4 KiB guest page, in sparse 4 MiB blocks like the memory
+tracker's (`src/common/guestPageWatch.h`). A page is *armed* before the load that reads it: the
+graphics page manager write-protects it, refcounted alongside the buffer and image watchers already
+on that page, so a guest store faults into `GpuResourceManager::HandleFault`, which drops the watch
+and bumps the generation before the caches run. Host writes that cannot fault bump it directly:
+`Memory::TryWriteBacking` (the backing alias every GPU-to-guest readback uses), `InvalidateMemory`,
+map and unmap, guest `mprotect`, the buffer cache's GPU-modified ranges and direct fills and copies,
+`TextureCache::CommitGpuWrite`, the command-processor packets that store into guest memory, and the
+one kernel-mode socket read that writes a guest buffer. Only armed pages are bumped, so a large
+range costs one load per 64 pages.
+
+Two guards keep the arming from costing more than it saves. A page whose generation moves more than
+eight times in one frame is hot: entries touching it are not cached and it is not re-armed, because
+a page written per draw would otherwise fault per draw. And an evaluation that takes a clean read
+stops tracing entirely, because the clean reader answers from the GPU caches, whose state no page
+generation describes.
+
+It works and it does not pay. Both windows below were taken in the same local console session (not
+Remote Desktop, unlike every earlier sample in this document), same binary, same parked scene:
+
+| Run | FPS | CPU cores | user | kernel | `EvaluateRuntimeSourcesImpl` |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `--srt-cache true` | 11.163 | 12.599 | 11.967 | 0.632 | 5.655 s / 4,475,523 calls = **1,263 ns** |
+| `--srt-cache false` | 11.159 | 12.622 | 12.531 | 0.091 | 6.085 s / 4,471,568 calls = **1,360 ns** |
+
+The zone gets 7.1% cheaper per call and the frame rate does not move: 11.163 against 11.159, three
+orders of magnitude inside the scene's own +/-4% spread. The counters explain both halves. Per frame
+in the parked Nexus the cache serves about 13,600 hits against 6,700 misses, a **67% hit rate**
+against the probe's 82.8% ceiling, the gap being the 3,600 evaluations per frame that touch a hot
+page and the ones that take a clean read. It inserts about 2,800 entries, records about 200
+invalidations and adds about **90 write faults per frame** — the arming is cheap, and the guard is
+what keeps it cheap.
+
+The 7% that the zone gives back does not reach the frame rate because it is not free elsewhere:
+total CPU is flat at 12.6 core-equivalents, but 0.54 core-equivalents move from user to kernel time,
+which is the `VirtualProtect` calls the arming makes and the faults it takes. A hit also still costs
+real memory traffic — four generation cells to check and about 900 bytes of descriptor values to
+copy — so it replaces twenty-one scattered dword reads with a handful of scattered reads plus a
+copy, not with nothing.
+
+A variant that packed each entry's payload into one allocation and kept pointers to the generation
+cells, to cut the hit's cache misses further, measured **worse**: 1,439 ns per call and 10.874 FPS
+(`srt-cache-2.csv`, `srt-cache-2-steady-clean.json`). `std::vector::resize` value-initialises before
+the copy overwrites it, and the caller hands in an empty vector every call, so the packed layout
+bought one indirection and paid two passes over 900 bytes. It was reverted; the kept build is the
+one the table reports.
+
+The change is kept because it is correct, tested, gated and it does make the zone cheaper, not
+because it paid. `--srt-cache false` turns it off entirely, including the page watching. Raw
+artifacts: `srt-cache-*` and `srt-cache-off-*` in `_Runtime/_Diagnostics/flat-plan/`.
 
 ### CCD affinity
 

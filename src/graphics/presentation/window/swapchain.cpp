@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/guestPageWatch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -791,6 +792,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
+		// The SRT cache's entries live for one frame; this is where a frame ends.
+		Common::GuestPageWatch::MarkFrame();
 		m_impl->window.UpdateTitle();
 		// Outside the render lock: the periodic driver cache save takes the pipeline cache mutex,
 		// which pipeline creation never holds while waiting on presentation.

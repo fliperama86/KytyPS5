@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/guestPageWatch.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -858,8 +859,15 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	if (g_guest_address_space == nullptr ||
+	    !g_guest_address_space->TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	// The backing alias is a second mapping of the same physical pages, so this write does not
+	// fault on the guest mapping's protection and has to say so itself. Every GPU-to-guest
+	// readback in the buffer and texture caches lands here.
+	Common::GuestPageWatch::Invalidate(vaddr, size);
+	return true;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -924,9 +932,25 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+static bool CanWatchGuestPage(uint64_t page_address) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->CanWatchPage(page_address);
+}
+
+static bool WatchGuestPage(uint64_t page_address, bool arm) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->WatchPage(page_address, arm);
+}
+
 void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
+	if (resources == nullptr) {
+		// Gives every watched page back while the page manager still exists: it fatals if it is
+		// destroyed with live page state.
+		Common::GuestPageWatch::InstallProtect(nullptr, nullptr);
+	}
 	g_gpu_resources = resources;
+	if (resources != nullptr) {
+		Common::GuestPageWatch::InstallProtect(CanWatchGuestPage, WatchGuestPage);
+	}
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
@@ -3666,6 +3690,9 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 
 	const auto host_mode = VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
 	                                                      : VirtualMemory::Mode::ReadWrite;
+	// A guest protection change overwrites whatever the page watchers set, so the watches go
+	// first and the requested mode is applied over a clean slate.
+	Common::GuestPageWatch::Invalidate(vaddr, size);
 	EXIT_IF(!g_guest_address_space->Protect(vaddr, size, host_mode));
 	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
 }
@@ -3701,6 +3728,7 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 		*old_mode = static_cast<VirtualMemory::Mode>(
 		    ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	}
+	Common::GuestPageWatch::Invalidate(aligned_addr, aligned_size);
 	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, mode)) {
 		return false;
 	}
@@ -3766,6 +3794,7 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
+	Common::GuestPageWatch::Invalidate(aligned_addr, aligned_len);
 	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
 
 	if (!ok) {

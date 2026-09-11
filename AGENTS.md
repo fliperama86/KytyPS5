@@ -15,7 +15,7 @@ Fork of KytyPS5 focused on getting Demon's Souls (PPSA01342) to run well. Read
 ## Game procedure
 
 [docs/reaching-the-nexus.md](docs/reaching-the-nexus.md) describes how to reach the benchmark scene
-(wait for frame 700, hold Cross 2 s, then about twelve Cross presses 3 s apart) and how to measure.
+(wait for frame 1000, hold Cross 4 s, then about twelve Cross presses 3 s apart) and how to measure.
 
 ## Rules
 

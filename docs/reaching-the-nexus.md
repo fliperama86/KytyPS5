@@ -14,9 +14,11 @@ Every performance number in these docs was taken in this scene, so repeat it exa
 
 ## Sequence
 
-1. Wait until the title shows **frame 700** or later. The opening cinematic is running and has
-   become skippable. Before that, input is ignored.
-2. **Hold Cross for 2 seconds.** Cross is the `J` key (VK `0x4A`, scancode `0x24`, see
+1. Wait until the title shows **frame 1000** or later. The opening cinematic is running and has
+   become skippable. Before that, input is ignored. The frame at which it becomes skippable has
+   moved as performance improved (700 was enough at 8 FPS), so when in doubt wait longer; a late
+   hold costs seconds, an early one is ignored.
+2. **Hold Cross for 4 seconds.** Cross is the `J` key (VK `0x4A`, scancode `0x24`, see
    `hostInput.cpp`). The cinematic skips; the counter jumps by about 100 frames.
 3. **Press Cross about 12 times, 3 seconds apart**, wall clock. This walks Press Any Button, then
    Continue, then Continue Offline. Menu transitions are animations on a wall clock, so frame-paced
@@ -27,7 +29,7 @@ Every performance number in these docs was taken in this scene, so repeat it exa
 5. Confirm with a screenshot. `_Runtime/_Diagnostics/flat-plan/after-nav.png` shows the expected
    view.
 
-If the game already sits on the title screen (frame counter far past 700, 32 fps), start at step 2.
+If the game already sits on the title screen (frame counter far past 1000, 32 fps), start at step 2.
 
 ## Sending input from a script
 
@@ -40,7 +42,7 @@ elevated emulator, so an elevated emulator needs an elevated sender.
 The local helper does all of this:
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File _Build\des-navigate.ps1 -NoElevate -WaitForFrame 700 -HoldSeconds 2 -Presses 12 -GapSeconds 3
+powershell -NoProfile -ExecutionPolicy Bypass -File _Build\des-navigate.ps1 -NoElevate -WaitForFrame 1000 -HoldSeconds 4 -Presses 12 -GapSeconds 3
 ```
 
 Drop `-NoElevate` when the emulator runs elevated for ETW sampling; the script then self-elevates.

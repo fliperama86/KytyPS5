@@ -122,7 +122,7 @@ The ignored helper `_Build/start-des-profile.ps1 -Phase <unique-name>` launches 
 
 The vendored tools are `_Build/profiling-tools/capture/tracy-capture.exe`, `csvexport/tracy-csvexport.exe`, and `analyzer/tracy-sample-analyzer.exe`, all built against Tracy 0.13.1 / protocol 76. Capture with `-a 127.0.0.1 -p 8086 -s 20 -o <new.tracy>`; CSV export `-e` gives self times, no `-e` gives total times, and the local analyzer `--frames` emits intervals. PowerShell 5 redirected CSV is UTF-16. Ignore the CSV `total_perc` column's preconnection denominator; calculate against the actual capture window.
 
-For a fresh run, follow [Reaching the Nexus](reaching-the-nexus.md): wait for frame 700, hold Cross for 2 seconds, then about twelve Cross presses 3 seconds apart, sent with PostMessage to the game window. This does not authorize disrupting the user's current active play session.
+For a fresh run, follow [Reaching the Nexus](reaching-the-nexus.md): wait for frame 1000, hold Cross for 4 seconds, then about twelve Cross presses 3 seconds apart, sent with PostMessage to the game window. This does not authorize disrupting the user's current active play session.
 
 ## Follow-up: descriptor evaluation memo
 

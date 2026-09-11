@@ -117,7 +117,7 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
 	return {
 	    .code      = code,
-	    .user_data = std::vector<uint32_t>(user_data.begin(), user_data.end()),
+	    .user_data = user_data,
 	    .hash      = declared_hash != 0 ? declared_hash
 	                                    : XXH3_64bits(code.data(), code.size_bytes()),
 	};
@@ -757,8 +757,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		return params;
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
-	// its user-data pointer in s0:s1.
-	params.user_data.insert(params.user_data.begin(), 8u, 0u);
+	// its user-data pointer in s0:s1. Only this stage rewrites the guest registers, so only it
+	// needs storage; keep it across draws so the steady state allocates nothing.
+	static thread_local std::vector<uint32_t> ngg_user_data;
+	ngg_user_data.assign(8u, 0u);
+	ngg_user_data.insert(ngg_user_data.end(), params.user_data.begin(), params.user_data.end());
+	params.user_data = ngg_user_data;
 	info                     = {};
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
@@ -775,8 +779,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS",
 		                    GetDeclaredShaderHash(regs.gs_regs.data_addr), {}, back);
 		params.back_code = back_params.code;
-		params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
-		params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
+		ngg_user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
+		ngg_user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
 		const uint64_t hashes[] = {params.hash, back_params.hash};
 		params.hash = XXH3_64bits(hashes, sizeof(hashes));
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);

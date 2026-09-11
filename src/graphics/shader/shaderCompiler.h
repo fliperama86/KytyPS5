@@ -15,7 +15,9 @@ class UserConfig;
 
 struct ShaderParams {
 	std::span<const uint32_t> code;
-	std::vector<uint32_t>     user_data;
+	// Points at the guest user-SGPR registers, or at the preparing call's scratch when the stage
+	// rewrites them. Valid until the next PrepareProgram call for the same stage.
+	std::span<const uint32_t> user_data;
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
 

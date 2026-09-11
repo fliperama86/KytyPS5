@@ -17,6 +17,7 @@
 #include <functional>
 #include <numeric>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -39,6 +40,10 @@ struct MaterializedSnapshot {
 	ResourceSnapshot           resources;
 	std::vector<IndirectImage> indirect_images;
 };
+
+// Storage handed back by the previous specialization. Every stage of every draw builds one, and
+// the vectors are the same size from draw to draw, so keeping the allocation is free.
+thread_local ResourceSpecialization g_specialization_scratch;
 
 bool SpecializationFail(MaterializeReport* report, std::string_view message) {
 	if (report != nullptr) {
@@ -717,8 +722,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 #if defined(TRACY_ENABLE)
 	KYTY_PROFILER_BLOCK("BuildResourceSpecialization");
 #endif
-	auto                   next_snapshot = std::move(snapshot.resources);
-	ResourceSpecialization next_specialization;
+	auto next_snapshot = std::move(snapshot.resources);
+	// Build into storage recycled from an earlier call and hand it over by swap: the destination
+	// is written only on success, so a rejected materialization still leaves it untouched.
+	ResourceSpecialization next_specialization = std::move(g_specialization_scratch);
+	next_specialization.buffers.clear();
+	next_specialization.images.clear();
 	next_specialization.buffers.reserve(program.info.buffers.size());
 	size_t image_count   = program.info.images.size();
 	size_t mapping_words = 0;
@@ -947,8 +956,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		}
 	}
 	ImageRemap(next_specialization).Apply(next_snapshot.images);
-	specialization       = std::move(next_specialization);
-	specialized_snapshot = std::move(next_snapshot);
+	std::swap(specialization, next_specialization);
+	g_specialization_scratch = std::move(next_specialization);
+	specialized_snapshot     = std::move(next_snapshot);
 	return true;
 }
 

@@ -327,8 +327,11 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		KYTY_PROFILER_END_BLOCK;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::IR::ResourceSnapshot resources;
+		// The snapshot is moved into input_info.stage below and outlives this call, so it cannot
+		// be pooled here. The specialization is compared and dropped on the cached path, so its
+		// two vectors come from per-stage scratch that keeps its capacity across draws.
+		auto& specialization = specialization_scratch[static_cast<size_t>(stage)];
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
@@ -431,6 +434,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::array<ShaderRecompiler::IR::ResourceSpecialization,
+	           static_cast<size_t>(ShaderType::Mesh) + 1>       specialization_scratch;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;

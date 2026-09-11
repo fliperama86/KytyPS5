@@ -44,10 +44,30 @@ struct StageEvent {
 	bool     has_vertex_layout = false;
 	bool     uses_dma          = false;
 	bool     push_overflow     = false;
+	// The stage skipped CPU materialization of its buffer descriptor sources and kept the variant
+	// its last CPU materialization chose (docs/gpu-descriptor-fetch.md, stage 1).
+	bool gpu_fetch = false;
+};
+
+// Why a program that can fetch its own buffer descriptors still took the CPU path, plus the two
+// events the feedback readback produces.
+enum class GpuDescriptorEvent : uint32_t {
+	// No variant has been materialized on the CPU yet, so there is no tuple to keep.
+	CpuFirst,
+	// A shader reported that a runtime V# no longer matches what it was specialized against.
+	CpuFeedback,
+	// The program exceeded its mismatch budget and is on the CPU path for good.
+	CpuPinned,
+	// One bit read back from the DescriptorFeedback buffer.
+	FeedbackBit,
+	// A program crossing the mismatch budget, counted once.
+	ProgramPinned,
+	Count,
 };
 
 void BeginEvent(bool dispatch);
 void RecordStage(const StageEvent& event);
+void RecordGpuDescriptor(GpuDescriptorEvent event);
 void EndEvent();
 void RecordGraphicsPipeline(const void* pipeline);
 void EndFrame();

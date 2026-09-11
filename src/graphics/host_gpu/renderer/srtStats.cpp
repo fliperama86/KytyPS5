@@ -5,6 +5,9 @@
 #include "common/logging/log.h"
 
 #include <algorithm>
+#include <array>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -67,6 +70,30 @@ struct Accumulator {
 	uint32_t samplers      = 0;
 	bool     uses_dma      = false;
 	bool     push_overflow = false;
+	bool     gpu_fetch     = false;
+};
+
+// Run and window totals for the GPU-side descriptor fetch. The window is the 600 frames since
+// the last console line.
+struct GpuDescriptorCounters {
+	uint64_t gpu_fetch_draws      = 0;
+	uint64_t gpu_fetch_dispatches = 0;
+	std::array<uint64_t, static_cast<size_t>(GpuDescriptorEvent::Count)> events {};
+
+	void Add(const GpuDescriptorCounters& other) {
+		gpu_fetch_draws += other.gpu_fetch_draws;
+		gpu_fetch_dispatches += other.gpu_fetch_dispatches;
+		for (size_t i = 0; i < events.size(); i++) {
+			events[i] += other.events[i];
+		}
+	}
+	[[nodiscard]] uint64_t Event(GpuDescriptorEvent event) const {
+		return events[static_cast<size_t>(event)];
+	}
+	[[nodiscard]] bool Empty() const {
+		return gpu_fetch_draws == 0 && gpu_fetch_dispatches == 0 &&
+		       std::all_of(events.begin(), events.end(), [](uint64_t v) { return v == 0; });
+	}
 };
 
 // Per thread so a compute queue running beside the render thread cannot mix its stages into a
@@ -107,6 +134,10 @@ struct Collector {
 	uint32_t flat_insts_max = 0;
 	uint64_t flat_reads_sum = 0;
 	uint32_t flat_reads_max = 0;
+
+	// GPU-side descriptor fetch: totals for the run, and for the frames since the last line.
+	GpuDescriptorCounters gpu_descriptors;
+	GpuDescriptorCounters gpu_descriptors_window;
 
 	std::map<uint32_t, uint64_t>               sources_histogram;
 	std::unordered_map<uint64_t, ShaderRecord> shaders;
@@ -193,6 +224,32 @@ void AppendHistogram(std::string& out, const char* name, const std::map<uint32_t
 	out += fmt::format("}}{}\n", suffix);
 }
 
+// One console line per WriteIntervalFrames frames with the GPU-side descriptor fetch counters:
+// the run so far, then the window since the previous line. Caller holds the collector mutex.
+void PrintGpuDescriptorsLocked(Collector& collector) {
+	const auto& run    = collector.gpu_descriptors;
+	const auto  window = collector.gpu_descriptors_window;
+	collector.gpu_descriptors_window = {};
+	if (run.Empty()) {
+		return;
+	}
+	auto line = [](const char* scope, const GpuDescriptorCounters& counters) {
+		return fmt::format(
+		    "{} draws={} dispatches={} cpu_first={} cpu_feedback={} cpu_pinned={} bits={} "
+		    "pinned={}",
+		    scope, counters.gpu_fetch_draws, counters.gpu_fetch_dispatches,
+		    counters.Event(GpuDescriptorEvent::CpuFirst),
+		    counters.Event(GpuDescriptorEvent::CpuFeedback),
+		    counters.Event(GpuDescriptorEvent::CpuPinned),
+		    counters.Event(GpuDescriptorEvent::FeedbackBit),
+		    counters.Event(GpuDescriptorEvent::ProgramPinned));
+	};
+	std::printf("SrtStats gpu-descriptors frame %" PRIu64 ": %s | %s\n", collector.frames,
+	            line("run", run).c_str(),
+	            line(fmt::format("last {}", WriteIntervalFrames).c_str(), window).c_str());
+	std::fflush(stdout);
+}
+
 // Caller holds the collector mutex.
 void WriteLocked(Collector& collector) {
 	if (collector.write_failed || collector.writing) {
@@ -258,6 +315,19 @@ void WriteLocked(Collector& collector) {
 	out += fmt::format("\t\t\"flat_insts_max\": {},\n", collector.flat_insts_max);
 	out += fmt::format("\t\t\"flat_reads_sum\": {},\n", collector.flat_reads_sum);
 	out += fmt::format("\t\t\"flat_reads_max\": {},\n", collector.flat_reads_max);
+	const auto& gpu = collector.gpu_descriptors;
+	out += fmt::format("\t\t\"gpu_fetch_draws\": {},\n", gpu.gpu_fetch_draws);
+	out += fmt::format("\t\t\"gpu_fetch_dispatches\": {},\n", gpu.gpu_fetch_dispatches);
+	out += fmt::format("\t\t\"gpu_fetch_cpu_first\": {},\n",
+	                   gpu.Event(GpuDescriptorEvent::CpuFirst));
+	out += fmt::format("\t\t\"gpu_fetch_cpu_feedback\": {},\n",
+	                   gpu.Event(GpuDescriptorEvent::CpuFeedback));
+	out += fmt::format("\t\t\"gpu_fetch_cpu_pinned\": {},\n",
+	                   gpu.Event(GpuDescriptorEvent::CpuPinned));
+	out += fmt::format("\t\t\"gpu_fetch_feedback_bits\": {},\n",
+	                   gpu.Event(GpuDescriptorEvent::FeedbackBit));
+	out += fmt::format("\t\t\"gpu_fetch_programs_pinned\": {},\n",
+	                   gpu.Event(GpuDescriptorEvent::ProgramPinned));
 	AppendHistogram(out, "sources_per_event_histogram", collector.sources_histogram, ",");
 	AppendHistogram(out, "distinct_buffer_layouts_histogram", buffer_layout_histogram, ",");
 	AppendHistogram(out, "distinct_vertex_layouts_histogram", vertex_layout_histogram, ",");
@@ -323,6 +393,7 @@ void RecordStage(const StageEvent& event) {
 		local.samplers += event.sampler_sources;
 		local.uses_dma      = local.uses_dma || event.uses_dma;
 		local.push_overflow = local.push_overflow || event.push_overflow;
+		local.gpu_fetch     = local.gpu_fetch || event.gpu_fetch;
 	}
 
 	auto&                                 collector = Instance();
@@ -374,6 +445,16 @@ void RecordStage(const StageEvent& event) {
 	collector.frame_shaders.insert(key);
 }
 
+void RecordGpuDescriptor(GpuDescriptorEvent event) {
+	if (!Detail::enabled || event >= GpuDescriptorEvent::Count) {
+		return;
+	}
+	auto&                                 collector = Instance();
+	std::lock_guard<std::recursive_mutex> lock(collector.mutex);
+	collector.gpu_descriptors.events[static_cast<size_t>(event)]++;
+	collector.gpu_descriptors_window.events[static_cast<size_t>(event)]++;
+}
+
 void EndEvent() {
 	if (!Detail::enabled) {
 		return;
@@ -392,11 +473,15 @@ void EndEvent() {
 		collector.buffers_only_dispatches += buffers_only ? 1u : 0u;
 		collector.dma_dispatches += local.uses_dma ? 1u : 0u;
 		collector.push_overflow_dispatches += local.push_overflow ? 1u : 0u;
+		collector.gpu_descriptors.gpu_fetch_dispatches += local.gpu_fetch ? 1u : 0u;
+		collector.gpu_descriptors_window.gpu_fetch_dispatches += local.gpu_fetch ? 1u : 0u;
 	} else {
 		collector.draws++;
 		collector.buffers_only_draws += buffers_only ? 1u : 0u;
 		collector.dma_draws += local.uses_dma ? 1u : 0u;
 		collector.push_overflow_draws += local.push_overflow ? 1u : 0u;
+		collector.gpu_descriptors.gpu_fetch_draws += local.gpu_fetch ? 1u : 0u;
+		collector.gpu_descriptors_window.gpu_fetch_draws += local.gpu_fetch ? 1u : 0u;
 	}
 }
 
@@ -421,6 +506,7 @@ void EndFrame() {
 	collector.frame_pipelines.clear();
 	collector.frame_shaders.clear();
 	if (collector.frames % WriteIntervalFrames == 0) {
+		PrintGpuDescriptorsLocked(collector);
 		WriteLocked(collector);
 	}
 }

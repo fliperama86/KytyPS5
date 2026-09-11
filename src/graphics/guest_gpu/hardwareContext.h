@@ -632,35 +632,66 @@ public:
 
 	void Reset() { *this = Context(); }
 
-	void SetColorBase(uint32_t slot, const ColorBase& base) { m_render_targets[slot].base = base; }
-	void SetColorView(uint32_t slot, const ColorView& view) { m_render_targets[slot].view = view; }
-	void SetColorInfo(uint32_t slot, const ColorInfo& info) { m_render_targets[slot].info = info; }
+	// Which top-level register blocks have been written since a consumer last cleared them.
+	// Only the blocks the draw path re-reads every draw are tracked; the rest never set a bit.
+	enum DirtyBits : uint32_t {
+		DirtyNone             = 0u,
+		DirtyViewport         = 1u << 0u,
+		DirtyClipControl      = 1u << 1u,
+		DirtyModeControl      = 1u << 2u,
+		DirtyScanModeControl  = 1u << 3u,
+		DirtyBlendControl     = 1u << 4u,
+		DirtyBlendColor       = 1u << 5u,
+		DirtyRenderTargetMask = 1u << 6u,
+		DirtyRenderTargets    = 1u << 7u,
+		DirtyAaConfig         = 1u << 8u,
+		DirtyPolyOffset       = 1u << 9u,
+		DirtyLineWidth        = 1u << 10u,
+		DirtyAll              = 0xffffffffu,
+	};
+
+	[[nodiscard]] uint32_t DirtyState() const noexcept { return m_dirty; }
+	void MarkDirty(uint32_t bits) noexcept { m_dirty |= bits; }
+	void ClearDirty(uint32_t bits) noexcept { m_dirty &= ~bits; }
+
+	void SetColorBase(uint32_t slot, const ColorBase& base) { m_render_targets[slot].base = base; MarkDirty(DirtyRenderTargets); }
+	void SetColorView(uint32_t slot, const ColorView& view) { m_render_targets[slot].view = view; MarkDirty(DirtyRenderTargets); }
+	void SetColorInfo(uint32_t slot, const ColorInfo& info) { m_render_targets[slot].info = info; MarkDirty(DirtyRenderTargets); }
 	void SetColorAttrib(uint32_t slot, const ColorAttrib& attrib) {
 		m_render_targets[slot].attrib = attrib;
+		MarkDirty(DirtyRenderTargets);
 	}
 	void SetColorAttrib2(uint32_t slot, const ColorAttrib2& attrib2) {
 		m_render_targets[slot].attrib2 = attrib2;
+		MarkDirty(DirtyRenderTargets);
 	}
 	void SetColorAttrib3(uint32_t slot, const ColorAttrib3& attrib3) {
 		m_render_targets[slot].attrib3 = attrib3;
+		MarkDirty(DirtyRenderTargets);
 	}
 	void SetColorDccControl(uint32_t slot, const ColorDccControl& dcc) {
 		m_render_targets[slot].dcc = dcc;
+		MarkDirty(DirtyRenderTargets);
 	}
 	void SetColorCmask(uint32_t slot, const ColorCmask& cmask) {
 		m_render_targets[slot].cmask = cmask;
+		MarkDirty(DirtyRenderTargets);
 	}
 	void SetColorFmask(uint32_t slot, const ColorFmask& fmask) {
 		m_render_targets[slot].fmask = fmask;
+		MarkDirty(DirtyRenderTargets);
 	}
 	void SetColorClearWord0(uint32_t slot, const ColorClearWord0& clear_word0) {
 		m_render_targets[slot].clear_word0 = clear_word0;
+		MarkDirty(DirtyRenderTargets);
 	}
 	void SetColorClearWord1(uint32_t slot, const ColorClearWord1& clear_word1) {
 		m_render_targets[slot].clear_word1 = clear_word1;
+		MarkDirty(DirtyRenderTargets);
 	}
 	void SetColorDccAddr(uint32_t slot, const ColorDccAddr& dcc_addr) {
 		m_render_targets[slot].dcc_addr = dcc_addr;
+		MarkDirty(DirtyRenderTargets);
 	}
 	[[nodiscard]] const RenderTarget& GetRenderTarget(uint32_t slot) const {
 		return m_render_targets[slot];
@@ -668,12 +699,13 @@ public:
 
 	void SetBlendControl(uint32_t slot, const BlendControl& control) {
 		m_blend_control[slot] = control;
+		MarkDirty(DirtyBlendControl);
 	}
 	[[nodiscard]] const BlendControl& GetBlendControl(uint32_t slot) const {
 		return m_blend_control[slot];
 	}
 
-	void                   SetRenderTargetMask(uint32_t mask) { m_render_target_mask = mask; }
+	void                   SetRenderTargetMask(uint32_t mask) { m_render_target_mask = mask; MarkDirty(DirtyRenderTargetMask); }
 	[[nodiscard]] uint32_t GetRenderTargetMask() const { return m_render_target_mask; }
 
 	void                   SetShaderStages(uint32_t flags) { m_shader_stages = flags; }
@@ -711,9 +743,11 @@ public:
 
 	void SetViewportZMin(uint32_t viewport_id, float zmin) {
 		m_screen_viewport.viewports[viewport_id].zmin = zmin;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportZMax(uint32_t viewport_id, float zmax) {
 		m_screen_viewport.viewports[viewport_id].zmax = zmax;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportScaleOffset(uint32_t viewport_id, float xscale, float xoffset, float yscale,
 	                            float yoffset, float zscale, float zoffset) {
@@ -723,24 +757,31 @@ public:
 		m_screen_viewport.viewports[viewport_id].yoffset = yoffset;
 		m_screen_viewport.viewports[viewport_id].zscale  = zscale;
 		m_screen_viewport.viewports[viewport_id].zoffset = zoffset;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportXScale(uint32_t viewport_id, float xscale) {
 		m_screen_viewport.viewports[viewport_id].xscale = xscale;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportXOffset(uint32_t viewport_id, float xoffset) {
 		m_screen_viewport.viewports[viewport_id].xoffset = xoffset;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportYScale(uint32_t viewport_id, float yscale) {
 		m_screen_viewport.viewports[viewport_id].yscale = yscale;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportYOffset(uint32_t viewport_id, float yoffset) {
 		m_screen_viewport.viewports[viewport_id].yoffset = yoffset;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportZScale(uint32_t viewport_id, float zscale) {
 		m_screen_viewport.viewports[viewport_id].zscale = zscale;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportZOffset(uint32_t viewport_id, float zoffset) {
 		m_screen_viewport.viewports[viewport_id].zoffset = zoffset;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportScissor(uint32_t viewport_id, int left, int top, int right, int bottom,
 	                        bool window_offset_enable) {
@@ -750,25 +791,30 @@ public:
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_bottom = bottom;
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_window_offset_enable =
 		    window_offset_enable;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportScissorTL(uint32_t viewport_id, int left, int top, bool window_offset_enable) {
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_left = left;
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_top  = top;
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_window_offset_enable =
 		    window_offset_enable;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportScissorBR(uint32_t viewport_id, int right, int bottom) {
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_right  = right;
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_bottom = bottom;
+		MarkDirty(DirtyViewport);
 	}
 	void SetViewportTransformControl(uint32_t control) {
 		m_screen_viewport.transform_control = control;
+		MarkDirty(DirtyViewport);
 	}
 	void SetScreenScissor(int left, int top, int right, int bottom) {
 		m_screen_viewport.screen_scissor_left   = left;
 		m_screen_viewport.screen_scissor_top    = top;
 		m_screen_viewport.screen_scissor_right  = right;
 		m_screen_viewport.screen_scissor_bottom = bottom;
+		MarkDirty(DirtyViewport);
 	}
 	void SetWindowScissor(int left, int top, int right, int bottom, bool window_offset_enable) {
 		m_screen_viewport.window_scissor_left                 = left;
@@ -776,6 +822,7 @@ public:
 		m_screen_viewport.window_scissor_right                = right;
 		m_screen_viewport.window_scissor_bottom               = bottom;
 		m_screen_viewport.window_scissor_window_offset_enable = window_offset_enable;
+		MarkDirty(DirtyViewport);
 	}
 	void SetGenericScissor(int left, int top, int right, int bottom, bool window_offset_enable) {
 		m_screen_viewport.generic_scissor_left                 = left;
@@ -783,37 +830,43 @@ public:
 		m_screen_viewport.generic_scissor_right                = right;
 		m_screen_viewport.generic_scissor_bottom               = bottom;
 		m_screen_viewport.generic_scissor_window_offset_enable = window_offset_enable;
+		MarkDirty(DirtyViewport);
 	}
 	void SetWindowOffset(int offset_x, int offset_y) {
 		m_screen_viewport.window_offset_x = offset_x;
 		m_screen_viewport.window_offset_y = offset_y;
+		MarkDirty(DirtyViewport);
 	}
 	void SetHardwareScreenOffset(uint32_t offset_x, uint32_t offset_y) {
 		m_screen_viewport.hw_offset_x = offset_x;
 		m_screen_viewport.hw_offset_y = offset_y;
+		MarkDirty(DirtyViewport);
 	}
 	void SetGuardBands(float horz_clip, float vert_clip, float horz_discard, float vert_discard) {
 		m_screen_viewport.guard_band_horz_clip    = horz_clip;
 		m_screen_viewport.guard_band_vert_clip    = vert_clip;
 		m_screen_viewport.guard_band_horz_discard = horz_discard;
 		m_screen_viewport.guard_band_vert_discard = vert_discard;
+		MarkDirty(DirtyViewport);
 	}
-	void SetClipRectRule(uint16_t rule) { m_screen_viewport.clip_rect_rule = rule; }
+	void SetClipRectRule(uint16_t rule) { m_screen_viewport.clip_rect_rule = rule; MarkDirty(DirtyViewport); }
 	void SetClipRectTL(uint32_t rect_id, int left, int top, bool window_offset_enable) {
 		m_screen_viewport.clip_rect_left[rect_id]                 = left;
 		m_screen_viewport.clip_rect_top[rect_id]                  = top;
 		m_screen_viewport.clip_rect_window_offset_enable[rect_id] = window_offset_enable;
+		MarkDirty(DirtyViewport);
 	}
 	void SetClipRectBR(uint32_t rect_id, int right, int bottom) {
 		m_screen_viewport.clip_rect_right[rect_id]  = right;
 		m_screen_viewport.clip_rect_bottom[rect_id] = bottom;
+		MarkDirty(DirtyViewport);
 	}
 	[[nodiscard]] const ScreenViewport& GetScreenViewport() const { return m_screen_viewport; }
 
 	[[nodiscard]] const BlendColor& GetBlendColor() const { return m_blend_color; }
-	void SetBlendColor(const BlendColor& color) { m_blend_color = color; }
+	void SetBlendColor(const BlendColor& color) { m_blend_color = color; MarkDirty(DirtyBlendColor); }
 	[[nodiscard]] const ClipControl& GetClipControl() const { return m_clip_control; }
-	void SetClipControl(const ClipControl& control) { m_clip_control = control; }
+	void SetClipControl(const ClipControl& control) { m_clip_control = control; MarkDirty(DirtyClipControl); }
 	[[nodiscard]] const RenderControl& GetRenderControl() const { return m_render_control; }
 	void SetRenderControl(const RenderControl& control) { m_render_control = control; }
 	[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {
@@ -825,9 +878,9 @@ public:
 	[[nodiscard]] const DepthControl& GetDepthControl() const { return m_depth_control; }
 	void SetDepthControl(const DepthControl& control) { m_depth_control = control; }
 	[[nodiscard]] const ModeControl& GetModeControl() const { return m_mode_control; }
-	void SetModeControl(const ModeControl& control) { m_mode_control = control; }
+	void SetModeControl(const ModeControl& control) { m_mode_control = control; MarkDirty(DirtyModeControl); }
 	[[nodiscard]] const PolyOffset& GetPolyOffset() const { return m_poly_offset; }
-	void SetPolyOffset(const PolyOffset& offset) { m_poly_offset = offset; }
+	void SetPolyOffset(const PolyOffset& offset) { m_poly_offset = offset; MarkDirty(DirtyPolyOffset); }
 	[[nodiscard]] const EqaaControl& GetEqaaControl() const { return m_eqaa_control; }
 	void SetEqaaControl(const EqaaControl& control) { m_eqaa_control = control; }
 	[[nodiscard]] const StencilControl& GetStencilControl() const { return m_stencil_control; }
@@ -837,11 +890,11 @@ public:
 	[[nodiscard]] const ColorControl& GetColorControl() const { return m_color_control; }
 	void SetColorControl(const ColorControl& control) { m_color_control = control; }
 	[[nodiscard]] const ScanModeControl& GetScanModeControl() const { return m_scan_mode_control; }
-	void SetScanModeControl(const ScanModeControl& control) { m_scan_mode_control = control; }
+	void SetScanModeControl(const ScanModeControl& control) { m_scan_mode_control = control; MarkDirty(DirtyScanModeControl); }
 	[[nodiscard]] const AaSampleControl& GetAaSampleControl() const { return m_aa_sample_control; }
 	void SetAaSampleControl(const AaSampleControl& control) { m_aa_sample_control = control; }
 	[[nodiscard]] const AaConfig& GetAaConfig() const { return m_aa_config; }
-	void                          SetAaConfig(const AaConfig& config) { m_aa_config = config; }
+	void                          SetAaConfig(const AaConfig& config) { m_aa_config = config; MarkDirty(DirtyAaConfig); }
 
 	[[nodiscard]] float GetDepthClearValue() const { return m_depth_clear_value; }
 	void                SetDepthClearValue(float clear_value) { m_depth_clear_value = clear_value; }
@@ -853,7 +906,7 @@ public:
 	void SetStencilClearValue(uint8_t clear_value) { m_stencil_clear_value = clear_value; }
 
 	[[nodiscard]] float    GetLineWidth() const { return m_line_width; }
-	void                   SetLineWidth(float width) { m_line_width = width; }
+	void                   SetLineWidth(float width) { m_line_width = width; MarkDirty(DirtyLineWidth); }
 	[[nodiscard]] uint32_t GetPrimitiveResetIndex() const { return m_primitive_reset_index; }
 	void SetPrimitiveResetIndex(uint32_t index) { m_primitive_reset_index = index; }
 
@@ -900,6 +953,8 @@ public:
 	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
 
 private:
+	// A copied or reset context must be treated as entirely rewritten, so the default is all bits.
+	uint32_t m_dirty                 = DirtyAll;
 	float    m_line_width            = 1.0f;
 	uint32_t m_primitive_reset_index = 0xffffffffu;
 

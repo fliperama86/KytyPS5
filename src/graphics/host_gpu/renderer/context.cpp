@@ -30,6 +30,8 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	// A fresh recording starts with no pipeline bound and no dynamic state set.
+	InvalidateGraphicsState();
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};

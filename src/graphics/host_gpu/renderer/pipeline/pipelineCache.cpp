@@ -864,7 +864,13 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
+		return *m_last_graphics_pipeline;
+	}
+
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		m_last_graphics_key      = key;
+		m_last_graphics_pipeline = iter->second.get();
 		return *iter->second;
 	}
 
@@ -892,6 +898,8 @@ PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
 	EXIT_IF(!inserted);
 	m_pipelines_since_save.fetch_add(1, std::memory_order_relaxed);
 
+	m_last_graphics_key      = iter->first;
+	m_last_graphics_pipeline = iter->second.get();
 	return *iter->second;
 }
 

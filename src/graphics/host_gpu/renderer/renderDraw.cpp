@@ -314,10 +314,18 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
+// Register blocks SetGraphicsDynamicParams reads. Nothing else it reads comes from the context.
+constexpr uint32_t DynamicStateRegisters =
+    HW::Context::DirtyViewport | HW::Context::DirtyClipControl |
+    HW::Context::DirtyScanModeControl | HW::Context::DirtyLineWidth |
+    HW::Context::DirtyBlendColor | HW::Context::DirtyModeControl | HW::Context::DirtyPolyOffset |
+    HW::Context::DirtyRenderTargetMask;
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderColorInfo* colors, uint32_t color_count,
-                                     const RenderDepthInfo& depth) {
+                                     const RenderDepthInfo& depth, GraphicsDynamicMemo& memo,
+                                     uint64_t epoch, bool registers_clean) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(colors == nullptr);
@@ -333,6 +341,34 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
+
+	GraphicsDynamicMemo current {};
+	current.epoch          = epoch;
+	current.vertex_program = vs_input_info.stage.program;
+	current.color_count    = color_count;
+	for (uint32_t i = 0; i < color_count; i++) {
+		EXIT_IF(colors[i].target_slot >= RENDER_COLOR_ATTACHMENTS_MAX);
+		current.color_slots |= colors[i].target_slot << (i * 4u);
+	}
+	current.extent_width  = framebuffer_extent.width;
+	current.extent_height = framebuffer_extent.height;
+	current.depth_format  = static_cast<uint32_t>(depth.desc.view_info.format);
+	current.depth_compare = static_cast<uint32_t>(depth.depth_compare_op);
+	current.depth_test    = depth.depth_test_enable;
+	current.depth_write   = depth.depth_write_enable;
+	current.stencil_test  = depth.stencil_test_enable;
+	if (depth.stencil_test_enable) {
+		current.stencil_front[0] = depth.stencil_dynamic_front.compareMask;
+		current.stencil_front[1] = depth.stencil_dynamic_front.writeMask;
+		current.stencil_front[2] = depth.stencil_dynamic_front.reference;
+		current.stencil_back[0]  = depth.stencil_dynamic_back.compareMask;
+		current.stencil_back[1]  = depth.stencil_dynamic_back.writeMask;
+		current.stencil_back[2]  = depth.stencil_dynamic_back.reference;
+	}
+	if (registers_clean && memo.epoch == epoch && memo == current) {
+		return;
+	}
+	memo = current;
 
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
@@ -1153,6 +1189,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         bindings.pixel);
 
+	// Everything above may synchronously finish and restart the scheduler, and resolving targets
+	// may record a blit. Read the epoch once that is behind us.
+	const auto epoch = buffer.GraphicsStateEpoch();
+	const bool dynamic_registers_clean =
+	    (buffer.GetRegisters().DirtyState() & DynamicStateRegisters) == 0;
+
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
@@ -1203,7 +1245,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.vs_input_info, state.color_info,
-	                         state.color_count, state.depth_info);
+	                         state.color_count, state.depth_info, m_dynamic_memo, epoch,
+	                         dynamic_registers_clean);
+	buffer.GetRegisters().ClearDirty(DynamicStateRegisters);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(
 		    rendering.depth_stencil_attachment.image_layout ==
@@ -1217,7 +1261,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	if (m_bound_graphics_pipeline != &pipeline || m_bound_graphics_epoch != epoch) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		m_bound_graphics_pipeline = &pipeline;
+		m_bound_graphics_epoch    = epoch;
+	}
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

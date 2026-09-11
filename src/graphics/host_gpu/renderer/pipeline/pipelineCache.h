@@ -219,6 +219,11 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// Consecutive draws overwhelmingly reuse one pipeline. Hashing the key mixes 166 bytes one
+	// byte at a time, so remember the last key and compare instead. Nothing is ever erased from
+	// m_graphics_pipelines, so the remembered pointer stays valid for the cache's lifetime.
+	GraphicsPipelineKey                                     m_last_graphics_key {};
+	Pipeline*                                               m_last_graphics_pipeline = nullptr;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 

@@ -119,6 +119,11 @@ public:
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	// Pipeline bindings and dynamic state live in the recorded command buffer. Anything that
+	// records graphics state the draw path does not own advances this counter, so a draw can tell
+	// whether what it left bound is still bound.
+	[[nodiscard]] uint64_t GraphicsStateEpoch() const noexcept { return m_graphics_state_epoch; }
+	void InvalidateGraphicsState() noexcept { ++m_graphics_state_epoch; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -126,6 +131,7 @@ private:
 		m_registers   = &registers;
 		m_user_config = &user_config;
 		m_shaders     = &shaders;
+		InvalidateGraphicsState();
 	}
 
 	void Begin();
@@ -146,8 +152,29 @@ private:
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
+	uint64_t            m_graphics_state_epoch = 1;
 
 	friend class CommandScheduler;
+};
+
+// Everything SetGraphicsDynamicParams reads that the context dirty bits do not cover. Two draws
+// with equal memos on one command-buffer epoch would record byte-identical dynamic state.
+struct GraphicsDynamicMemo {
+	uint64_t    epoch          = 0;
+	const void* vertex_program = nullptr;
+	uint32_t    color_count    = 0;
+	uint32_t    color_slots    = 0;
+	uint32_t    extent_width   = 0;
+	uint32_t    extent_height  = 0;
+	uint32_t    depth_format   = 0;
+	uint32_t    depth_compare  = 0;
+	uint32_t    stencil_front[3] {};
+	uint32_t    stencil_back[3] {};
+	bool        depth_test     = false;
+	bool        depth_write    = false;
+	bool        stencil_test   = false;
+
+	bool operator==(const GraphicsDynamicMemo&) const = default;
 };
 
 class RenderExecutor {
@@ -221,6 +248,11 @@ private:
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
+	// Dynamic state and the bound pipeline survive from draw to draw inside one command-buffer
+	// epoch; these say what the previous draw left behind.
+	GraphicsDynamicMemo                   m_dynamic_memo;
+	const PipelineCache::Pipeline*        m_bound_graphics_pipeline = nullptr;
+	uint64_t                              m_bound_graphics_epoch    = 0;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

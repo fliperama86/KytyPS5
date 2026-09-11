@@ -247,7 +247,10 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 			break;
 		case ContextStateOperation::Pop:
 			EXIT_IF(!m_context_state_pushed);
-			m_ctx                  = m_saved_ctx;
+			m_ctx = m_saved_ctx;
+			// The copy carries the saved context's dirty bits, which say nothing about what the
+			// draw path last consumed. Everything the restore may have changed is dirty again.
+			m_ctx.MarkDirty(HW::Context::DirtyAll);
 			m_saved_ctx            = {};
 			m_context_state_pushed = false;
 			break;

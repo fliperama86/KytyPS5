@@ -19,8 +19,10 @@ listening; it is on-demand and costs nothing until a capture client connects.
 
 - `Kyty.ini`: launcher configuration.
 - `_SaveData`: current saves.
-- `_PipelineCache`: driver pipeline cache. Release builds with a clean tree use it; dirty builds
-  disable it and recompile every shader on each run.
+- `_PipelineCache`: the Vulkan driver's pipeline cache, about 75 MB for Demon's Souls. Saved every
+  20 s while new pipelines appear and again on exit, dirty builds included, keyed on the driver
+  rather than the emulator revision. It removes driver pipeline compilation on later runs; it does
+  not cache shader translation, which is what the first-encounter stutter mostly is.
 - `_Diagnostics`: current and previous run logs, traces and benchmark evidence.
 
 ## Building

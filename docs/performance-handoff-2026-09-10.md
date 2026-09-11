@@ -261,9 +261,12 @@ zone self time, not by sample attribution.
    registers, shader base, the guest words each `ReadAddress`/`ReadBuffer` touched). A cache keyed on
    those inputs could remove most of the remaining evaluation cost, but it needs proven
    invalidation of the guest words between draws. Do not cache without it.
-2. Exit the emulator cleanly at least once so the disk Vulkan pipeline cache persists. It is enabled
-   only for a committed, clean tree, and every profiling session so far ended in a forced
-   termination, so the cache on disk is stale and each run still recompiles the compute shaders cold.
+2. Cache translated shaders on disk. The driver pipeline cache now persists (saved every 20 s while
+   pipelines appear, dirty builds included, `_PipelineCache/PPSA01342.bin`, about 75 MB), but a
+   warm run showed no change in the gameplay-transition stall: the `Shaders:` counters keep
+   climbing there, so that stall is GCN-to-SPIR-V translation and specialization, not driver
+   compilation. Persist the translated SPIR-V plus its specialization key per shader hash and
+   rebuild pipelines from it at startup, RPCS3 style; then consider translating on a worker thread.
 3. The long tail on the GPU thread from the memo trace: `FlipQueue::Flip` 6.6%, `RebindBuffers`
    6.4%, `SynchronizeBdaBuffers` 4.9%, `ExecutePreparedDraw` 4.8%, `CommandProcessor::Process`
    3.8%, `SyncArguments` 2.7%. None is large alone; the per-draw ones add up across 9,300 draws.

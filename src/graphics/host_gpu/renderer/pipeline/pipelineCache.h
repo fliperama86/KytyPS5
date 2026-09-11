@@ -9,12 +9,16 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -113,6 +117,8 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// Called once per presented frame on the presentation thread.
+	void SaveIfDirty();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -216,7 +222,19 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
+	// Periodic save state. The writer thread only owns its payload copy and touches no Vulkan
+	// object, so it needs neither the device nor m_mutex. m_save_mutex serializes the shutdown
+	// Save() against the per-frame SaveIfDirty(); it is always taken before m_mutex, never after.
+	Common::Mutex                         m_save_mutex;
+	std::thread                           m_cache_writer;
+	std::atomic_bool                      m_cache_writer_busy {false};
+	std::atomic_uint32_t                  m_pipelines_since_save {0};
+	std::chrono::steady_clock::time_point m_last_save = std::chrono::steady_clock::now();
+
 	void InitializeDriverCache();
+	bool SnapshotDriverCache(std::vector<uint8_t>& payload);
+	bool WriteDriverCacheFile(const std::vector<uint8_t>& payload);
+	void JoinCacheWriter();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

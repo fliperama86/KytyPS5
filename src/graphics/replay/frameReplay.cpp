@@ -425,7 +425,11 @@ private:
 						SpinPause();
 					}
 				}
-				m_cache.MarkRegionAsCpuModified(event.vaddr, event.size);
+				// The game path: InvalidateMemory, not a bare mark, because a range the GPU still
+				// owns has to be flushed back before its CPU state changes -- marking it outright
+				// from another thread trips the tracker's "CPU dirty state conflicts with GPU
+				// dirty state" check.
+				m_cache.InvalidateMemory(event.vaddr, event.size);
 			}
 
 			lock.lock();
@@ -780,9 +784,12 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 		         dirty_events.size(), pre_events.size(), timed_events.size(),
 		         static_cast<unsigned long long>(reader.Manifest().progress_events),
 		         skipped_events != 0 ? " (some out of range, skipped)" : "");
+	} else if (reader.Manifest().format_version >= 3) {
+		::printf("  dirty events   dirty-events.bin is empty; the BDA generation only moves with the "
+		         "batch, which under-counts the BDA scan\n");
 	} else {
-		::printf("  dirty events   none recorded (format version %u); the whole dirty set is "
-		         "re-marked in one batch, which under-counts the BDA scan\n",
+		::printf("  dirty events   none recorded (format version %u); the BDA generation only moves "
+		         "with the batch, which under-counts the BDA scan\n",
 		         reader.Manifest().format_version);
 	}
 	::fflush(stdout);
@@ -807,23 +814,25 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 	progress_reached.reserve(loops);
 
 	for (uint32_t loop = 0; loop < loops; loop++) {
-		if (use_events) {
-			// Everything the guest wrote before the frame's first draw, on the GPU thread and outside
-			// the timing, exactly where the batch path used to put the whole set.
-			if (!pre_events.empty()) {
-				gpu.SendCommandSync([&]() {
-					for (const auto& event: pre_events) {
-						buffer_cache.MarkRegionAsCpuModified(event.vaddr, event.size);
-					}
-				});
-			}
-			marker->Start();
-		} else if (!dirty_ranges.empty()) {
+		// The recorded dirty set, in one batch on the GPU thread and outside the timing, as it has
+		// been since phase B. That set is what makes the loop upload the frame's working set: almost
+		// none of it comes from a CPU write of the frame, it is memory nothing has uploaded yet. The
+		// recorded events are the writes, and they come on top of it, not instead of it -- see the
+		// phase D section of docs/frame-replay.md.
+		if (!dirty_ranges.empty() || !pre_events.empty()) {
 			gpu.SendCommandSync([&]() {
 				for (const auto& range: dirty_ranges) {
 					buffer_cache.MarkRegionAsCpuModified(range.start, range.size);
 				}
+				// Everything the guest wrote before the frame's first draw, through the same
+				// invalidation path the marker thread uses.
+				for (const auto& event: pre_events) {
+					buffer_cache.InvalidateMemory(event.vaddr, event.size);
+				}
 			});
+		}
+		if (marker) {
+			marker->Start();
 		}
 
 		const auto loop_start = Clock::now();

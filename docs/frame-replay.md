@@ -339,10 +339,15 @@ Four things phase B should know before it reads a capture:
 One command per comparison, from the repository root:
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File _Build\replay-des.ps1 `
-    -Capture _Runtime\_Diagnostics\replay\nexus-2 -Loops 60 -Repeats 2 -Image `
-    -Configs '--gpu-descriptors false', '--gpu-descriptors true'
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\_Build\replay-des.ps1' `
+    -Capture '_Runtime\_Diagnostics\replay\nexus-2' -Loops 60 -Repeats 2 -Image `
+    -Configs '--gpu-descriptors false','--gpu-descriptors true'"
 ```
+
+`-Command`, not `-File`: `-File` hands each argument to the script as a bare token, so a
+configuration string that starts with a dash is taken for a parameter name and the call fails. From
+an interactive PowerShell prompt, `& .\_Build\replay-des.ps1 -Configs '--a b','--c d'` is enough.
+Without `-OutputRoot` the reports land in `<capture>\runs-<yyyyMMdd-HHmmss>`.
 
 `replay-des.ps1` runs each flag set in turn — never two emulator processes at once, and it refuses
 to start if one is already running — moves each `replay-report.json` into a timestamped

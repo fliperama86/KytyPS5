@@ -2,6 +2,7 @@
 
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -50,11 +51,19 @@ struct PendingSubmission {
 	std::vector<uint32_t> constants;
 };
 
+// About 75 000 CPU-dirty marks reach the recorder in a Nexus frame, so the buffer is reserved
+// once and only ever cleared: after the first frame the append path allocates nothing.
+constexpr size_t DIRTY_EVENT_RESERVE = 262144;
+
 struct Recorder {
 	std::mutex                                      mutex;
 	std::unordered_map<uint64_t, PendingSubmission> pending;
 	std::vector<PendingSubmission>                  ordered;
 	uint64_t                                        next_id = 1;
+	// A lock of its own: the dirty marks arrive from every guest thread and from the GPU thread,
+	// and must not queue behind a submission being copied.
+	std::mutex                    dirty_mutex;
+	std::vector<DirtyEventRecord> dirty_events;
 };
 
 struct State {
@@ -74,7 +83,9 @@ State& Instance() {
 			state.folder     = Config::GetFrameCaptureFolder();
 			state.capture_at = Config::GetFrameCaptureFrame();
 			state.exit_after = Config::FrameCaptureExitEnabled();
+			state.recorder.dirty_events.reserve(DIRTY_EVENT_RESERVE);
 			state.active.store(true, std::memory_order_relaxed);
+			Detail::g_dirty_events_armed.store(true, std::memory_order_relaxed);
 			LOGF("FrameCapture: armed, folder=%s frame=%d exit=%s\n", state.folder.string().c_str(),
 			     state.capture_at, state.exit_after ? "true" : "false");
 		}
@@ -308,6 +319,27 @@ uint64_t WriteDirtyPages(RenderContext&                                         
 	return count;
 }
 
+// The arrival order of the frame's CPU-dirty marks, each keyed to the GPU thread's progress
+// clock. This is what a replay needs to move the BDA generation as often as the game does.
+uint64_t WriteDirtyEvents(const std::filesystem::path& folder, bool& ok) {
+	Writer file;
+	if (!file.Open(folder / "dirty-events.bin")) {
+		LOGF("FrameCapture: cannot create dirty-events.bin\n");
+		ok = false;
+		return 0;
+	}
+
+	auto&            recorder = Instance().recorder;
+	std::unique_lock lock(recorder.dirty_mutex);
+	file.Write(recorder.dirty_events.data(),
+	           recorder.dirty_events.size() * sizeof(DirtyEventRecord));
+	const auto count = static_cast<uint64_t>(recorder.dirty_events.size());
+	lock.unlock();
+
+	ok = file.Close() && ok;
+	return count;
+}
+
 void WriteRegisters(std::span<const ProcessorRegisters> processors,
                     const std::filesystem::path& folder, bool& ok) {
 	static_assert(std::is_trivially_copyable_v<HW::Context>);
@@ -452,8 +484,24 @@ std::string TitleId() {
 
 } // namespace
 
+namespace Detail {
+std::atomic_bool g_dirty_events_armed {false};
+} // namespace Detail
+
 bool Armed() noexcept {
 	return Instance().active.load(std::memory_order_relaxed);
+}
+
+void RecordDirtyEventSlow(uint64_t vaddr, uint64_t size) {
+	DirtyEventRecord record {};
+	record.progress   = GuestGpu::Progress();
+	record.submission = GuestGpu::SubmissionIndex();
+	record.vaddr      = vaddr;
+	record.size       = size;
+
+	auto&            recorder = Instance().recorder;
+	std::scoped_lock lock(recorder.dirty_mutex);
+	recorder.dirty_events.push_back(record);
 }
 
 bool ExitAfterCapture() noexcept {
@@ -509,10 +557,14 @@ void RecordDone() {
 }
 
 void ResetFrame() noexcept {
-	auto&            recorder = Instance().recorder;
-	std::scoped_lock lock(recorder.mutex);
-	recorder.ordered.clear();
-	recorder.pending.clear();
+	auto& recorder = Instance().recorder;
+	{
+		std::scoped_lock lock(recorder.mutex);
+		recorder.ordered.clear();
+		recorder.pending.clear();
+	}
+	std::scoped_lock lock(recorder.dirty_mutex);
+	recorder.dirty_events.clear();
 }
 
 bool ShouldCapture(int frame_num) {
@@ -532,7 +584,8 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
                   std::span<const ProcessorRegisters> processors) {
 	auto& state = Instance();
 	// One capture per run: disarm before anything can fail, so a broken capture does not retry
-	// every frame.
+	// every frame. The dirty-mark path is disarmed with it, but only once the events already in the
+	// recorder have been written out below.
 	state.active.store(false, std::memory_order_relaxed);
 
 	const auto  started = std::chrono::steady_clock::now();
@@ -578,7 +631,10 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
 	// 3. Everything else.
-	const auto dirty_pages = WriteDirtyPages(renderer, ranges, folder, ok);
+	const auto dirty_pages  = WriteDirtyPages(renderer, ranges, folder, ok);
+	const auto progress     = GuestGpu::Progress();
+	const auto dirty_events = WriteDirtyEvents(folder, ok);
+	Detail::g_dirty_events_armed.store(false, std::memory_order_relaxed);
 	uint32_t   width       = 0;
 	uint32_t   height      = 0;
 	const auto video_out   = WriteVideoOut(folder, width, height, ok);
@@ -610,6 +666,8 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	out += fmt::format("\t\"memory_bytes\": {},\n", memory.bytes);
 	out += fmt::format("\t\"memory_seconds\": {:.3f},\n", memory_seconds);
 	out += fmt::format("\t\"dirty_pages\": {},\n", dirty_pages);
+	out += fmt::format("\t\"dirty_events\": {},\n", dirty_events);
+	out += fmt::format("\t\"progress_events\": {},\n", progress);
 	out += fmt::format("\t\"submissions\": {},\n", submissions);
 	out += fmt::format("\t\"prt_apertures\": {},\n", apertures);
 	out += fmt::format("\t\"shaders\": {},\n", shaders);
@@ -644,15 +702,17 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	const auto seconds =
 	    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 	LOGF("FrameCapture: frame %d written to %s in %.2f s: %" PRIu64 " ranges, %" PRIu64
-	     " pages (%.2f MiB), %" PRIu64 " dirty pages, %" PRIu64 " submissions, %zu gaps%s\n",
+	     " pages (%.2f MiB), %" PRIu64 " dirty pages, %" PRIu64 " dirty events over %" PRIu32
+	     " draws, %" PRIu64 " submissions, %zu gaps%s\n",
 	     frame_num, folder.string().c_str(), seconds, memory.ranges, memory.pages,
-	     static_cast<double>(memory.bytes) / (1024.0 * 1024.0), dirty_pages, submissions,
-	     gaps.size(), ok ? "" : " (INCOMPLETE)");
+	     static_cast<double>(memory.bytes) / (1024.0 * 1024.0), dirty_pages, dirty_events, progress,
+	     submissions, gaps.size(), ok ? "" : " (INCOMPLETE)");
 	std::printf("FrameCapture: frame %d written to %s in %.2f s: %" PRIu64 " pages (%.2f MiB), "
-	            "%" PRIu64 " submissions, %zu gaps%s\n",
+	            "%" PRIu64 " submissions, %" PRIu64 " dirty events over %" PRIu32
+	            " draws, %zu gaps%s\n",
 	            frame_num, folder.string().c_str(), seconds, memory.pages,
-	            static_cast<double>(memory.bytes) / (1024.0 * 1024.0), submissions, gaps.size(),
-	            ok ? "" : " (INCOMPLETE)");
+	            static_cast<double>(memory.bytes) / (1024.0 * 1024.0), submissions, dirty_events,
+	            progress, gaps.size(), ok ? "" : " (INCOMPLETE)");
 	std::fflush(stdout);
 
 	return ok;

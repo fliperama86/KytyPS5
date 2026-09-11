@@ -9,6 +9,8 @@
 //   ranges.bin        RangeRecord[]            every mapped guest range at capture time
 //   memory.bin        PageRecord[]             every non-zero 16 KiB page of committed ranges
 //   dirty-pages.bin   uint64_t[]               pages the CPU modified during the captured frame
+//   dirty-events.bin  DirtyEventRecord[]       every CPU-dirty mark of the frame, in arrival
+//                                              order, keyed to the GPU thread's progress (v3)
 //   submissions.bin   SubmissionRecord stream  the captured frame, in processing-start order
 //   registers.bin     RegisterFileRecord stream  command-processor register files at frame start
 //   videoout.bin      VideoOutRecord stream    buffer registrations, one per attribute group
@@ -25,7 +27,10 @@ namespace Libs::Graphics::Replay {
 
 // Version 2 adds prt.bin and shaders.bin. A version 1 capture still replays: the apertures
 // and the shader map are then recovered or reported missing, see docs/frame-replay.md.
-constexpr uint32_t kFormatVersion    = 2;
+//
+// Version 3 adds dirty-events.bin, the *timing* of the frame's CPU writes. dirty-pages.bin stays
+// for older readers and is what a v3 replay falls back to when the event stream is absent.
+constexpr uint32_t kFormatVersion    = 3;
 constexpr uint32_t kMinFormatVersion = 1;
 constexpr uint64_t kPageSize         = 16384;
 
@@ -123,18 +128,40 @@ struct ShaderRecord {
 };
 static_assert(sizeof(ShaderRecord) == 40);
 
+// One CPU-dirty mark of the captured frame (v3). The game dirties guest pages throughout the
+// frame, interleaved with the GPU thread's draws, and the BDA scan runs once per generation bump
+// (BufferCache::InvalidateBda, GpuResourceManager::PrepareBda), so *when* a mark arrives decides
+// how many scans a frame pays. Replaying the whole set in one batch before the frame collapses
+// hundreds of scans into a handful; see the phase C and phase D sections of docs/frame-replay.md.
+//
+// `progress` is GuestGpu::Progress() at the moment of the mark: a per-frame counter the GPU
+// thread bumps once per draw and once per dispatch and Done() resets. It is a clock that means
+// the same thing in the game and in a replay, unlike wall time. `submission` is the index of the
+// submission the GPU thread had started when the mark arrived, for reading the stream by hand;
+// the replay ignores it. Records are in arrival order, so the stream is sorted by neither field.
+struct DirtyEventRecord {
+	uint32_t progress   = 0;
+	uint32_t submission = 0;
+	uint64_t vaddr      = 0;
+	uint64_t size       = 0;
+};
+static_assert(sizeof(DirtyEventRecord) == 24);
+
 #pragma pack(pop)
 
 // manifest.json keys, all at the top level, written by the capture side. The replay side needs
 // only format_version and frame; everything else is for people and scripts.
 //
-//   "format_version": 2
+//   "format_version": 3
 //   "title_id": "PPSA01342"
 //   "commit": "<git hash of the capturing build>"
 //   "frame": <GuestGpu frame number of the captured frame>
 //   "width": <presented width>, "height": <presented height>
 //   "ranges": <count>, "pages": <count>, "dirty_pages": <count>, "submissions": <count>
 //   "prt_apertures": <count>, "shaders": <count>                                    (v2)
+//   "dirty_events": <count>          records in dirty-events.bin                    (v3)
+//   "progress_events": <count>       GuestGpu::Progress() at the end of the frame,
+//                                    that is draws plus dispatches                  (v3)
 //   "gaps": [ {"vaddr": <hex string>, "size": <hex string>, "reason": "<text>"}, ... ]
 //           ranges the capture could not read back from the GPU (image-owned or unsupported)
 

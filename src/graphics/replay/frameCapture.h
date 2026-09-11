@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/replay/frameCaptureFormat.h"
 
+#include <atomic>
 #include <cstdint>
 #include <span>
 
@@ -23,6 +24,24 @@ namespace Libs::Graphics::Replay {
 // True when the submissions of the frame the GPU is on must be recorded. `frame_num` is
 // GuestGpu::GetFrameNum() at submit time.
 [[nodiscard]] bool RecordingFrame(int frame_num) noexcept;
+
+namespace Detail {
+// True while a capture is armed and has not been written. Read on the CPU-dirty marking path,
+// which runs tens of thousands of times per frame, so it is a plain relaxed load with no
+// function-local static behind it.
+extern std::atomic_bool g_dirty_events_armed;
+} // namespace Detail
+
+// Appends one CPU-dirty mark {progress, submission, vaddr, size} to the frame (format version 3,
+// docs/frame-replay.md). Called from BufferCache's invalidation path, which is where the host
+// page-fault handler and the kernel write paths both land. Inert, and one relaxed atomic load,
+// unless --frame-capture armed a capture.
+void RecordDirtyEventSlow(uint64_t vaddr, uint64_t size);
+inline void RecordDirtyEvent(uint64_t vaddr, uint64_t size) {
+	if (Detail::g_dirty_events_armed.load(std::memory_order_relaxed)) {
+		RecordDirtyEventSlow(vaddr, size);
+	}
+}
 
 // Copies the dwords and returns the capture id to carry on the Submission; 0 when not recording.
 [[nodiscard]] uint64_t RecordEnqueue(SubmissionKind kind, uint32_t queue_id,

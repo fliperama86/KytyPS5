@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/replay/frameCapture.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -252,6 +253,10 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	InvalidateBda(vaddr, size);
+	// Frame capture (docs/frame-replay.md): this is where a guest CPU write lands, whether it came
+	// from the host page-fault handler or from a kernel write path. The capture records when it
+	// arrived so a replay can re-mark it at the same point in the frame.
+	Replay::RecordDirtyEvent(vaddr, size);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -307,6 +312,7 @@ void BufferCache::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	}
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	InvalidateBda(vaddr, size);
+	Replay::RecordDirtyEvent(vaddr, size);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

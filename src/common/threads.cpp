@@ -5,9 +5,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <chrono>             // IWYU pragma: keep
+#include <chrono> // IWYU pragma: keep
+#include <cinttypes>
 #include <condition_variable> // IWYU pragma: keep
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
@@ -24,9 +28,13 @@
 #include <string>
 #include <thread>
 
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
+// IWYU pragma: no_include <processthreadsapi.h>
+#endif
+
+#ifdef KYTY_WIN_CS
 constexpr DWORD    KYTY_CS_SPIN_COUNT          = 4000;
 constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
 
@@ -471,5 +479,93 @@ int Thread::GetThreadIdUnique() {
 	static thread_local int tid = ++g_thread_counter;
 	return tid;
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// A hexadecimal CPU mask, with or without the 0x prefix. Zero means "leave the thread alone", so an
+// unset, empty or unparseable value and an explicit mask of 0 all read the same way.
+static uint64_t ParseAffinityMask(const char* text) {
+	if (text == nullptr) {
+		return 0;
+	}
+	while (*text == ' ' || *text == '\t') {
+		text++;
+	}
+	if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+		text += 2;
+	}
+	if (*text == '\0') {
+		return 0;
+	}
+	char*      end   = nullptr;
+	const auto value = std::strtoull(text, &end, 16);
+	if (end == text) {
+		return 0;
+	}
+	return static_cast<uint64_t>(value);
+}
+
+// The variables are a startup choice, so each one is read from the environment exactly once no
+// matter how many threads ask for it. At most three entries ever land here.
+static uint64_t AffinityMaskFor(const char* variable) {
+	static std::recursive_mutex                          mutex;
+	static std::vector<std::pair<std::string, uint64_t>> cache;
+
+	std::lock_guard lock(mutex);
+	for (const auto& entry: cache) {
+		if (entry.first == variable) {
+			return entry.second;
+		}
+	}
+	// The UCRT marks getenv deprecated; the emulator target silences that globally, this one
+	// does not.
+#if KYTY_COMPILER == KYTY_COMPILER_CLANG
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+	const auto mask = ParseAffinityMask(std::getenv(variable));
+#if KYTY_COMPILER == KYTY_COMPILER_CLANG
+#pragma clang diagnostic pop
+#endif
+	cache.emplace_back(variable, mask);
+	return mask;
+}
+
+// One line per thread, at startup, and the guest printf direction is silent by default. Write it
+// the way the pipeline cache writes its own startup lines: straight to stdout when the log is not
+// already going there, and through the log either way.
+static void WriteAffinityLine(const std::string& message) {
+	if (Log::GetDirection() != Log::Direction::Console) {
+		std::fwrite(message.data(), 1, message.size(), stdout);
+		std::fflush(stdout);
+	}
+	Log::Write(message);
+	Log::Flush();
+}
+
+void ApplyThreadAffinityFromEnv(const char* variable, const char* thread_label) {
+	const auto mask = AffinityMaskFor(variable);
+	if (mask == 0) {
+		return;
+	}
+	const auto* label    = (thread_label != nullptr && *thread_label != '\0' ? thread_label : "?");
+	const auto  thread   = static_cast<uint32_t>(GetCurrentThreadId());
+	const auto  previous = SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask));
+	if (previous == 0) {
+		WriteAffinityLine(
+		    fmt::sprintf("affinity: %s = 0x%016" PRIx64 " rejected for %s (thread %u), error %u\n",
+		                 variable, mask, label, thread, static_cast<uint32_t>(GetLastError())));
+		return;
+	}
+	WriteAffinityLine(fmt::sprintf("affinity: %s -> %s (thread %u): mask 0x%016" PRIx64
+	                               ", was 0x%016" PRIx64 "\n",
+	                               variable, label, thread, mask, static_cast<uint64_t>(previous)));
+}
+
+#else
+
+void ApplyThreadAffinityFromEnv(const char* /*variable*/, const char* /*thread_label*/) {}
+
+#endif
 
 } // namespace Common

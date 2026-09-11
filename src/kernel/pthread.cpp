@@ -1136,6 +1136,8 @@ void PthreadInitSelfForMainThread() {
 	     g_pthread_self->unique_id, os_thread_id,
 	     reinterpret_cast<uint64_t>(g_pthread_self->attr->stack_addr),
 	     static_cast<uint64_t>(g_pthread_self->attr->stack_size));
+
+	Common::ApplyThreadAffinityFromEnv("KYTY_GUEST_THREAD_AFFINITY", "MainThread");
 }
 
 void* PthreadCreateMainGuestStack() {
@@ -3458,6 +3460,8 @@ static void* RunThread(void* arg) {
 	     reinterpret_cast<uint64_t>(thread->entry), reinterpret_cast<uint64_t>(thread->arg),
 	     reinterpret_cast<uint64_t>(thread->attr->stack_addr),
 	     static_cast<uint64_t>(thread->attr->stack_size));
+
+	Common::ApplyThreadAffinityFromEnv("KYTY_GUEST_THREAD_AFFINITY", thread->name.c_str());
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_push(CleanupThread, thread);

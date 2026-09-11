@@ -16,10 +16,12 @@ struct ImageInfo;
 struct WindowContext;
 
 // Frame replay (docs/frame-replay.md): the last presented frame copied into host memory,
-// tightly packed, four bytes per pixel.
+// tightly packed. The guest picks the video-out pixel format, so both the name and the pixel
+// size have to travel with the bytes: this title presents A2B10G10R10, not an 8-bit format.
 struct PresentedImage {
-	uint32_t             width  = 0;
-	uint32_t             height = 0;
+	uint32_t             width            = 0;
+	uint32_t             height           = 0;
+	uint32_t             bytes_per_pixel  = 4;
 	std::string          format;
 	std::vector<uint8_t> pixels;
 };

@@ -765,7 +765,8 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 			std::ofstream sidecar(sidecar_path, std::ios::binary | std::ios::trunc);
 			sidecar << "{\"width\":" << readback.width << ",\"height\":" << readback.height
 			        << ",\"format\":\"" << readback.format
-			        << "\",\"bytes_per_pixel\":4,\"stride\":" << readback.width * 4u << "}\n";
+			        << "\",\"bytes_per_pixel\":" << readback.bytes_per_pixel << ",\"stride\":"
+			        << readback.width * readback.bytes_per_pixel << "}\n";
 			sidecar.close();
 			::printf("  image          %s (%ux%u %s) + %s\n", image.string().c_str(),
 			         readback.width, readback.height, readback.format.c_str(),

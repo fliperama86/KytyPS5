@@ -19,6 +19,8 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -765,6 +767,24 @@ RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
 
+namespace {
+// Names the presented image's format for the replay image sidecar, with the bytes a tightly
+// packed row uses per pixel. Anything outside VIDEO_OUT_FORMAT_POLICIES falls back to the Vulkan
+// enum name, so a new policy is readable rather than silently mislabelled.
+std::pair<std::string, uint32_t> DescribePresentedFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb: return {"RGBA8", 4};
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb: return {"BGRA8", 4};
+		case vk::Format::eA2B10G10R10UnormPack32: return {"A2B10G10R10_UNORM_PACK32", 4};
+		case vk::Format::eA2R10G10B10UnormPack32: return {"A2R10G10B10_UNORM_PACK32", 4};
+		case vk::Format::eR16G16B16A16Sfloat: return {"RGBA16F", 8};
+		default: return {vk::to_string(format), 4};
+	}
+}
+} // namespace
+
 bool Presenter::ReadLastPresentedFrame(PresentedImage* out) {
 	EXIT_IF(out == nullptr);
 
@@ -775,7 +795,10 @@ bool Presenter::ReadLastPresentedFrame(PresentedImage* out) {
 
 	const auto width  = frame->image.extent.width;
 	const auto height = frame->image.extent.height;
-	const auto size   = static_cast<uint64_t>(width) * height * 4u;
+	// The guest chooses the video-out pixel format (VIDEO_OUT_FORMAT_POLICIES); it is not always
+	// an 8-bit one, and the 16-bit float policy is eight bytes per pixel.
+	const auto [format_name, bytes_per_pixel] = DescribePresentedFormat(frame->image.format);
+	const auto size = static_cast<uint64_t>(width) * height * bytes_per_pixel;
 
 	bool ok = false;
 	{
@@ -829,7 +852,8 @@ bool Presenter::ReadLastPresentedFrame(PresentedImage* out) {
 		if (mapped.size() >= size) {
 			out->width  = width;
 			out->height = height;
-			out->format = frame->image.format == vk::Format::eR8G8B8A8Unorm ? "RGBA8" : "BGRA8";
+			out->format          = format_name;
+			out->bytes_per_pixel = bytes_per_pixel;
 			out->pixels.assign(mapped.begin(), mapped.begin() + static_cast<std::ptrdiff_t>(size));
 			ok = true;
 		}

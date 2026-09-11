@@ -18,6 +18,11 @@ struct CaptureManifest {
 	uint64_t frame          = 0;
 	uint32_t width          = 0;
 	uint32_t height         = 0;
+	// Version 3. `progress_events` is GuestGpu::Progress() at the end of the captured frame, the
+	// draws plus dispatches the replay's progress clock has to reach for every dirty event to be
+	// marked on time; both are 0 in an older capture.
+	uint64_t dirty_events    = 0;
+	uint64_t progress_events = 0;
 };
 
 struct CaptureRegisterFile {
@@ -57,6 +62,10 @@ public:
 	bool ReadPrtApertures(std::vector<PrtApertureRecord>* out, bool* present,
 	                      std::string* error) const;
 	bool ReadShaders(std::vector<ShaderRecord>* out, bool* present, std::string* error) const;
+	// The version 3 stream: every CPU-dirty mark of the frame in arrival order. Absent in a v1 or
+	// v2 capture, which reports `present` false and leaves the replay on the batch path.
+	bool ReadDirtyEvents(std::vector<DirtyEventRecord>* out, bool* present,
+	                     std::string* error) const;
 
 	// Streams memory.bin one page at a time, so a multi-GB capture never has to fit in memory.
 	// The sink returns false to stop with an error the caller has already reported.

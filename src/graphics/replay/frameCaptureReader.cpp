@@ -123,6 +123,18 @@ bool CaptureReader::ParseManifest(const std::string& text, CaptureManifest* out,
 	}
 	manifest.height = found ? static_cast<uint32_t>(value) : 0;
 
+	if (!ManifestNumber(text, "dirty_events", &value, &found)) {
+		SetError(error, "manifest.json has a malformed dirty_events");
+		return false;
+	}
+	manifest.dirty_events = found ? value : 0;
+
+	if (!ManifestNumber(text, "progress_events", &value, &found)) {
+		SetError(error, "manifest.json has a malformed progress_events");
+		return false;
+	}
+	manifest.progress_events = found ? value : 0;
+
 	*out = manifest;
 	return true;
 }
@@ -328,6 +340,11 @@ bool CaptureReader::ReadPrtApertures(std::vector<PrtApertureRecord>* out, bool* 
 bool CaptureReader::ReadShaders(std::vector<ShaderRecord>* out, bool* present,
                                 std::string* error) const {
 	return ReadOptionalRecords(m_dir / "shaders.bin", out, present, error, "shaders.bin");
+}
+
+bool CaptureReader::ReadDirtyEvents(std::vector<DirtyEventRecord>* out, bool* present,
+                                    std::string* error) const {
+	return ReadOptionalRecords(m_dir / "dirty-events.bin", out, present, error, "dirty-events.bin");
 }
 
 bool CaptureReader::ForEachPage(const PageSink& sink, uint64_t* pages, std::string* error) const {

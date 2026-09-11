@@ -98,9 +98,10 @@ bool CaptureReader::ParseManifest(const std::string& text, CaptureManifest* out,
 		return false;
 	}
 	manifest.format_version = static_cast<uint32_t>(value);
-	if (manifest.format_version != kFormatVersion) {
+	if (manifest.format_version < kMinFormatVersion || manifest.format_version > kFormatVersion) {
 		SetError(error, "capture format version " + std::to_string(manifest.format_version) +
-		                    " but this build reads version " + std::to_string(kFormatVersion));
+		                    " but this build reads versions " + std::to_string(kMinFormatVersion) +
+		                    " to " + std::to_string(kFormatVersion));
 		return false;
 	}
 
@@ -290,6 +291,43 @@ bool CaptureReader::ReadSubmissions(std::vector<CaptureSubmission>* out, std::st
 		}
 		out->push_back(std::move(submission));
 	}
+}
+
+// A stream a version 1 capture does not have: a missing file is not an error, a truncated one
+// is.
+template <typename T>
+static bool ReadOptionalRecords(const std::filesystem::path& path, std::vector<T>* out,
+                                bool* present, std::string* error, const char* what) {
+	out->clear();
+	*present = false;
+
+	std::ifstream stream(path, std::ios::binary);
+	if (!stream.is_open()) {
+		return true;
+	}
+	*present = true;
+	for (;;) {
+		T    record {};
+		bool at_end = false;
+		if (!ReadExact(stream, &record, sizeof(record), &at_end)) {
+			if (at_end) {
+				return true;
+			}
+			SetError(error, std::string(what) + " ends inside a record");
+			return false;
+		}
+		out->push_back(record);
+	}
+}
+
+bool CaptureReader::ReadPrtApertures(std::vector<PrtApertureRecord>* out, bool* present,
+                                     std::string* error) const {
+	return ReadOptionalRecords(m_dir / "prt.bin", out, present, error, "prt.bin");
+}
+
+bool CaptureReader::ReadShaders(std::vector<ShaderRecord>* out, bool* present,
+                                std::string* error) const {
+	return ReadOptionalRecords(m_dir / "shaders.bin", out, present, error, "shaders.bin");
 }
 
 bool CaptureReader::ForEachPage(const PageSink& sink, uint64_t* pages, std::string* error) const {

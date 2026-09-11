@@ -12,6 +12,8 @@
 //   submissions.bin   SubmissionRecord stream  the captured frame, in processing-start order
 //   registers.bin     RegisterFileRecord stream  command-processor register files at frame start
 //   videoout.bin      VideoOutRecord stream    buffer registrations, one per attribute group
+//   prt.bin           PrtApertureRecord[]      partially-resident-texture apertures (v2)
+//   shaders.bin       ShaderRecord[]           the AGC shader map (v2)
 //   frame.png         the presented frame (may be absent; then frame.raw + manifest width/height)
 //
 // All integers little-endian, all records packed, no padding. Streams are read until end of file.
@@ -21,8 +23,11 @@
 
 namespace Libs::Graphics::Replay {
 
-constexpr uint32_t kFormatVersion = 1;
-constexpr uint64_t kPageSize      = 16384;
+// Version 2 adds prt.bin and shaders.bin. A version 1 capture still replays: the apertures
+// and the shader map are then recovered or reported missing, see docs/frame-replay.md.
+constexpr uint32_t kFormatVersion    = 2;
+constexpr uint32_t kMinFormatVersion = 1;
+constexpr uint64_t kPageSize         = 16384;
 
 #pragma pack(push, 1)
 
@@ -92,17 +97,44 @@ struct VideoOutRecord {
 };
 static_assert(sizeof(VideoOutRecord) == 24);
 
+// One partially-resident-texture aperture, as set by sceKernelSetPrtAperture. Only apertures
+// with a non-zero size are written. An image whose resident head is a committed range and whose
+// tail is a reserved hole is read through the aperture (Memory::TryReadPrtBacking), so a replay
+// that does not restore these cannot read that image at all.
+struct PrtApertureRecord {
+	int32_t  index   = 0;
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+static_assert(sizeof(PrtApertureRecord) == 20);
+
+// One entry of the AGC shader map (graphics/shader/shader.cpp), which sceAgcCreateShader fills
+// and every draw and dispatch resolves through. A replay runs no guest code, so it has to be
+// restored; every field is a guest address or a plain number, and the structs they point at
+// live in guest memory and come back with it.
+struct ShaderRecord {
+	uint64_t code_address        = 0; // ShaderMap key: the shader code base
+	uint64_t user_data           = 0; // guest ShaderUserData*, may be 0
+	uint64_t input_semantics     = 0; // guest ShaderSemantic*, may be 0
+	uint32_t num_input_semantics = 0;
+	uint32_t code_size_bytes     = 0;
+	uint32_t scratch_size_dwords = 0;
+	uint32_t type                = 0; // Prospero::ShaderBinaryType
+};
+static_assert(sizeof(ShaderRecord) == 40);
+
 #pragma pack(pop)
 
 // manifest.json keys, all at the top level, written by the capture side. The replay side needs
 // only format_version and frame; everything else is for people and scripts.
 //
-//   "format_version": 1
+//   "format_version": 2
 //   "title_id": "PPSA01342"
 //   "commit": "<git hash of the capturing build>"
 //   "frame": <GuestGpu frame number of the captured frame>
 //   "width": <presented width>, "height": <presented height>
 //   "ranges": <count>, "pages": <count>, "dirty_pages": <count>, "submissions": <count>
+//   "prt_apertures": <count>, "shaders": <count>                                    (v2)
 //   "gaps": [ {"vaddr": <hex string>, "size": <hex string>, "reason": "<text>"}, ... ]
 //           ranges the capture could not read back from the GPU (image-owned or unsupported)
 

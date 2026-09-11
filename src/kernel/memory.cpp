@@ -1030,6 +1030,20 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	return false;
 }
 
+std::vector<PrtApertureSnapshot> SnapshotPrtApertures() {
+	Common::LockGuard lock(g_prt_aperture_mutex);
+
+	std::vector<PrtApertureSnapshot> snapshot;
+	for (size_t index = 0; index < g_prt_apertures.size(); index++) {
+		const auto& aperture = g_prt_apertures[index];
+		if (aperture.size == 0) {
+			continue;
+		}
+		snapshot.push_back({static_cast<int32_t>(index), aperture.address, aperture.size});
+	}
+	return snapshot;
+}
+
 bool TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size) {
 	std::vector<VirtualRanges::Range> ranges;
 	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr ||

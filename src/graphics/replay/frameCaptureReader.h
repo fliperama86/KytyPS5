@@ -52,6 +52,11 @@ public:
 	bool ReadRegisterFiles(std::vector<CaptureRegisterFile>* out, std::string* error) const;
 	bool ReadVideoOut(std::vector<CaptureVideoOut>* out, std::string* error) const;
 	bool ReadSubmissions(std::vector<CaptureSubmission>* out, std::string* error) const;
+	// Version 2 streams. A version 1 capture has neither file; both then report `present`
+	// false with an empty vector and no error, so an old capture still replays.
+	bool ReadPrtApertures(std::vector<PrtApertureRecord>* out, bool* present,
+	                      std::string* error) const;
+	bool ReadShaders(std::vector<ShaderRecord>* out, bool* present, std::string* error) const;
 
 	// Streams memory.bin one page at a time, so a multi-GB capture never has to fit in memory.
 	// The sink returns false to stop with an error the caller has already reported.

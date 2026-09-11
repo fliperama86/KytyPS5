@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
@@ -369,6 +370,56 @@ uint32_t WriteVideoOut(const std::filesystem::path& folder, uint32_t& width, uin
 	return static_cast<uint32_t>(registrations.size());
 }
 
+// The partially-resident-texture apertures. Without them a replay cannot read a partly
+// resident image at all: Memory::TryReadPrtBacking refuses outside an aperture.
+uint32_t WritePrtApertures(const std::filesystem::path& folder, bool& ok) {
+	Writer file;
+	if (!file.Open(folder / "prt.bin")) {
+		LOGF("FrameCapture: cannot create prt.bin\n");
+		ok = false;
+		return 0;
+	}
+
+	const auto apertures = LibKernel::Memory::SnapshotPrtApertures();
+	for (const auto& aperture: apertures) {
+		PrtApertureRecord record {};
+		record.index   = aperture.index;
+		record.address = aperture.address;
+		record.size    = aperture.size;
+		file.Write(&record, sizeof(record));
+	}
+
+	ok = file.Close() && ok;
+	return static_cast<uint32_t>(apertures.size());
+}
+
+// The AGC shader map. Guest code built it through sceAgcCreateShader before the capture; a
+// replay runs no guest code, so every draw and dispatch would fail to resolve its shader.
+uint64_t WriteShaders(const std::filesystem::path& folder, bool& ok) {
+	Writer file;
+	if (!file.Open(folder / "shaders.bin")) {
+		LOGF("FrameCapture: cannot create shaders.bin\n");
+		ok = false;
+		return 0;
+	}
+
+	const auto entries = ShaderSnapshotMap();
+	for (const auto& entry: entries) {
+		ShaderRecord record {};
+		record.code_address        = entry.code_address;
+		record.user_data           = reinterpret_cast<uint64_t>(entry.data.user_data);
+		record.input_semantics     = reinterpret_cast<uint64_t>(entry.data.input_semantics);
+		record.num_input_semantics = entry.data.num_input_semantics;
+		record.code_size_bytes     = entry.data.code_size_bytes;
+		record.scratch_size_dwords = entry.data.scratch_size_dwords;
+		record.type                = static_cast<uint32_t>(entry.data.type);
+		file.Write(&record, sizeof(record));
+	}
+
+	ok = file.Close() && ok;
+	return static_cast<uint64_t>(entries.size());
+}
+
 uint64_t WriteSubmissions(const std::filesystem::path& folder, bool& ok) {
 	Writer file;
 	if (!file.Open(folder / "submissions.bin")) {
@@ -533,6 +584,8 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	const auto video_out   = WriteVideoOut(folder, width, height, ok);
 	WriteRegisters(processors, folder, ok);
 	const auto submissions = WriteSubmissions(folder, ok);
+	const auto apertures   = WritePrtApertures(folder, ok);
+	const auto shaders     = WriteShaders(folder, ok);
 
 	if (width == 0) {
 		width  = Config::GetScreenWidth();
@@ -558,6 +611,8 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	out += fmt::format("\t\"memory_seconds\": {:.3f},\n", memory_seconds);
 	out += fmt::format("\t\"dirty_pages\": {},\n", dirty_pages);
 	out += fmt::format("\t\"submissions\": {},\n", submissions);
+	out += fmt::format("\t\"prt_apertures\": {},\n", apertures);
+	out += fmt::format("\t\"shaders\": {},\n", shaders);
 	out += fmt::format("\t\"video_out_registrations\": {},\n", video_out);
 	out += fmt::format("\t\"register_files\": {},\n", processors.size());
 	out += fmt::format("\t\"flushed_buffer_bytes\": {},\n", flushed_bytes);

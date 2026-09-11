@@ -62,6 +62,14 @@ struct VirtualRangeSnapshot {
 	char     name[KERNEL_MAXIMUM_NAME_LENGTH] {};
 };
 
+// One partially-resident-texture aperture. A frame capture records these and a replay puts
+// them back, because IsInPrtAperture gates every read of a partly resident image.
+struct PrtApertureSnapshot {
+	int32_t  index   = 0;
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+
 struct KernelBatchMapEntry {
 	void*         start;
 	uint64_t      offset;
@@ -136,6 +144,8 @@ bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t si
 // Every mapped range, reserved ones included, sorted by address. For the frame capture; taken
 // under the range lock alone, so it is consistent with itself but not with a concurrent syscall.
 [[nodiscard]] std::vector<VirtualRangeSnapshot> SnapshotVirtualRanges();
+// Every aperture with a non-zero size, in index order.
+[[nodiscard]] std::vector<PrtApertureSnapshot> SnapshotPrtApertures();
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;

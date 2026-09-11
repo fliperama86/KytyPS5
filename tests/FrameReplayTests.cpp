@@ -51,6 +51,11 @@ constexpr uint32_t RANGE_TYPE_FLEXIBLE = 3;
 constexpr uint32_t PROT_READ_WRITE     = 0x03;
 constexpr uint32_t PROT_GPU_READ_WRITE = 0x33;
 
+// A PRT aperture well clear of the ranges above, inside the kernel aperture window
+// (0x0f00000000 to 0xfc00000000) and 16 KiB aligned.
+constexpr uint64_t PRT_APERTURE_ADDRESS = 0x1200000000ull;
+constexpr uint64_t PRT_APERTURE_SIZE    = 0x400000ull;
+
 constexpr uint32_t DISPLAY_WIDTH  = 256;
 constexpr uint32_t DISPLAY_HEIGHT = 128;
 // VIDEO_OUT_FORMAT_POLICIES: B8G8R8A8 sRGB, four bytes per element.
@@ -215,6 +220,29 @@ bool WriteCapture(const std::filesystem::path& dir) {
 		writer.Bytes(addresses, sizeof(addresses));
 	}
 
+	{
+		Writer writer(dir / "prt.bin");
+		if (!writer.Ok()) {
+			return false;
+		}
+		PrtApertureRecord record {};
+		record.index   = 0;
+		record.address = PRT_APERTURE_ADDRESS;
+		record.size    = PRT_APERTURE_SIZE;
+		writer.Value(record);
+	}
+
+	{
+		Writer writer(dir / "shaders.bin");
+		if (!writer.Ok()) {
+			return false;
+		}
+		ShaderRecord record {};
+		record.code_address    = SCRATCH_ADDRESS;
+		record.code_size_bytes = 0x100;
+		writer.Value(record);
+	}
+
 	size_t submission_count = 0;
 	{
 		Writer writer(dir / "submissions.bin");
@@ -287,7 +315,9 @@ void RunTests(const std::filesystem::path& root) {
 	CHECK(CaptureReader::ParseManifest("{\"format_version\": 1, \"frame\": 7}", &manifest, &error));
 	CHECK(manifest.format_version == 1);
 	CHECK(manifest.frame == 7);
-	CHECK(!CaptureReader::ParseManifest("{\"format_version\": 2}", &manifest, &error));
+	CHECK(CaptureReader::ParseManifest("{\"format_version\": 1}", &manifest, &error));
+	CHECK(manifest.format_version == 1);
+	CHECK(!CaptureReader::ParseManifest("{\"format_version\": 3}", &manifest, &error));
 	CHECK(error.find("version") != std::string::npos);
 	CHECK(!CaptureReader::ParseManifest("{\"frame\": 1}", &manifest, &error));
 
@@ -320,6 +350,20 @@ void RunTests(const std::filesystem::path& root) {
 	CHECK(video_out[0].addresses.size() == 2);
 	CHECK(video_out[0].addresses[0] == DISPLAY_ADDRESS);
 
+	std::vector<PrtApertureRecord> apertures;
+	bool                           present = false;
+	CHECK(reader.ReadPrtApertures(&apertures, &present, &error));
+	CHECK(present);
+	CHECK(apertures.size() == 1);
+	CHECK(apertures[0].address == PRT_APERTURE_ADDRESS);
+	CHECK(apertures[0].size == PRT_APERTURE_SIZE);
+
+	std::vector<ShaderRecord> shaders;
+	CHECK(reader.ReadShaders(&shaders, &present, &error));
+	CHECK(present);
+	CHECK(shaders.size() == 1);
+	CHECK(shaders[0].code_address == SCRATCH_ADDRESS);
+
 	std::vector<CaptureSubmission> submissions;
 	CHECK(reader.ReadSubmissions(&submissions, &error));
 	CHECK(submissions.size() == 3);
@@ -343,11 +387,11 @@ void RunTests(const std::filesystem::path& root) {
 	CHECK(seen == 5);
 
 	// A capture cut short inside a record is rejected, not read as far as it goes.
-	const auto truncated = root / "truncated";
+	const auto      truncated = root / "truncated";
+	std::error_code ec;
 	CopyCapture(good, truncated);
 	{
-		std::error_code ec;
-		const auto      size = std::filesystem::file_size(truncated / "submissions.bin", ec);
+		const auto size = std::filesystem::file_size(truncated / "submissions.bin", ec);
 		TruncateFile(truncated / "submissions.bin", size - 8);
 		CaptureReader short_reader;
 		CHECK(short_reader.Open(truncated, &error));
@@ -356,8 +400,7 @@ void RunTests(const std::filesystem::path& root) {
 		CHECK(error.find("submissions.bin") != std::string::npos);
 	}
 	{
-		std::error_code ec;
-		const auto      size = std::filesystem::file_size(truncated / "memory.bin", ec);
+		const auto size = std::filesystem::file_size(truncated / "memory.bin", ec);
 		TruncateFile(truncated / "memory.bin", size - 32);
 		CaptureReader short_reader;
 		CHECK(short_reader.Open(truncated, &error));
@@ -367,13 +410,46 @@ void RunTests(const std::filesystem::path& root) {
 		CHECK(error.find("memory.bin") != std::string::npos);
 	}
 	{
-		std::error_code ec;
-		const auto      size = std::filesystem::file_size(truncated / "ranges.bin", ec);
+		const auto size = std::filesystem::file_size(truncated / "ranges.bin", ec);
 		TruncateFile(truncated / "ranges.bin", size - 4);
 		CaptureReader short_reader;
 		CHECK(short_reader.Open(truncated, &error));
 		std::vector<RangeRecord> records;
 		CHECK(!short_reader.ReadRanges(&records, &error));
+	}
+
+	// A version 1 capture has no prt.bin and no shaders.bin; it still opens, and the two optional
+	// streams report themselves absent rather than failing.
+	const auto legacy = root / "legacy";
+	CopyCapture(good, legacy);
+	std::filesystem::remove(legacy / "prt.bin", ec);
+	std::filesystem::remove(legacy / "shaders.bin", ec);
+	ReplaceManifestVersion(legacy, "{\"format_version\": 1, \"frame\": 5}\n");
+	{
+		CaptureReader legacy_reader;
+		CHECK(legacy_reader.Open(legacy, &error));
+		CHECK(legacy_reader.Manifest().format_version == 1);
+		std::vector<PrtApertureRecord> none;
+		bool                           legacy_present = true;
+		CHECK(legacy_reader.ReadPrtApertures(&none, &legacy_present, &error));
+		CHECK(!legacy_present);
+		CHECK(none.empty());
+		std::vector<ShaderRecord> no_shaders;
+		CHECK(legacy_reader.ReadShaders(&no_shaders, &legacy_present, &error));
+		CHECK(!legacy_present);
+		CHECK(no_shaders.empty());
+	}
+
+	// A truncated optional stream is still an error.
+	{
+		const auto size = std::filesystem::file_size(truncated / "prt.bin", ec);
+		TruncateFile(truncated / "prt.bin", size - 4);
+		CaptureReader short_reader;
+		CHECK(short_reader.Open(truncated, &error));
+		std::vector<PrtApertureRecord> records;
+		bool                           short_present = false;
+		CHECK(!short_reader.ReadPrtApertures(&records, &short_present, &error));
+		CHECK(error.find("prt.bin") != std::string::npos);
 	}
 
 	// A capture from a different format version is rejected before anything is restored.
@@ -386,7 +462,6 @@ void RunTests(const std::filesystem::path& root) {
 
 	// A directory with no manifest at all is rejected too.
 	const auto empty = root / "empty";
-	std::error_code ec;
 	std::filesystem::create_directories(empty, ec);
 	CaptureReader empty_reader;
 	CHECK(!empty_reader.Open(empty, &error));

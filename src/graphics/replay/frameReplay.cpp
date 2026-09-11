@@ -158,6 +158,25 @@ bool IsHostReadable(uint32_t prot) {
 // its offsets are already absolute pointers and the restore puts them back at the same guest
 // addresses. So the replay scans the restored readable ranges for the header signature and
 // re-registers what it finds. A capture format v2 should record the map instead of inferring it.
+uint64_t RestoreRecordedShaderMap(const std::vector<ShaderRecord>& records) {
+	uint64_t registered = 0;
+	for (const auto& record: records) {
+		if (record.code_address == 0) {
+			continue;
+		}
+		ShaderMappedData map;
+		map.type            = static_cast<Prospero::ShaderBinaryType>(record.type);
+		map.user_data       = reinterpret_cast<ShaderUserData*>(record.user_data);       // NOLINT
+		map.input_semantics = reinterpret_cast<ShaderSemantic*>(record.input_semantics); // NOLINT
+		map.num_input_semantics = record.num_input_semantics;
+		map.code_size_bytes     = record.code_size_bytes;
+		map.scratch_size_dwords = record.scratch_size_dwords;
+		ShaderMapUserData(record.code_address, map);
+		registered++;
+	}
+	return registered;
+}
+
 uint64_t RestoreShaderMap(const std::vector<RestoredRange>& ranges) {
 	// Shader::file_header 0x34333231 ("1234") followed by Shader::version 0x00000018, the pair
 	// sceAgcCreateShader insists on.
@@ -456,14 +475,51 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops,
 		         static_cast<unsigned long long>(pages_failed));
 	}
 
-	// 2b. Shader map. Guest code created every shader before the capture; the replay recovers the
-	// registrations from the headers the game left in guest memory.
+	// 2b. PRT apertures. A partly resident image is a committed head followed by a reserved hole,
+	// and BufferCache reads it through Memory::TryReadPrtBacking, which refuses outside an
+	// aperture. Restore them before anything can touch such an image.
+	std::vector<PrtApertureRecord> apertures;
+	bool                           apertures_present = false;
+	if (!reader.ReadPrtApertures(&apertures, &apertures_present, &error)) {
+		Fail(error);
+		return 1;
+	}
+	uint32_t apertures_restored = 0;
+	for (const auto& aperture: apertures) {
+		if (Memory::KernelSetPrtAperture(aperture.index,
+		                                 reinterpret_cast<void*>(aperture.address), // NOLINT
+		                                 aperture.size) != 0) {
+			Fail("could not restore PRT aperture " + std::to_string(aperture.index));
+			return 1;
+		}
+		apertures_restored++;
+	}
+	if (!apertures_present) {
+		::printf("  prt apertures  none recorded (format version %u); a partly resident image "
+		         "cannot be read\n",
+		         reader.Manifest().format_version);
+	} else {
+		::printf("  prt apertures  %u restored\n", apertures_restored);
+	}
+
+	// 2c. Shader map. Guest code created every shader before the capture; version 2 records the
+	// map, version 1 leaves it to be recovered from the headers the game left in guest memory.
+	std::vector<ShaderRecord> shader_records;
+	bool                      shaders_present = false;
+	if (!reader.ReadShaders(&shader_records, &shaders_present, &error)) {
+		Fail(error);
+		return 1;
+	}
 	const auto shaders_start = Clock::now();
-	const auto shaders       = RestoreShaderMap(restored);
-	::printf("  shaders        %llu registrations recovered, %.0f ms\n",
-	         static_cast<unsigned long long>(shaders), MillisSince(shaders_start));
+	const auto shaders       = shaders_present && !shader_records.empty()
+	                               ? RestoreRecordedShaderMap(shader_records)
+	                               : RestoreShaderMap(restored);
+	::printf("  shaders        %llu registrations %s, %.0f ms\n",
+	         static_cast<unsigned long long>(shaders),
+	         shaders_present && !shader_records.empty() ? "restored" : "recovered by scan",
+	         MillisSince(shaders_start));
 	if (shaders == 0) {
-		::printf("  WARNING        no shader headers were found; every draw will fail\n");
+		::printf("  WARNING        the shader map is empty; every draw will fail\n");
 	}
 
 	// 3a. Register files, on the GPU thread so the lazy compute processors are created there.

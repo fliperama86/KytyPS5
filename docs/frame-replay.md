@@ -72,14 +72,17 @@ Taken at `Done()` of frame N, on the GPU thread:
 4. **Record the CPU-dirty page set of frame N** from the memory tracker, so replay can re-mark
    them dirty each loop and the dirty-upload path (`PrepareBda`) is exercised as in the game.
 5. **Dump emulator state.** Video-out registrations, the gfx and compute command-processor
-   register files, the current flip request id.
-6. **Screenshot** of frame N (`des-window.ps1 -Shot` equivalent inside the emulator, or the
-   presenter's readback). *Not implemented.* The presenter has no readback path at all: its
-   `Frame::image` is `eTransferSrc`, but nothing copies it to a host-visible buffer and
-   `Presenter` exposes no entry point for it. A capture therefore has no `frame.png` or
-   `frame.raw`; the manifest still carries `width` and `height`, taken from the video-out
-   attribute group. Adding the readback belongs with phase B, which needs the same code to write
-   the image after the last loop.
+   register files, the current flip request id, and the two things the render path needs that are
+   neither in guest memory nor in the PM4 stream: the partially-resident-texture apertures
+   (`prt.bin`, from `Memory::SnapshotPrtApertures`) and the AGC shader map (`shaders.bin`, from
+   `ShaderSnapshotMap`). Both arrived with format version 2; see the section on them below for
+   what happens without either.
+6. **Screenshot** of frame N. *Not implemented on the capture side.* A capture has no `frame.png`
+   or `frame.raw`; the manifest carries `width` and `height`, taken from the video-out attribute
+   group. Phase B added the readback the capture would need
+   (`Presenter::ReadLastPresentedFrame`, src/graphics/presentation/window/swapchain.cpp), so a
+   capture-time screenshot is now a few lines: acquire the last presented frame and write it the
+   way `--replay-image` does.
 
 Taken during frame N (between `Done()` of N-1 and `Done()` of N), on the submit path:
 
@@ -179,22 +182,33 @@ replay: <capture dir>
 `loop_ms` and `gpu_ms` arrays, and `summary` / `gpu_summary` objects with `min_ms`, `median_ms`,
 `max_ms`, `jitter` and `total_ms`, so two runs diff without re-parsing the console.
 
-### Gaps in the capture format the replay works around
+### Emulator state outside guest memory, and what version 2 records
 
-`src/graphics/replay/frameCaptureFormat.h` is fixed for version 1; these are the places where the
-replay has to infer what the capture does not record, listed so a version 2 can close them.
+Two things the render path needs are neither in guest memory nor in the PM4 stream, and both stop
+a replay dead. Format version 2 records them; a version 1 capture still opens, and the replay
+either recovers the state or says it could not.
 
-- **The shader map is not captured.** This is the one gap that would otherwise stop a replay dead.
-  Every draw and dispatch resolves its shader through `ShaderMap` (src/graphics/shader/shader.cpp),
-  which the game fills from `sceAgcCreateShader`; a replay runs no guest code, so the first
-  dispatch exits with "is missing from ShaderMap". Every field of an entry, though, comes from the
-  guest AGC shader header, and `sceAgcCreateShader` rewrites that header in place before the
-  capture, turning its offsets into absolute pointers that land back at the same guest addresses on
-  restore. So the replay scans the restored readable ranges for the header signature
-  (`file_header` 0x34333231 followed by `version` 0x18), validates each candidate against the
-  ranges it restored, and re-registers it. On the title-1 capture this recovers 4374 registrations
-  in 1.5 s, with no address claimed by two headers. A `shaders.bin` stream of
-  `{code_address, header_address}` pairs in format v2 would make the scan unnecessary.
+- **The AGC shader map** (`shaders.bin`). Every draw and dispatch resolves its shader through
+  `ShaderMap` (src/graphics/shader/shader.cpp), which the game fills from `sceAgcCreateShader`; a
+  replay runs no guest code, so without it the first dispatch exits with "is missing from
+  ShaderMap". The capture writes one `ShaderRecord` per entry — the code address plus the guest
+  `ShaderUserData*` and `ShaderSemantic*` and the three sizes — and the replay registers them back.
+  For a version 1 capture the replay falls back to recovering the map from guest memory: every
+  field of an entry comes from the guest AGC shader header, and `sceAgcCreateShader` rewrites that
+  header in place before the capture, so the replay scans the restored readable ranges for the
+  header signature (`file_header` 0x34333231 followed by `version` 0x18), validates each candidate
+  against the ranges it restored, and re-registers it. On title-1 that recovered 4374
+  registrations in 1.5 s, with no address claimed by two headers.
+- **The partially-resident-texture apertures** (`prt.bin`). A streamed texture is a small committed
+  head — one or two 64 KiB Direct ranges, protection 0xf3 — followed by a large type-0 reserved
+  hole, and `BufferCache::ObtainBufferForImage` reads it through
+  `Memory::TryReadPrtBacking`, which refuses unless `IsInPrtAperture` says the address is inside an
+  aperture the game registered with `sceKernelSetPrtAperture`. The apertures live in
+  `g_prt_apertures` (src/kernel/memory.cpp), not in guest memory, so a replay that does not restore
+  them fails every such image with "BufferCache: failed to read mapped guest image backing". The
+  capture snapshots them through `Memory::SnapshotPrtApertures()`; the replay puts them back with
+  `KernelSetPrtAperture` before the first submission. A version 1 capture has no apertures and the
+  replay says so in its report.
 - **`RangeRecord` has no direct-memory offset or memory type.** Replay allocates a fresh physical
   block per direct range, so two virtual ranges that aliased one physical block in the game become
   two independent copies. Harmless for a frame that does not write through one alias and read
@@ -210,7 +224,9 @@ replay has to infer what the capture does not record, listed so a version 2 can 
   hold guest addresses only, no host pointers, so the raw copy is safe. Const RAM
   (`CommandProcessor::m_const_ram`) is not part of the record and is not captured.
 - **No version stamp outside `manifest.json`.** The `.bin` streams have no magic, so a capture
-  whose manifest is missing or edited is only caught by record-size arithmetic.
+  whose manifest is missing or edited is only caught by record-size arithmetic. A missing optional
+  stream is indistinguishable from a version 1 capture, which is why the replay prints which of the
+  two it used.
 
 ## What a capture actually contains
 
@@ -285,6 +301,25 @@ Four things phase B should know before it reads a capture:
   - Const RAM (`CommandProcessor::m_const_ram`, 48 KiB) is not in `registers.bin`. It is cleared
     by the same per-frame `Reset` on the graphics queue and rebuilt by the frame's constant-engine
     packets, which the capture records.
+- **Streamed mip content is not captured.** `memory.bin` holds the pages of committed ranges. The
+  resident tail of a partially resident texture is committed and comes back; the streamed mips live
+  in the sparse backing of the reserved part of the aperture, which the capture does not walk. With
+  the apertures restored, `TryReadPrtBacking` zero-fills that part, so the frame runs and the
+  picture lacks streamed detail. Dumping those pages needs a sparse-backing write path on the
+  replay side, which the kernel does not have (`TryReadSparseBacking` has no counterpart), so
+  closing this means recording the sparse mappings too, not just their contents.
+- **The loop is not flat over tens of loops.** On title-2 the first ten measured loops sit at
+  10.8 to 12.4 ms of GPU-thread time, then loop 12 spikes to 81 to 85 ms and the run settles into
+  a sawtooth: a spike near 28 ms every seven to nine loops, decaying by roughly 2 ms a loop in
+  between. Over 40 loops that is median 20 ms against a floor of 11 ms, so the scope's "jitter
+  under 2%" is not met yet. It is not the replay's own bookkeeping: a run with the dirty-page set
+  emptied (`dirty-pages.bin` replaced by an empty file, everything else hardlinked) reproduces the
+  same shape, spike for spike. Nothing is compiled after the warm-up loop either — all 132
+  "Shaders:" lines fall in loop 1. That leaves the host-side caches: the most likely suspect is the
+  GPU resource garbage collector and its age-based eviction, which in a replay sees the same
+  working set every loop and should never evict. Worth chasing before phase C trusts a median, and
+  worth chasing on its own account: a periodic 80 ms stall in the render path would be visible in
+  the game.
 - **One machine, console session.** Replays are compared with replays, on the same build type.
 
 ## Phases
@@ -295,11 +330,31 @@ Four things phase B should know before it reads a capture:
 | B. Replay | `--replay`, memory and state restore, feeder thread, loop timing and report, image readback | 1 to 2 agent-days |
 | C. Validation | capture the parked Nexus on the current build; 100 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff | half a day |
 
-Phase B status, September 11, 2026: `--replay` restores and feeds both existing captures. nexus-1
-restores 7068 ranges (10,299 MiB) in 1.8 s, 455,615 pages (7119 MiB) in 5.1 s and 9353 shader
-registrations in 2.6 s, then replays far enough to compile 125 compute, 1 vertex and 1 pixel
-shader before it stops on the decommitted-range limit above. The loop, the report and the image
-readback are exercised end to end on a synthetic capture (`frame_replay_tests --write-capture`).
+Phase B status, September 11, 2026: `--replay` replays a real capture end to end. On title-2, the
+title screen at frame 300 captured with format version 2, it restores 1190 ranges (6123 MiB) in
+206 ms, 182,741 pages (2855 MiB) in 2.0 s, 1 PRT aperture and 4374 shader registrations, then runs
+5 loops, presents 5 flips, writes `replay-report.json` and a 3840x2160 BGRA8 image, and exits 0.
+Measured loops: **ms/loop gpu min 11.26, median 11.49, max 13.68** (jitter 21%), ms/loop 16.3 to
+16.7 (vblank-paced). The warm-up loop is 2.24 s on a cold shader cache.
+
+Three things had to be added before a real capture would run, all of them emulator state the
+format did not carry:
+
+1. **The host fault handler.** `KytyExceptionHandler` (src/loader/runtimeLinker.cpp) is what turns
+   an access violation on a guest page into `Memory::HandleGpuFault`, and only `LoadProgram`
+   installed it. Without an ELF the first render-thread read of a page the GPU memory tracker had
+   protected killed the process with no output. Exported as
+   `Loader::InstallHostFaultHandler()` and called by the replay.
+2. **The AGC shader map**, now `shaders.bin` (format v2), with the guest-memory scan as the
+   fallback for version 1 captures.
+3. **The PRT apertures**, now `prt.bin` (format v2). This was the cause of
+   "BufferCache: failed to read mapped guest image backing" on title-1 and nexus-1, which looked
+   like decommitted memory and is not: a streamed texture is a 64 or 128 KiB committed Direct head
+   followed by a reserved hole, read through `Memory::TryReadPrtBacking`, which refuses outside a
+   registered aperture. Restoring the one aperture Demon's Souls registers fixes every such image.
+
+Still open for phase C on nexus-1: that capture is version 1, so it has neither stream; recapture
+it on this build to get `prt.bin` and `shaders.bin`.
 
 Code goes under `src/graphics/replay/` (capture and replay), flags in
 [settings.md](settings.md), the capture format and the report format in this file. Both flags

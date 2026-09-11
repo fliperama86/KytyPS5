@@ -77,6 +77,19 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	(*g_shader_map)[addr] = data;
 }
 
+std::vector<ShaderMapEntry> ShaderSnapshotMap() {
+	EXIT_IF(g_shader_map == nullptr);
+
+	std::scoped_lock lock(g_shader_map_mutex);
+
+	std::vector<ShaderMapEntry> entries;
+	entries.reserve(g_shader_map->size());
+	for (const auto& [address, data]: *g_shader_map) {
+		entries.push_back({address, data});
+	}
+	return entries;
+}
+
 static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 

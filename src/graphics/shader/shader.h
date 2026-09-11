@@ -276,8 +276,16 @@ struct ShaderMappedData {
 	uint32_t        scratch_size_dwords = 0;
 };
 
+// Frame capture and replay (docs/frame-replay.md): one ShaderMap entry with its key.
+struct ShaderMapEntry {
+	uint64_t         code_address = 0;
+	ShaderMappedData data;
+};
+
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// The whole map, so a capture can record it and a replay can put it back.
+[[nodiscard]] std::vector<ShaderMapEntry> ShaderSnapshotMap();
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

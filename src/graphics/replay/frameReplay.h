@@ -14,8 +14,10 @@ namespace Libs::Graphics::Replay {
 // whose labels and ring slots the restore is consistent with; earlier frames are further from it. Reports milliseconds per loop and per frame on stdout and in replay-report.json next to
 // the capture. Returns the process exit code: 0 when the replay ran, non-zero on any failure.
 // See docs/frame-replay.md.
+// `dirty_set_once` marks the recorded CPU-dirty page set at restore only, instead of before every
+// replayed frame; the frame's recorded CPU-write events are applied per frame either way.
 int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames,
-              const std::filesystem::path& image);
+              bool dirty_set_once, const std::filesystem::path& image);
 
 // WAIT_REG_MEM diagnostics, so a wait that never completes ends the replay with the address and
 // the compare parameters instead of spinning. Off outside a replay; the recording call is behind

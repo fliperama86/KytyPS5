@@ -50,7 +50,7 @@ inline void RecordDirtyEvent(uint64_t vaddr, uint64_t size) {
 // docs/frame-replay.md, phase E). Both need the same call, and neither is on in a normal run, so
 // it is a single relaxed load of a null pointer there.
 using PrepareSink = void (*)(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                             uint64_t dirty_bytes);
+                             uint64_t dirty_bytes, uint32_t scan_ns);
 
 namespace Detail {
 extern std::atomic<PrepareSink> g_prepare_sink;
@@ -60,10 +60,16 @@ extern std::atomic<PrepareSink> g_prepare_sink;
 void SetPrepareSink(PrepareSink sink) noexcept;
 
 inline void RecordPrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                               uint64_t dirty_bytes) {
+                               uint64_t dirty_bytes, uint32_t scan_ns) {
 	if (auto* sink = Detail::g_prepare_sink.load(std::memory_order_relaxed); sink != nullptr) {
-		sink(scanned, dirty_ranges, synchronized, dirty_bytes);
+		sink(scanned, dirty_ranges, synchronized, dirty_bytes, scan_ns);
 	}
+}
+
+// True when somebody is watching the preparations, so the scan is worth timing. One relaxed load;
+// without it PrepareBda would pay two clock reads per draw in a normal run.
+[[nodiscard]] inline bool PrepareEventsWatched() noexcept {
+	return Detail::g_prepare_sink.load(std::memory_order_relaxed) != nullptr;
 }
 
 // Appends one BDA-generation bump that is not a CPU write: a buffer registration or retirement,

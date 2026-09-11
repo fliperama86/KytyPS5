@@ -90,6 +90,10 @@ struct ConfigOptions {
 	uint32_t               replay_loops                = DEFAULT_REPLAY_LOOPS;
 	// How many of the capture's frames one loop replays; 0 means all of them.
 	uint32_t               replay_frames               = 0;
+	// Whether the recorded CPU-dirty page set is re-marked only once at restore (true, the
+	// default: it is what the game's own BDA scans see) or before every replayed frame (false,
+	// the phase B to D behaviour). See docs/frame-replay.md, phase E.
+	bool                   replay_dirty_set_once       = true;
 	std::filesystem::path  replay_image;
 	ThreadAffinity         thread_affinity             = ThreadAffinity::Auto;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -147,6 +151,7 @@ bool                  ReplayEnabled();
 std::filesystem::path GetReplayDir();
 uint32_t              GetReplayLoops();
 uint32_t              GetReplayFrames();
+bool                  ReplayDirtySetOnce();
 std::filesystem::path GetReplayImage();
 
 ThreadAffinity GetThreadAffinity();

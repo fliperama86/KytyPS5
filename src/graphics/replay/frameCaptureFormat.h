@@ -220,7 +220,10 @@ struct PrepareEventRecord {
 	uint32_t scanned      = 0; // 0 or 1
 	uint32_t dirty_ranges = 0; // ranges in the dirty set the scan took, 0 when it did not scan
 	uint32_t synchronized = 0; // SynchronizeBuffersInRange calls the scan made
-	uint32_t reserved     = 0;
+	// Nanoseconds the scan took, so a capture carries the game's cost per scan as well as its
+	// count. 0 means "not measured": a scan that did not run, or a capture written before the
+	// field existed, which is the only difference between the two version 5 layouts.
+	uint32_t scan_ns      = 0;
 	uint64_t dirty_bytes  = 0; // bytes those dirty ranges cover
 };
 static_assert(sizeof(PrepareEventRecord) == 32);

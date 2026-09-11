@@ -175,6 +175,10 @@ uint32_t GetReplayFrames() {
 	return g_config->replay_frames;
 }
 
+bool ReplayDirtySetOnce() {
+	return g_config->replay_dirty_set_once;
+}
+
 std::filesystem::path GetReplayImage() {
 	return g_config->replay_image;
 }

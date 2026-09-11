@@ -104,6 +104,9 @@ static void PrintUsage() {
 	         Config::DEFAULT_REPLAY_LOOPS);
 	::printf("  --replay-frames <num>                Frames of the capture one loop replays.\n"
 	         "                                       Default: every frame it holds.\n");
+	::printf("  --replay-dirty-set <once|loop>       Re-mark the recorded CPU-dirty page set once\n"
+	         "                                       at restore or before every frame.\n"
+	         "                                       Default: once.\n");
 	::printf("  --replay-image <path>                Write the last replayed frame there.\n");
 }
 
@@ -430,6 +433,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--replay-frames") {
 			if (!ParseFrameCount(value, options.config.replay_frames)) {
 				::printf("invalid frame count for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--replay-dirty-set") {
+			if (value == "once") {
+				options.config.replay_dirty_set_once = true;
+			} else if (value == "loop") {
+				options.config.replay_dirty_set_once = false;
+			} else {
+				::printf("invalid dirty-set mode for %s: %s (once or loop)\n", arg.c_str(),
+				         value.c_str());
 				return false;
 			}
 		} else if (arg == "--replay-image") {

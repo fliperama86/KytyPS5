@@ -82,7 +82,7 @@ struct Recorder {
 };
 
 void CapturePrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                         uint64_t dirty_bytes);
+                         uint64_t dirty_bytes, uint32_t scan_ns);
 
 struct State {
 	bool                  armed      = false;
@@ -126,7 +126,7 @@ State& Instance() {
 // The capture's prepare sink: one record per GpuResourceManager::PrepareBda call of the frame.
 // GPU thread only.
 void CapturePrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                         uint64_t dirty_bytes) {
+                         uint64_t dirty_bytes, uint32_t scan_ns) {
 	auto&              recorder = Instance().recorder;
 	PrepareEventRecord record {};
 	record.frame        = recorder.frame_index.load(std::memory_order_relaxed);
@@ -134,6 +134,7 @@ void CapturePrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchroni
 	record.scanned      = scanned ? 1u : 0u;
 	record.dirty_ranges = dirty_ranges;
 	record.synchronized = synchronized;
+	record.scan_ns      = scan_ns;
 	record.dirty_bytes  = dirty_bytes;
 
 	std::scoped_lock lock(recorder.prepare_mutex);
@@ -449,7 +450,8 @@ uint64_t WriteChurnEvents(const std::filesystem::path& folder, ChurnCounts& coun
 // Every draw and dispatch preparation of the captured frames and whether it scanned: the ground
 // truth a replay is measured against (docs/frame-replay.md, phase E).
 uint64_t WritePrepareEvents(const std::filesystem::path& folder, std::vector<uint64_t>& per_frame,
-                            std::vector<uint64_t>& scans_per_frame, uint64_t& scans, bool& ok) {
+                            std::vector<uint64_t>& scans_per_frame, uint64_t& scans,
+                            uint64_t& scan_ns, bool& ok) {
 	Writer file;
 	if (!file.Open(folder / "prepare-events.bin")) {
 		LOGF("FrameCapture: cannot create prepare-events.bin\n");
@@ -466,6 +468,7 @@ uint64_t WritePrepareEvents(const std::filesystem::path& folder, std::vector<uin
 		if (event.scanned != 0) {
 			CountPerFrame(scans_per_frame, event.frame);
 			scans++;
+			scan_ns += event.scan_ns;
 		}
 	}
 	const auto count = static_cast<uint64_t>(recorder.prepare_events.size());
@@ -847,9 +850,10 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	Detail::g_churn_events_armed.store(false, std::memory_order_relaxed);
 	std::vector<uint64_t> prepares_per_frame;
 	std::vector<uint64_t> prepare_scans_per_frame;
-	uint64_t              prepare_scans = 0;
-	const auto prepare_events = WritePrepareEvents(folder, prepares_per_frame,
-	                                               prepare_scans_per_frame, prepare_scans, ok);
+	uint64_t              prepare_scans    = 0;
+	uint64_t              prepare_scan_ns  = 0;
+	const auto prepare_events = WritePrepareEvents(
+	    folder, prepares_per_frame, prepare_scans_per_frame, prepare_scans, prepare_scan_ns, ok);
 	SetPrepareSink(nullptr);
 	uint32_t   width       = 0;
 	uint32_t   height      = 0;
@@ -907,6 +911,7 @@ bool WriteCapture(RenderContext& renderer, int frame_num,
 	out += fmt::format("\t\"churn_unmaps_per_frame\": {},\n", JsonArray(churn.unmaps));
 	out += fmt::format("\t\"prepare_events\": {},\n", prepare_events);
 	out += fmt::format("\t\"prepare_scans\": {},\n", prepare_scans);
+	out += fmt::format("\t\"prepare_scan_ns\": {},\n", prepare_scan_ns);
 	out += fmt::format("\t\"prepares_per_frame\": {},\n", JsonArray(prepares_per_frame));
 	out += fmt::format("\t\"prepare_scans_per_frame\": {},\n",
 	                   JsonArray(prepare_scans_per_frame));

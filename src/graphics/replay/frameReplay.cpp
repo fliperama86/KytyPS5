@@ -497,6 +497,7 @@ struct PrepareCounters {
 	std::atomic_uint64_t dirty_ranges {0};
 	std::atomic_uint64_t synchronized {0};
 	std::atomic_uint64_t dirty_bytes {0};
+	std::atomic_uint64_t scan_ns {0};
 
 	void Reset() noexcept {
 		prepares.store(0, std::memory_order_relaxed);
@@ -504,13 +505,14 @@ struct PrepareCounters {
 		dirty_ranges.store(0, std::memory_order_relaxed);
 		synchronized.store(0, std::memory_order_relaxed);
 		dirty_bytes.store(0, std::memory_order_relaxed);
+		scan_ns.store(0, std::memory_order_relaxed);
 	}
 };
 
 PrepareCounters g_prepare_counters;
 
 void CountPrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronized,
-                       uint64_t dirty_bytes) {
+                       uint64_t dirty_bytes, uint32_t scan_ns) {
 	auto& counters = g_prepare_counters;
 	counters.prepares.fetch_add(1, std::memory_order_relaxed);
 	if (!scanned) {
@@ -520,6 +522,7 @@ void CountPrepareEvent(bool scanned, uint32_t dirty_ranges, uint32_t synchronize
 	counters.dirty_ranges.fetch_add(dirty_ranges, std::memory_order_relaxed);
 	counters.synchronized.fetch_add(synchronized, std::memory_order_relaxed);
 	counters.dirty_bytes.fetch_add(dirty_bytes, std::memory_order_relaxed);
+	counters.scan_ns.fetch_add(scan_ns, std::memory_order_relaxed);
 }
 
 // What one frame's preparations amounted to, in the capture or in one replayed loop.
@@ -529,6 +532,7 @@ struct PrepareSummary {
 	uint64_t dirty_ranges = 0;
 	uint64_t synchronized = 0;
 	uint64_t dirty_bytes  = 0;
+	uint64_t scan_ns      = 0;
 };
 
 // One frame of a capture: the slice of submissions.bin between two Done records, the frame's own
@@ -627,7 +631,7 @@ std::string DescribeLastBlockedWait() {
 }
 
 int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_wanted,
-              const std::filesystem::path& image) {
+              bool dirty_set_once, const std::filesystem::path& image) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SetUnhandledExceptionFilter(ReplayCrashFilter);
 #endif
@@ -977,6 +981,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		summary.dirty_ranges += event.dirty_ranges;
 		summary.synchronized += event.synchronized;
 		summary.dirty_bytes += event.dirty_bytes;
+		summary.scan_ns += event.scan_ns;
 	}
 
 	size_t graphics_count = 0;
@@ -1003,7 +1008,8 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	         "%zu flips)\n",
 	         graphics_count + compute_count + flip_count, graphics_count, compute_count,
 	         flip_count);
-	::printf("  dirty pages    %zu in %zu ranges\n", dirty_pages.size(), dirty_ranges.size());
+	::printf("  dirty pages    %zu in %zu ranges, re-marked %s\n", dirty_pages.size(),
+	         dirty_ranges.size(), dirty_set_once ? "once at restore" : "before every frame");
 	if (prepare_events_present && !prepare_events.empty()) {
 		uint64_t recorded_prepares = 0;
 		uint64_t recorded_scans    = 0;
@@ -1071,6 +1077,13 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	}
 	// The replay's own preparations, counted through the sink the capture writes its stream from.
 	Replay::SetPrepareSink(&CountPrepareEvent);
+	if (dirty_set_once && !dirty_ranges.empty()) {
+		gpu.SendCommandSync([&]() {
+			for (const auto& range: dirty_ranges) {
+				buffer_cache.MarkRegionAsCpuModified(range.start, range.size);
+			}
+		});
+	}
 	std::vector<std::vector<PrepareSummary>> frame_prepares(frame_count);
 	uint64_t late_events = 0;
 
@@ -1079,14 +1092,19 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		double gpu_total  = 0.0;
 		for (size_t index = 0; index < frame_count; index++) {
 			const auto& frame = recorded[frame_base + index];
-			// The recorded dirty set, in one batch on the GPU thread and outside the timing, as it
-			// has been since phase B, plus everything the guest wrote before this frame's first
-			// draw. The events come on top of the batch, not instead of it -- see the phase D
-			// section of docs/frame-replay.md.
-			if (!dirty_ranges.empty() || !frame.pre_events.empty()) {
+			// The recorded dirty set, in one batch on the GPU thread and outside the timing, plus
+			// everything the guest wrote before this frame's first draw. The events come on top of
+			// the batch, not instead of it -- see the phase D section of docs/frame-replay.md.
+			// With --replay-dirty-set once the set is marked at restore instead: in the game those
+			// pages stay dirty across frames without being re-marked, and re-marking them every
+			// frame inflates what each BDA scan has to walk (phase E).
+			const bool mark_batch = !dirty_set_once && !dirty_ranges.empty();
+			if (mark_batch || !frame.pre_events.empty()) {
 				gpu.SendCommandSync([&]() {
-					for (const auto& range: dirty_ranges) {
-						buffer_cache.MarkRegionAsCpuModified(range.start, range.size);
+					if (mark_batch) {
+						for (const auto& range: dirty_ranges) {
+							buffer_cache.MarkRegionAsCpuModified(range.start, range.size);
+						}
 					}
 					for (const auto& event: frame.pre_events) {
 						buffer_cache.InvalidateMemory(event.vaddr, event.size);
@@ -1181,7 +1199,8 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			     g_prepare_counters.scans.load(std::memory_order_relaxed),
 			     g_prepare_counters.dirty_ranges.load(std::memory_order_relaxed),
 			     g_prepare_counters.synchronized.load(std::memory_order_relaxed),
-			     g_prepare_counters.dirty_bytes.load(std::memory_order_relaxed)});
+			     g_prepare_counters.dirty_bytes.load(std::memory_order_relaxed),
+			     g_prepare_counters.scan_ns.load(std::memory_order_relaxed)});
 			frame_gpu_ms[index].push_back(gpu_done);
 			frame_loop_ms[index].push_back(frame_done);
 			gpu_total += gpu_done;
@@ -1225,10 +1244,11 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			total.dirty_ranges += samples[loop].dirty_ranges;
 			total.synchronized += samples[loop].synchronized;
 			total.dirty_bytes += samples[loop].dirty_bytes;
+			total.scan_ns += samples[loop].scan_ns;
 		}
-		prepare_mean[i] = {total.prepares / counted, total.scans / counted,
+		prepare_mean[i] = {total.prepares / counted,     total.scans / counted,
 		                   total.dirty_ranges / counted, total.synchronized / counted,
-		                   total.dirty_bytes / counted};
+		                   total.dirty_bytes / counted,  total.scan_ns / counted};
 	}
 
 	// 5. Report. The first loop is a warm-up: pipelines, descriptor sets and history buffers are
@@ -1274,18 +1294,20 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		         static_cast<unsigned long long>(replayed.scans),
 		         static_cast<unsigned long long>(captured.scans));
 		if (replayed.scans != 0) {
-			::printf(", %.1f dirty ranges and %.1f buffers a scan",
-			         static_cast<double>(replayed.dirty_ranges) /
-			             static_cast<double>(replayed.scans),
-			         static_cast<double>(replayed.synchronized) /
-			             static_cast<double>(replayed.scans));
+			const auto scans = static_cast<double>(replayed.scans);
+			::printf(", %.1f ranges %.1f buffers %.0f KiB %.1f us a scan",
+			         static_cast<double>(replayed.dirty_ranges) / scans,
+			         static_cast<double>(replayed.synchronized) / scans,
+			         static_cast<double>(replayed.dirty_bytes) / scans / 1024.0,
+			         static_cast<double>(replayed.scan_ns) / scans / 1000.0);
 		}
 		if (captured.scans != 0) {
-			::printf(" (recorded %.1f and %.1f)",
-			         static_cast<double>(captured.dirty_ranges) /
-			             static_cast<double>(captured.scans),
-			         static_cast<double>(captured.synchronized) /
-			             static_cast<double>(captured.scans));
+			const auto scans = static_cast<double>(captured.scans);
+			::printf(" (recorded %.1f %.1f %.0f KiB %.1f us)",
+			         static_cast<double>(captured.dirty_ranges) / scans,
+			         static_cast<double>(captured.synchronized) / scans,
+			         static_cast<double>(captured.dirty_bytes) / scans / 1024.0,
+			         static_cast<double>(captured.scan_ns) / scans / 1000.0);
 		}
 		::printf("\n");
 	}
@@ -1380,6 +1402,27 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		report << "  \"frame_scan_dirty_ranges\": [";
 		for (size_t i = 0; i < frame_count; i++) {
 			report << (i == 0 ? "" : ",") << prepare_mean[i].dirty_ranges;
+		}
+		report << "],\n";
+		report << "  \"dirty_set_once\": " << (dirty_set_once ? "true" : "false") << ",\n";
+		report << "  \"frame_scan_ns\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << prepare_mean[i].scan_ns;
+		}
+		report << "],\n";
+		report << "  \"frame_scan_bytes\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << prepare_mean[i].dirty_bytes;
+		}
+		report << "],\n";
+		report << "  \"frame_scan_ns_recorded\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << recorded[frame_base + i].recorded_prepares.scan_ns;
+		}
+		report << "],\n";
+		report << "  \"frame_scan_bytes_recorded\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << recorded[frame_base + i].recorded_prepares.dirty_bytes;
 		}
 		report << "],\n";
 		report << "  \"frame_scan_synchronized\": [";

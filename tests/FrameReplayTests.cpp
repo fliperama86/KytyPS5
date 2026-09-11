@@ -135,10 +135,10 @@ std::vector<DirtyEventRecord> DirtyEvents() {
 // in the second, one of which did. This is the ground truth a replay is compared with.
 std::vector<PrepareEventRecord> PrepareEvents() {
 	std::vector<PrepareEventRecord> events;
-	events.push_back({0, 2, 1, 4, 7, 0, 0x8000});
+	events.push_back({0, 2, 1, 4, 7, 31000, 0x8000});
 	events.push_back({0, 6, 0, 0, 0, 0, 0});
-	events.push_back({0, 14, 1, 2, 3, 0, 0x2000});
-	events.push_back({1, 3, 1, 1, 1, 0, 0x1000});
+	events.push_back({0, 14, 1, 2, 3, 12000, 0x2000});
+	events.push_back({1, 3, 1, 1, 1, 9000, 0x1000});
 	events.push_back({1, 8, 0, 0, 0, 0, 0});
 	return events;
 }
@@ -489,6 +489,7 @@ void RunTests(const std::filesystem::path& root) {
 	CHECK(prepares[0].dirty_ranges == 4);
 	CHECK(prepares[0].synchronized == 7);
 	CHECK(prepares[0].dirty_bytes == 0x8000);
+	CHECK(prepares[0].scan_ns == 31000);
 	CHECK(prepares[1].scanned == 0);
 	CHECK(prepares[3].frame == 1);
 	CHECK(prepares[3].scanned == 1);

@@ -523,6 +523,30 @@ add_custom_command(
 target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
+# Headless micro-benchmark for the cost of a shader load through the BDA guest page table versus a
+# bound storage buffer. It loads Vulkan by hand and shares nothing with the emulator runtime.
+set(bda_load_bench_generated_dir "${PROJECT_BINARY_DIR}/bda_load_bench")
+set(bda_load_bench_shader_source "${KYTY_TESTS_DIR}/bda_load_bench.comp")
+set(bda_load_bench_shader_spv "${bda_load_bench_generated_dir}/bda_load_bench.spv")
+set(bda_load_bench_shader_header "${bda_load_bench_generated_dir}/bda_load_bench_spv.h")
+add_custom_command(
+	OUTPUT "${bda_load_bench_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${bda_load_bench_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${bda_load_bench_shader_spv}" "${bda_load_bench_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${bda_load_bench_shader_spv}
+	        -DOUTPUT=${bda_load_bench_shader_header} -DSYMBOL=BDA_LOAD_BENCH_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${bda_load_bench_shader_source}"
+	VERBATIM
+)
+add_executable(bda_load_bench EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BdaLoadBench.cpp"
+	"${bda_load_bench_shader_header}"
+)
+target_link_libraries(bda_load_bench Vulkan::Headers)
+target_include_directories(bda_load_bench PRIVATE "${bda_load_bench_generated_dir}")
+
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)

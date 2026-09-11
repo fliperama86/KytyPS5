@@ -50,6 +50,8 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
 		++m_mapped_generation;
+		// Buffers may already cover the new mapping; the next preparation must revisit it.
+		m_buffer_cache.InvalidateBda(vaddr, size);
 	}
 }
 
@@ -70,6 +72,8 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		++m_mapped_generation;
+		// Nothing can be uploaded to an unmapped range, and it must not linger in the set.
+		m_buffer_cache.ForgetBdaRange(vaddr, size);
 	};
 	if (m_gpu == nullptr) {
 		unmap();
@@ -87,8 +91,13 @@ void GpuResourceManager::PrepareBda() {
 		return;
 	}
 	KYTY_PROFILER_BLOCK("GpuResourceManager::SynchronizeBdaBuffers");
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+	// Take the dirty set before the scan. A range added afterwards also advances the
+	// generation captured above, so the next call picks it up.
+	const auto dirty = m_buffer_cache.TakeBdaDirtyRanges();
+	dirty.ForEach([this](uint64_t start, uint64_t end) {
+		m_mapped_ranges.ForEachIntersection(start, end - start, [this](RangeSet::Range range) {
+			m_buffer_cache.SynchronizeBuffersInRange(range.address, range.size);
+		});
 	});
 	// Publish the generations captured before the scan. A concurrent buffer invalidation
 	// may have advanced the live generation while scanning and must force the next call

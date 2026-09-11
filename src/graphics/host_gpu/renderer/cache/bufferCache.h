@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -74,6 +75,12 @@ public:
 	[[nodiscard]] uint64_t BdaGeneration() const noexcept {
 		return m_bda_generation.load(std::memory_order_acquire);
 	}
+	// Records a range whose guest bytes may no longer match the cached buffers and advances the
+	// generation. Callers that only retire buffers use BumpBdaGeneration instead: a deleted
+	// buffer has nothing to upload, and a later lookup registers and dirties its replacement.
+	void                   InvalidateBda(uint64_t vaddr, uint64_t size);
+	void                   ForgetBdaRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] RangeSet TakeBdaDirtyRanges();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -112,7 +119,7 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
-	void InvalidateBdaGeneration() noexcept {
+	void BumpBdaGeneration() noexcept {
 		m_bda_generation.fetch_add(1, std::memory_order_release);
 	}
 
@@ -137,6 +144,10 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	std::atomic_uint64_t m_bda_generation {0};
+	// Guest ranges dirtied since the last BDA preparation. Written from any guest thread that
+	// faults or invalidates memory, drained on the GPU thread.
+	std::mutex m_bda_dirty_mutex;
+	RangeSet   m_bda_dirty_ranges;
 };
 
 } // namespace Libs::Graphics

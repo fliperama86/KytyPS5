@@ -94,7 +94,12 @@ void BufferCache::ChangeRegister(BufferId id) {
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
-	InvalidateBdaGeneration();
+	if constexpr (insert) {
+		InvalidateBda(buffer.CpuAddress(), buffer.Size());
+	} else {
+		// A retired buffer needs no upload; its replacement dirties itself when it registers.
+		BumpBdaGeneration();
+	}
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
@@ -245,7 +250,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	InvalidateBdaGeneration();
+	InvalidateBda(vaddr, size);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -291,7 +296,7 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	}
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		InvalidateBdaGeneration();
+		InvalidateBda(vaddr, size);
 	}
 }
 
@@ -686,6 +691,37 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::InvalidateBda(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid BDA invalidation range\n");
+	}
+	// The tracker marks whole pages dirty, so record the pages the range touches, not the
+	// range itself: the incremental scan must cover every page the full scan would upload.
+	const auto begin = std::max(vaddr & ~(TRACKER_PAGE_SIZE - 1), TRACKER_PAGE_SIZE);
+	const auto end   = std::min((vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1),
+	                            TRACKER_ADDRESS_SIZE);
+	if (begin < end) {
+		std::lock_guard lock(m_bda_dirty_mutex);
+		m_bda_dirty_ranges.Add(begin, end - begin);
+	}
+	BumpBdaGeneration();
+}
+
+void BufferCache::ForgetBdaRange(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid BDA range retirement\n");
+	}
+	std::lock_guard lock(m_bda_dirty_mutex);
+	m_bda_dirty_ranges.Subtract(vaddr, size);
+}
+
+RangeSet BufferCache::TakeBdaDirtyRanges() {
+	RangeSet        taken;
+	std::lock_guard lock(m_bda_dirty_mutex);
+	std::swap(taken, m_bda_dirty_ranges);
+	return taken;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

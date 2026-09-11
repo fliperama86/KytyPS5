@@ -4474,6 +4474,39 @@ public:
                   sizeof(downloaded));
       Require(name, "GPU dirty download", downloaded == gpu_value,
               "GPU-owned bytes were not preserved through CPU readback");
+
+      // The incremental scan walks the ranges recorded since the last preparation, so two
+      // independent dirty ranges must both reach their buffers in a single preparation.
+      constexpr uint32_t first_final_value = 0x0f1e2d3cu;
+      constexpr uint32_t second_final_value = 0x4b5a6978u;
+      const auto FindNative = [&](uint64_t address) {
+        auto &buffer = cache.GetBuffer(cache.FindBuffer(address, sizeof(uint32_t)));
+        return std::pair<Libs::Graphics::Buffer *, uint64_t>{&buffer,
+                                                             buffer.Offset(address)};
+      };
+      Require(name, "first range invalidation",
+              resources.InvalidateMemory(base, sizeof(first_final_value)),
+              "CPU write to the first buffer was not accepted");
+      Require(name, "second range invalidation",
+              resources.InvalidateMemory(base + second_offset,
+                                         sizeof(second_final_value)),
+              "CPU write to the second buffer was not accepted");
+      std::memcpy(mapped, &first_final_value, sizeof(first_final_value));
+      std::memcpy(static_cast<uint8_t *>(mapped) + second_offset,
+                  &second_final_value, sizeof(second_final_value));
+      Require(name, "multi-range scan required",
+              GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "CPU writes did not invalidate the BDA scan cache");
+      resources.PrepareBda();
+      Require(name, "multi-range upload",
+              ReadNativeValue(FindNative(base)) == first_final_value &&
+                  ReadNativeValue(FindNative(base + second_offset)) ==
+                      second_final_value,
+              "the incremental BDA scan did not upload every dirty range");
+      Require(name, "multi-range scan cached",
+              !GpuResourceManagerTestAccess::BdaScanRequired(resources),
+              "multi-range BDA scan was not cached");
+
       resources.UnmapMemory(base, allocation_size);
       resources.MapMemory(base, allocation_size);
       Require(name, "mapping change invalidates",

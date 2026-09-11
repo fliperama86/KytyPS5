@@ -776,7 +776,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
-	Common::ApplyThreadAffinityFromEnv("KYTY_PRESENT_THREAD_AFFINITY", "Thread_Present");
+	Common::ApplyThreadAffinity(Common::ThreadAffinityGroup::Present, "Thread_Present");
 
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);

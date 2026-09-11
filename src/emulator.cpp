@@ -131,6 +131,10 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
 
+	// Derive the host CPU masks before anything that consults them exists: the guest threads, the
+	// render thread and the presentation thread all start below. It logs, so the log comes first.
+	Common::InitializeThreadAffinity(Config::GetThreadAffinity() == Config::ThreadAffinity::Auto);
+
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
 		if (const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();

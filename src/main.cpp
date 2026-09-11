@@ -73,6 +73,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --thread-affinity <auto|none>        Derive the render, presentation and guest\n"
+	         "                                       CPU masks from the host L3 cache topology.\n"
+	         "                                       Default: auto.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -115,6 +118,20 @@ static bool ParseEnum(const std::string& value, E& out) {
 
 	out = enum_value.value();
 	return true;
+}
+
+static bool ParseThreadAffinity(const std::string& value, Config::ThreadAffinity& out) {
+	if (Common::EqualNoCase(value, "auto")) {
+		out = Config::ThreadAffinity::Auto;
+		return true;
+	}
+
+	if (Common::EqualNoCase(value, "none")) {
+		out = Config::ThreadAffinity::None;
+		return true;
+	}
+
+	return false;
 }
 
 static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
@@ -300,6 +317,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--spirv-debug-printf") {
 			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--thread-affinity") {
+			if (!ParseThreadAffinity(value, options.config.thread_affinity)) {
+				::printf("invalid thread affinity: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--readback-linear-images") {

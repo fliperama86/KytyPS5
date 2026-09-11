@@ -103,70 +103,9 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::Flush();
 }
 
-// A clean guest read costs a buffer-cache range-set lookup plus a locked texture-cache region
-// query before it reaches the backing store, and the words a materialization reads sit in one to
-// three 4 KiB pages. A page whose whole extent passes those checks contains no word that could
-// fail them, so the verdict is taken once for the page and its words are then read straight from
-// the backing. In the Nexus scene 99.9% of the clean reads hit a verdict that was already taken.
-//
-// The verdict is only valid for as long as nothing records a new GPU write, so one cache lives on
-// the stack of one materialization call and is thrown away with it. Only the GPU thread reaches
-// the clean path at all (IsGpuCleanBackingRange requires it), and that is the thread running the
-// materialization, so no GPU write can land between the verdict and the reads it covers. Anything
-// other than a clean verdict falls back to the unchanged per-word call; no per-word result is ever
-// remembered.
-//
-// This is not where the shader evaluation spends its time. Demon's Souls marks almost none of its
-// SRT reads clean: the flat program reads about 21 guest words per evaluation and about 0.05 of
-// them come through here, the rest being direct reads of guest memory that never consult the GPU
-// caches. See docs/demons-souls-performance.md.
-class ShaderGuestPageCache {
-public:
-	bool Read(uint64_t address, uint32_t* value) {
-		const auto page = address >> PageShift;
-		// A word straddling two pages is covered by two verdicts; let it take the per-word path.
-		if (((address + sizeof(uint32_t) - 1) >> PageShift) != page) {
-			return ReadWord(address, value);
-		}
-		auto& entry = m_entries[page & (Entries - 1)];
-		if (entry.page != page) {
-			entry.page  = page;
-			entry.clean = Libs::LibKernel::Memory::IsGpuCleanBackingRange(page << PageShift,
-			                                                              uint64_t {1} << PageShift);
-		}
-		if (!entry.clean) {
-			return ReadWord(address, value);
-		}
-		return Libs::LibKernel::Memory::TryReadBacking(address, value, sizeof(*value));
-	}
-
-private:
-	static bool ReadWord(uint64_t address, uint32_t* value) {
-		return Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
-	}
-
-	static constexpr uint64_t PageShift = 12;
-	static constexpr uint64_t Entries   = 8;
-	static_assert((Entries & (Entries - 1)) == 0, "the index must be a mask, not a division");
-
-	struct Entry {
-		// No guest page number reaches UINT64_MAX, so it marks an entry that was never filled.
-		uint64_t page  = UINT64_MAX;
-		bool     clean = false;
-	};
-
-	std::array<Entry, Entries> m_entries {};
-};
-
-bool ReadShaderGuestMemory(void* userdata, uint64_t address, uint32_t* value) {
-	if (value == nullptr) {
-		return false;
-	}
-	auto* pages = static_cast<ShaderGuestPageCache*>(userdata);
-	if (pages == nullptr) {
-		return Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
-	}
-	return pages->Read(address, value);
+bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
+	return value != nullptr &&
+	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
 bool SyncShaderGuestMemory(void*, uint64_t address, uint64_t size) {
@@ -266,17 +205,6 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 }
 
 } // namespace
-
-bool ReadShaderGuestWordsForTest(uint64_t address, std::span<uint32_t> values) {
-	ShaderGuestPageCache guest_pages;
-	for (size_t index = 0; index < values.size(); index++) {
-		if (!ReadShaderGuestMemory(&guest_pages, address + index * sizeof(uint32_t),
-		                           &values[index])) {
-			return false;
-		}
-	}
-	return true;
-}
 
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
@@ -404,14 +332,9 @@ struct PipelineCache::ProgramCache {
 		// be pooled here. The specialization is compared and dropped on the cached path, so its
 		// two vectors come from per-stage scratch that keeps its capacity across draws.
 		auto& specialization = specialization_scratch[static_cast<size_t>(stage)];
-		// Exactly one materialization runs per call: the cached-entry path and the compile path
-		// are mutually exclusive. The page verdicts therefore never outlive the call that took
-		// them, which is what keeps them safe to trust.
-		ShaderGuestPageCache                         guest_pages;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
-		    .userdata                   = &guest_pages,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};

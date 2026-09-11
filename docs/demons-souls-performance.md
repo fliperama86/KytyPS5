@@ -160,7 +160,7 @@ formatted and small-buffer streamed slots must be excluded in any case: they cop
 ownership on every call, and an image-backed texel buffer can change without the buffer cache
 knowing.
 
-### Page verdict cache, kept but not a win
+### Page verdict cache, measured and reverted
 
 `EvaluateRuntimeSourcesImpl` dominates the render thread: 5.88 s of the 20.1-second capture (29%)
 over 4.3 million calls, about 1.37 microseconds per stage per draw, seven times the size of

@@ -594,8 +594,6 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME bda_generation_cache
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-generation-only)
-	add_test(NAME shader_guest_page_verdicts
-		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --page-verdict-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.

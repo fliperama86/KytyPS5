@@ -96,24 +96,121 @@ replay. What this misses is documented under limits.
 
 ## Replay design
 
-`kyty_emulator --replay <dir> [--loops N] [--replay-image out.png]`, plus the usual flags
-(`--gpu-descriptors`, Tracy build, `--present-mode`).
+`kyty_emulator --replay <dir> [--replay-loops N] [--replay-image out.raw]`, plus the usual flags
+(`--gpu-descriptors`, Tracy build, `--present-mode`). Flags in [settings.md](settings.md);
+`--replay` and `--game` are mutually exclusive and `--replay` needs neither an app0 directory nor
+an ELF. Everything below lives in `src/graphics/replay/frameReplay.cpp`.
 
-1. `Init` as today, no ELF, no guest thread.
-2. **Restore memory.** For each recorded range, map it at the same address through the kernel
-   memory layer (a new `Memory::RestoreRange(vaddr, size, prot)` next to the existing map calls,
-   so page-protection tracking stays consistent) and write the pages. Lazy mapping of the
-   snapshot file is a later optimization if restore exceeds 30 s.
-3. **Restore state.** Video-out registrations through the same code path the game uses; the
-   register files directly into the command processors.
-4. **Loop.** For each loop: re-mark the recorded CPU-dirty pages, feed the recorded submissions
-   in recorded order (`Submit`, `SubmitCompute`, `SubmitFlipPreparation`, `Done`), wait for the
-   flip, record wall time. `WAIT_REG_MEM` executes as normal; with the snapshot's final label
-   values and the recorded order it does not block. If it does, the harness reports the address
-   and stops rather than spinning.
-5. **Report.** Milliseconds per loop after a warm-up loop, min, median, jitter; the render
-   thread's zone totals if Tracy is attached. After the last loop, read back the presented image
-   and write it; a script diffs it against the capture screenshot.
+1. `Init` as today, no ELF, no guest thread. `WindowRun()` still owns the main thread, so
+   presentation works; a feeder thread does steps 2 to 5 and ends the process with `quick_exit`,
+   the same exit the guest path takes: 0 after the report, non-zero on any replay error. The feeder
+   first installs the host fault handler through `Loader::InstallHostFaultHandler()`. The ELF
+   loader installs it for the guest path, and it is what turns an access violation on a guest page
+   into `Memory::HandleGpuFault`; without it the first render-thread read of a page the GPU memory
+   tracker has protected kills the process with no output. On Windows the replay also installs an
+   unhandled-exception filter, so a fault nothing claims prints the faulting address, the access
+   kind and the module offset instead of vanishing.
+2. **Restore memory.** Each committed range goes through
+   `Memory::RestoreRange(vaddr, size, prot, type, name)` (src/kernel/memory.cpp), which dispatches
+   on the recorded `VirtualRangeType` to the map call the guest would have used
+   (`KernelReserveVirtualRange`, `KernelAllocateDirectMemory` plus `KernelMapNamedDirectMemory`,
+   `KernelMapNamedFlexibleMemory`, the memory-pool trio, or the private-committed path
+   `AllocateProgramMemory`/`AllocateRuntimeMemory` use), always at the recorded address with the
+   `MAP_FIXED` flag. Nothing bypasses `VirtualRanges`, the physical or flexible allocator, or
+   `MapGpuRange`, so the memory tracker and the GPU page table see the range exactly as in the
+   game. `memory.bin` is then streamed page by page — the file is never held in memory — and each
+   page is written with `Memory::TryWriteBacking`, falling back to a direct copy with the host
+   protection lifted for ranges that are committed rather than backing-store mapped. Restore time
+   and bytes are printed.
+3. **Restore state.** Video-out registrations replay through `VideoOutRegisterBuffers2` on a
+   handle from the same `VideoOutOpen` path the game uses. Register files are copied into the
+   command processors on the GPU thread through `GuestGpu::RestoreRegisterFile`; a record whose
+   size is not `sizeof(HW::Context) + sizeof(HW::UserConfig) + sizeof(HW::Shader)` fails the
+   replay with a message naming both sizes. Note that the graphics processor is `Reset()` again by
+   the first `Submit` of every frame, in replay exactly as in the game, so the restore matters for
+   the compute processors, which carry state across frames.
+4. **Loop.** For each loop: re-mark the recorded CPU-dirty pages
+   (`BufferCache::MarkRegionAsCpuModified`, coalesced into runs and applied on the GPU thread),
+   then feed the recorded submissions in file order (`Submit`, `SubmitCompute`, a fresh CPU flip
+   where the capture recorded a `FlipPreparation`, `Done`), wait for the GPU thread to drain and
+   for every flip queued on the video-out port to present, record wall time. Demon's Souls flips
+   from its own graphics command stream, not through `VideoOutSubmitFlip`, so most captures carry
+   no `FlipPreparation` record at all and the flip appears as the PM4 stream replays; the loop
+   therefore ends on "the port's flip queue is empty", not on a recorded flip. A recorded flip
+   request id belongs to the captured process and is never reused: where a capture does carry a
+   `FlipPreparation`, the replay reserves its own request through the `VideoOutSubmitFlip` path.
+   `WAIT_REG_MEM` executes as normal; with the snapshot's final label values and the recorded order
+   it does not block. If a measured loop does not finish within 2 s the replay prints the last
+   blocked wait's address, value, reference, mask and compare function and exits non-zero rather
+   than spinning. The warm-up loop gets a much larger budget, because it compiles every pipeline
+   the frame touches.
+5. **Report.** One block on stdout and the same numbers as JSON in `replay-report.json` next to
+   the capture. The first loop is a warm-up (cold pipelines, cold descriptor sets, cold history
+   buffers) and is excluded from min, median, max and jitter. Two series are reported: `ms/loop`
+   is first submit to presented flip, `ms/loop gpu` is first submit to GPU-thread idle, which is
+   the render-path number and is free of the vblank thread's presentation cadence. Presentation is
+   paced by the virtual vblank, so `ms/loop` is quantised to the vblank period and never falls
+   below it; raise `--vblank-frequency` to shrink the quantum, or steer by `ms/loop gpu`. With Tracy
+   attached the render thread's zone totals come from Tracy as usual.
+6. **Image.** `--replay-image <path>` copies the last presented swapchain frame into a host buffer
+   (`Presenter::ReadLastPresentedFrame`) and writes it as raw tightly packed 8-bit BGRA or RGBA,
+   with a `<path>.json` sidecar carrying width, height, format and stride. There is no PNG encoder
+   in the tree outside imgui's stb, so a script converts or diffs the raw file.
+
+### Report format
+
+```
+replay: <capture dir>
+  frame          <captured frame number>
+  ranges         <n> restored, <n> skipped, <n> MiB committed, <n> ms
+  memory         <n> pages, <n> MiB, <n> ms
+  registers      <n> command processors, <n> bytes each
+  video-out      <n> registrations, handle <h>, flip index <i>
+  submissions    <n> records (<n> graphics, <n> compute, <n> flips)
+  dirty pages    <n> in <n> ranges
+  loops          <n> (<n> measured, loop 1 excluded)
+  ms/loop        min <a>  median <b>  max <c>  jitter <d>%
+  ms/loop gpu    min <a>  median <b>  max <c>  jitter <d>%
+  total          <n> s
+```
+
+`replay-report.json` carries `capture`, `frame`, `loops`, `warmup_loops`, `restore_ranges_ms`,
+`restore_pages_ms`, `restore_pages`, `restore_bytes`, `submissions`, `dirty_pages`, the full
+`loop_ms` and `gpu_ms` arrays, and `summary` / `gpu_summary` objects with `min_ms`, `median_ms`,
+`max_ms`, `jitter` and `total_ms`, so two runs diff without re-parsing the console.
+
+### Gaps in the capture format the replay works around
+
+`src/graphics/replay/frameCaptureFormat.h` is fixed for version 1; these are the places where the
+replay has to infer what the capture does not record, listed so a version 2 can close them.
+
+- **The shader map is not captured.** This is the one gap that would otherwise stop a replay dead.
+  Every draw and dispatch resolves its shader through `ShaderMap` (src/graphics/shader/shader.cpp),
+  which the game fills from `sceAgcCreateShader`; a replay runs no guest code, so the first
+  dispatch exits with "is missing from ShaderMap". Every field of an entry, though, comes from the
+  guest AGC shader header, and `sceAgcCreateShader` rewrites that header in place before the
+  capture, turning its offsets into absolute pointers that land back at the same guest addresses on
+  restore. So the replay scans the restored readable ranges for the header signature
+  (`file_header` 0x34333231 followed by `version` 0x18), validates each candidate against the
+  ranges it restored, and re-registers it. On the title-1 capture this recovers 4374 registrations
+  in 1.5 s, with no address claimed by two headers. A `shaders.bin` stream of
+  `{code_address, header_address}` pairs in format v2 would make the scan unnecessary.
+- **`RangeRecord` has no direct-memory offset or memory type.** Replay allocates a fresh physical
+  block per direct range, so two virtual ranges that aliased one physical block in the game become
+  two independent copies. Harmless for a frame that does not write through one alias and read
+  through the other; a `uint64_t offset` and an `int memory_type` in the record would remove the
+  doubt, and the offset is already in `VirtualRanges::Range`.
+- **`SubmissionRecord::flip_request_id` is process-local.** It cannot be replayed, and for a title
+  that flips from the command stream there is no `FlipPreparation` record at all. Nothing is lost
+  today, because the PM4 stream carries the video-out handle and buffer index itself; a capture of
+  a title that flips through `VideoOutSubmitFlip` would want the buffer index in the record, since
+  the replay currently guesses the first registered index.
+- **`RegisterFileRecord` does not say what the bytes are.** Replay reads them as `HW::Context`
+  then `HW::UserConfig` then `HW::Shader`, in that order, and rejects any other size. The structs
+  hold guest addresses only, no host pointers, so the raw copy is safe. Const RAM
+  (`CommandProcessor::m_const_ram`) is not part of the record and is not captured.
+- **No version stamp outside `manifest.json`.** The `.bin` streams have no magic, so a capture
+  whose manifest is missing or edited is only caught by record-size arithmetic.
 
 ## What a capture actually contains
 
@@ -197,6 +294,12 @@ Four things phase B should know before it reads a capture:
 | A. Capture | flag, quiesce and flush, sparse memory dump, submission recorder in processing order, state dump, manifest; format in `frameCaptureFormat.h`. Done except the screenshot, which needs a presenter readback path | 1 agent-day |
 | B. Replay | `--replay`, memory and state restore, feeder thread, loop timing and report, image readback | 1 to 2 agent-days |
 | C. Validation | capture the parked Nexus on the current build; 100 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff | half a day |
+
+Phase B status, September 11, 2026: `--replay` restores and feeds both existing captures. nexus-1
+restores 7068 ranges (10,299 MiB) in 1.8 s, 455,615 pages (7119 MiB) in 5.1 s and 9353 shader
+registrations in 2.6 s, then replays far enough to compile 125 compute, 1 vertex and 1 pixel
+shader before it stops on the decommitted-range limit above. The loop, the report and the image
+readback are exercised end to end on a synthetic capture (`frame_replay_tests --write-capture`).
 
 Code goes under `src/graphics/replay/` (capture and replay), flags in
 [settings.md](settings.md), the capture format and the report format in this file. Both flags

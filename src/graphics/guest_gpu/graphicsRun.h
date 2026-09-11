@@ -39,6 +39,21 @@ public:
 	void              Done();
 	[[nodiscard]] int GetFrameNum() const;
 
+	// Blocks the calling thread until the GPU thread has drained every queue. Not callable from
+	// the GPU thread itself.
+	void WaitForIdle();
+	// The same with a deadline; false means the GPU thread is still busy. Frame replay uses it to
+	// catch a WAIT_REG_MEM that never completes instead of spinning (docs/frame-replay.md).
+	bool WaitForIdleFor(uint32_t timeout_ms);
+
+	// Frame replay: the recorded register-file layout of one command processor, Context then
+	// UserConfig then Shader, and the number of processors a capture may carry.
+	[[nodiscard]] static size_t   RegisterFileSize() noexcept;
+	[[nodiscard]] static uint32_t RegisterFileQueueCount() noexcept { return QueueCount; }
+	// Copies recorded register bytes into one command processor. GPU thread only; the replay
+	// reaches it through SendCommandSync.
+	bool RestoreRegisterFile(uint32_t queue_id, const void* data, size_t size);
+
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
 private:
@@ -69,7 +84,6 @@ private:
 
 	void              Enqueue(Submission submission);
 	void              CaptureFrame(int frame_num);
-	void              WaitForIdle();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);

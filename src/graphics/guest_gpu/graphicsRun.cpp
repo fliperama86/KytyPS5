@@ -16,6 +16,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/replay/frameCapture.h"
 #include "graphics/presentation/window.h"
+#include "graphics/replay/frameReplay.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +34,7 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -403,6 +406,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		if (Replay::IsWaitDiagnosticsEnabled()) {
+			Replay::RecordBlockedWait(reinterpret_cast<uint64_t>(addr), *addr, ref, mask, func,
+			                          sizeof(T));
+		}
 		SuspendPm4();
 	}
 }
@@ -519,6 +526,45 @@ void GuestGpu::WaitForIdle() {
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
 	}
+}
+
+bool GuestGpu::WaitForIdleFor(uint32_t timeout_ms) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+	Common::LockGuard lock(m_queue_mutex);
+	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			return false;
+		}
+		const auto remaining =
+		    std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+		m_idle.WaitFor(&m_queue_mutex, static_cast<uint32_t>(remaining));
+	}
+	return true;
+}
+
+size_t GuestGpu::RegisterFileSize() noexcept {
+	static_assert(std::is_trivially_copyable_v<HW::Context>);
+	static_assert(std::is_trivially_copyable_v<HW::UserConfig>);
+	static_assert(std::is_trivially_copyable_v<HW::Shader>);
+	return sizeof(HW::Context) + sizeof(HW::UserConfig) + sizeof(HW::Shader);
+}
+
+bool GuestGpu::RestoreRegisterFile(uint32_t queue_id, const void* data, size_t size) {
+	EXIT_IF(!IsGpuThread());
+	if (queue_id >= QueueCount || data == nullptr || size != RegisterFileSize()) {
+		return false;
+	}
+	// The graphics processor is Reset() again by the first Submit of every frame, exactly as in
+	// the game; the restore matters for the compute processors, which carry state across frames.
+	auto* cursor = static_cast<const uint8_t*>(data);
+	auto& cp     = GetProcessor(queue_id);
+	std::memcpy(&cp.GetCtx(), cursor, sizeof(HW::Context));
+	cursor += sizeof(HW::Context);
+	std::memcpy(&cp.GetUcfg(), cursor, sizeof(HW::UserConfig));
+	cursor += sizeof(HW::UserConfig);
+	std::memcpy(&cp.GetShCtx(), cursor, sizeof(HW::Shader));
+	return true;
 }
 
 void GuestGpu::ThreadRun(void* data) {

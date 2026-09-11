@@ -29,6 +29,9 @@ window, user, and path options omitted here.
 | `--playgo-hack` | off | Uses the bundled PlayGo stub fallback when the title's chunks do not load. | Games that stall in PlayGo. |
 | `--redzone` (Windows) | off | Protects the guest SysV red zone across host callbacks. | Guest-fault investigations. |
 | `--rd` | off | Loads the RenderDoc capture layer. | Frame captures. |
+| `--replay <dir>` | off | Starts the emulator without a game, restores the frame capture in `<dir>` (guest memory, video-out registration, command-processor registers) and feeds its submissions through the real `GuestGpu` queue in a loop, then prints milliseconds per loop and writes `replay-report.json` next to the capture. Cannot be combined with `--game`; every other flag, `--gpu-descriptors` and `--present-mode` included, still applies. See [frame-replay.md](frame-replay.md). | Measuring render-path changes in under a minute instead of a 40-minute end-to-end run. |
+| `--replay-loops <num>` | `20` | Loops `--replay` runs. The first loop is a warm-up and is excluded from the statistics. | Trading measurement time against noise. |
+| `--replay-image <path>` | off | After the last loop, writes the presented frame as raw tightly packed 8-bit BGRA (or RGBA, whichever the swapchain used) to `<path>`, with a `<path>.json` sidecar giving width, height, format and stride. | Diffing a replayed frame against the capture screenshot. |
 
 ## Environment variables
 

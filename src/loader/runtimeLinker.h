@@ -209,6 +209,11 @@ private:
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
 };
 
+// Installs the host fault handler the ELF loader installs, which routes an access violation on
+// guest memory to the GPU page tracker. Frame replay needs it without loading a program
+// (docs/frame-replay.md); LoadProgram calls it for the guest path.
+void InstallHostFaultHandler();
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();

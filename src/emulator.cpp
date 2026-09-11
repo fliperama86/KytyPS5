@@ -12,6 +12,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "graphics/presentation/window.h"
+#include "graphics/replay/frameReplay.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -185,13 +186,31 @@ static void Execute(const std::filesystem::path& game_patch) {
 	std::quick_exit(0);
 }
 
-void Run(const RunOptions& options) {
-	if (options.app0_dir.empty()) {
-		EXIT("app0 directory is required\n");
-	}
+// Frame replay (docs/frame-replay.md): the same subsystems, no ELF and no guest thread. The
+// feeder does the whole replay and ends the process with its exit code the way Execute does.
+static void ExecuteReplay() {
+	Common::Thread feeder(
+	    [](void*) {
+		    const int code = Libs::Graphics::Replay::RunReplay(
+		        Config::GetReplayDir(), Config::GetReplayLoops(), Config::GetReplayImage());
+		    std::quick_exit(code);
+	    },
+	    nullptr);
+	Libs::Graphics::WindowRun();
+	std::quick_exit(0);
+}
 
-	if (options.elf.empty()) {
-		EXIT("ELF is required\n");
+void Run(const RunOptions& options) {
+	const bool replay = !options.config.replay_dir.empty();
+
+	if (!replay) {
+		if (options.app0_dir.empty()) {
+			EXIT("app0 directory is required\n");
+		}
+
+		if (options.elf.empty()) {
+			EXIT("ELF is required\n");
+		}
 	}
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
@@ -208,6 +227,11 @@ void Run(const RunOptions& options) {
 	// Guest threads are still running, so skip KytyClose() and only flush emergency state.
 	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
+
+	if (replay) {
+		ExecuteReplay();
+		return;
+	}
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");

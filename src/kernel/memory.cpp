@@ -3792,6 +3792,98 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	return FreeGuestMemoryOwner(vaddr, mapped_size);
 }
 
+// Frees whatever the fresh process already placed over [vaddr, vaddr + size). The fixed map paths
+// do this themselves through their FIXED flag; the private-committed and pooled paths do not.
+static bool ReleaseFixedRangeForRestore(uint64_t vaddr, uint64_t size) {
+	if (!g_virtual_ranges->HasOverlap(vaddr, size)) {
+		return true;
+	}
+	if (!ReplaceFixedRangeWithReserved(vaddr, size)) {
+		return false;
+	}
+	(void)g_virtual_ranges->ConsumeReservedSpan(vaddr, size);
+	return !g_virtual_ranges->HasOverlap(vaddr, size);
+}
+
+bool RestoreRange(uint64_t vaddr, uint64_t size, uint32_t prot, uint32_t type, const char* name) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	constexpr uint64_t PAGE_SIZE       = 0x4000;
+	constexpr int      GUEST_MAP_FIXED = 0x10;
+	// The capture does not record the direct-memory type; nothing on the render path reads it.
+	constexpr int RESTORED_MEMORY_TYPE = 3;
+
+	if (g_virtual_ranges == nullptr || vaddr == 0 || size == 0 || (vaddr & (PAGE_SIZE - 1u)) != 0 ||
+	    (size & (PAGE_SIZE - 1u)) != 0 || type > static_cast<uint32_t>(VirtualRangeType::Runtime)) {
+		return false;
+	}
+
+	const auto  range_type = static_cast<VirtualRangeType>(type);
+	const auto  protection = static_cast<int>(prot);
+	const char* range_name = (name != nullptr ? name : "");
+	auto*       addr       = reinterpret_cast<void*>(vaddr);
+
+	switch (range_type) {
+		case VirtualRangeType::Reserved:
+			return KernelReserveVirtualRange(&addr, size, GUEST_MAP_FIXED, 0) == OK;
+		case VirtualRangeType::Direct: {
+			int64_t phys_addr = 0;
+			if (KernelAllocateDirectMemory(0, static_cast<int64_t>(KernelGetDirectMemorySize()),
+			                               size, PAGE_SIZE, RESTORED_MEMORY_TYPE,
+			                               &phys_addr) != OK) {
+				return false;
+			}
+			return KernelMapNamedDirectMemory(&addr, size, protection, GUEST_MAP_FIXED, phys_addr,
+			                                  0, range_name) == OK &&
+			       addr == reinterpret_cast<void*>(vaddr);
+		}
+		case VirtualRangeType::Flexible:
+			return KernelMapNamedFlexibleMemory(&addr, size, protection, GUEST_MAP_FIXED,
+			                                    range_name) == OK &&
+			       addr == reinterpret_cast<void*>(vaddr);
+		case VirtualRangeType::PoolReserved: {
+			if (!ReleaseFixedRangeForRestore(vaddr, size)) {
+				return false;
+			}
+			void* out_addr = nullptr;
+			return KernelMemoryPoolReserve(addr, size, 0, GUEST_MAP_FIXED, &out_addr) == OK &&
+			       out_addr == addr;
+		}
+		case VirtualRangeType::Pooled: {
+			if (!ReleaseFixedRangeForRestore(vaddr, size)) {
+				return false;
+			}
+			int64_t phys_addr = 0;
+			if (KernelMemoryPoolExpand(0, static_cast<int64_t>(KernelGetDirectMemorySize()), size,
+			                           0, &phys_addr) != OK) {
+				return false;
+			}
+			void* out_addr = nullptr;
+			if (KernelMemoryPoolReserve(addr, size, 0, GUEST_MAP_FIXED, &out_addr) != OK ||
+			    out_addr != addr) {
+				return false;
+			}
+			return KernelMemoryPoolCommit(addr, size, RESTORED_MEMORY_TYPE, protection, 0) == OK;
+		}
+		case VirtualRangeType::Stack:
+		case VirtualRangeType::Code:
+		case VirtualRangeType::Runtime: {
+			if (!ReleaseFixedRangeForRestore(vaddr, size)) {
+				return false;
+			}
+			VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
+			GpuAccessMode       gpu_mode = GpuAccessMode::NoAccess;
+			if (!DecodeMemoryProtection(protection, &mode, &gpu_mode)) {
+				return false;
+			}
+			return AllocateGuestRuntimeMemory(vaddr, size, mode, range_name, range_type, true) ==
+			       vaddr;
+		}
+	}
+
+	return false;
+}
+
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	PRINT_NAME();
 

@@ -7,6 +7,7 @@
 
 namespace Libs::Graphics {
 
+class RenderContext;
 struct Shader;
 struct ShaderRegister;
 
@@ -32,6 +33,10 @@ struct Lifecycle {
 };
 
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer);
+
+// Frame replay (docs/frame-replay.md): the render context the graphics lifecycle created, or
+// nullptr before Initialize().
+[[nodiscard]] RenderContext* GetRenderContext() noexcept;
 
 namespace Gen5 {
 

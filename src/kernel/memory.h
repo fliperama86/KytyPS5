@@ -208,6 +208,11 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
+// Frame replay (docs/frame-replay.md): re-creates one recorded guest range at its recorded
+// address through the same map calls the guest uses, so the page tracker, the GPU page table
+// and the virtual-range table stay consistent. `type` is the kernel's VirtualRangeType value.
+bool RestoreRange(uint64_t vaddr, uint64_t size, uint32_t prot, uint32_t type,
+                  const char* name);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestFailNextPhysicalMemoryUnmap();

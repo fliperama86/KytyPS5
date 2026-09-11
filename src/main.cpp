@@ -1,6 +1,7 @@
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -95,6 +96,11 @@ static void PrintUsage() {
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --replay <dir>                       Replay a captured frame from <dir>\n"
+	         "                                       without a game; docs/frame-replay.md.\n");
+	::printf("  --replay-loops <num>                 Replay loops. Default: %u.\n",
+	         Config::DEFAULT_REPLAY_LOOPS);
+	::printf("  --replay-image <path>                Write the last replayed frame there.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -156,6 +162,16 @@ static bool ParseConsoleLanguage(const std::string& value, uint32_t& out) {
 		return false;
 	}
 	out = language;
+	return true;
+}
+
+static bool ParseReplayLoops(const std::string& value, uint32_t& out) {
+	uint32_t loops    = 0;
+	auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), loops);
+	if (error != std::errc {} || end != value.data() + value.size() || loops == 0) {
+		return false;
+	}
+	out = loops;
 	return true;
 }
 
@@ -374,6 +390,25 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--replay") {
+			if (!options.config.replay_dir.empty()) {
+				::printf("--replay can only be specified once\n");
+				return false;
+			}
+			value = Common::FixFilenameSlash(value);
+			if (!Common::File::IsDirectoryExisting(value)) {
+				::printf("--replay must point to an existing capture directory: %s\n",
+				         value.c_str());
+				return false;
+			}
+			options.config.replay_dir = value;
+		} else if (arg == "--replay-loops") {
+			if (!ParseReplayLoops(value, options.config.replay_loops)) {
+				::printf("invalid replay loop count: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--replay-image") {
+			options.config.replay_image = Common::FixFilenameSlash(value);
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
@@ -391,7 +426,20 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		options.config.vulkan_validation_enabled = true;
 	}
 
-	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
+	if (show_help) {
+		return true;
+	}
+
+	// Replay runs without a game: no app0 directory and no ELF (docs/frame-replay.md).
+	if (!options.config.replay_dir.empty()) {
+		if (!options.app0_dir.empty()) {
+			::printf("--replay and --game cannot be combined\n");
+			return false;
+		}
+		return true;
+	}
+
+	return !options.app0_dir.empty() && !options.elf.empty();
 }
 
 int main(int argc, char* argv[]) {

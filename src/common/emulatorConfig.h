@@ -39,6 +39,7 @@ constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
 constexpr int32_t DEFAULT_USER_ID           = 1000;
+constexpr uint32_t DEFAULT_REPLAY_LOOPS     = 20;
 
 constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 	constexpr int32_t USER_ID_EVERYONE = 0xfe;
@@ -82,6 +83,10 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   playgo_hack_enabled         = false;
+	// Frame replay (docs/frame-replay.md). An empty replay_dir leaves every replay path inert.
+	std::filesystem::path  replay_dir;
+	uint32_t               replay_loops                = DEFAULT_REPLAY_LOOPS;
+	std::filesystem::path  replay_image;
 	ThreadAffinity         thread_affinity             = ThreadAffinity::Auto;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
@@ -132,6 +137,12 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool PlayGoHackEnabled();
+
+bool                  ReplayEnabled();
+std::filesystem::path GetReplayDir();
+uint32_t              GetReplayLoops();
+std::filesystem::path GetReplayImage();
+
 ThreadAffinity GetThreadAffinity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();

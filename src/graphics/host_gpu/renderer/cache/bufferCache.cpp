@@ -301,6 +301,14 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	}
 }
 
+void BufferCache::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0) {
+		return;
+	}
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	InvalidateBda(vaddr, size);
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -527,7 +535,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
 	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
 	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+		EXIT("BufferCache: failed to read mapped guest image backing, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " staged=%s\n",
+		     vaddr, size, staging != nullptr ? "yes" : "no");
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};

@@ -155,6 +155,22 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
+bool ReplayEnabled() {
+	return !g_config->replay_dir.empty();
+}
+
+std::filesystem::path GetReplayDir() {
+	return g_config->replay_dir;
+}
+
+uint32_t GetReplayLoops() {
+	return g_config->replay_loops == 0 ? 1u : g_config->replay_loops;
+}
+
+std::filesystem::path GetReplayImage() {
+	return g_config->replay_image;
+}
+
 ThreadAffinity GetThreadAffinity() {
 	return g_config->thread_affinity;
 }

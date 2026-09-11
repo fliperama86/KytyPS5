@@ -125,6 +125,30 @@ KYTY_SYSV_ABI int VideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point
 KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
 
+// Frame replay (docs/frame-replay.md). The game path does not use these; they exist so the replay
+// can restore a recorded video-out state and drive a flip without the guest-facing structs, which
+// live in videoOut.cpp, leaking into it.
+
+// Opens one bus port the way the guest's VideoOutOpen does. Negative on failure. The handle a
+// port yields is fixed (bus type plus one), so a capture whose PM4 stream flips on handle h is
+// replayed by opening bus type h - 1.
+int VideoOutReplayOpen(int bus_type);
+// sizeof(VideoOutBufferAttribute2), so the replay can check a recorded attribute blob.
+[[nodiscard]] size_t VideoOutReplayAttributeSize();
+// Re-registers one recorded buffer group through VideoOutRegisterBuffers2. `addresses` holds two
+// entries per buffer, the data address then the metadata address.
+int VideoOutReplayRegisterBuffers(int handle, int set_index, int index_start, int count,
+                                  int category, const void* attribute, size_t attribute_size,
+                                  const uint64_t* addresses);
+// Reserves a CPU flip of `index` and submits its preparation, exactly as VideoOutSubmitFlip does.
+int VideoOutReplaySubmitFlip(int handle, int index);
+// Blocks until every flip queued on `handle` has been presented, whoever submitted it: this
+// title flips from the graphics command stream, not through VideoOutSubmitFlip, so there is no
+// buffer index to wait on. False on timeout.
+bool VideoOutReplayWaitFlipsDrained(int handle, uint32_t timeout_ms);
+// How many flips this port has presented so far.
+uint64_t VideoOutReplayFlipCount(int handle);
+
 } // namespace Libs::VideoOut
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_VIDEOOUT_H_ */

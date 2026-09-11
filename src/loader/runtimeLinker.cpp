@@ -915,6 +915,14 @@ static void DumpDesTouchList(const Common::HostException::ExceptionInfo& info) {
 }
 #endif
 
+static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info);
+
+void InstallHostFaultHandler() {
+	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
+		EXIT("Failed to install the required vectored exception handler\n");
+	}
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -2212,9 +2220,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	g_faulting_linker = program->rt;
-	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
-		EXIT("Failed to install the required vectored exception handler\n");
-	}
+	InstallHostFaultHandler();
 
 	// program->elf->SetBaseVAddr(program->base_vaddr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

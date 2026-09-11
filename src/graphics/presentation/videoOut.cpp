@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstring>
 #include <list>
 #include <thread>
 #include <vector>
@@ -207,6 +209,7 @@ public:
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
+	bool WaitDrained(VideoOutConfig& cfg, uint32_t timeout_ms);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -1141,6 +1144,28 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
+bool FlipQueue::WaitDrained(VideoOutConfig& cfg, uint32_t timeout_ms) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+	Common::LockGuard lock(m_mutex);
+
+	auto matches     = [&cfg](const Request& r) { return r.cfg == &cfg; };
+	auto has_request = [this, &matches] {
+		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
+		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+	};
+	while (has_request()) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			return false;
+		}
+		const auto remaining =
+		    std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
+		m_done_cond_var.WaitFor(&m_mutex, static_cast<uint32_t>(remaining));
+	}
+	return true;
+}
+
 bool FlipQueue::Flip(uint32_t micros) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
@@ -1893,6 +1918,62 @@ KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* s
 	ctx->mutex.Unlock();
 
 	return OK;
+}
+
+int VideoOutReplayOpen(int bus_type) {
+	return VideoOutOpen(0, bus_type, 0, nullptr);
+}
+
+size_t VideoOutReplayAttributeSize() {
+	return sizeof(VideoOutBufferAttribute2);
+}
+
+int VideoOutReplayRegisterBuffers(int handle, int set_index, int index_start, int count,
+                                  int category, const void* attribute, size_t attribute_size,
+                                  const uint64_t* addresses) {
+	if (attribute == nullptr || addresses == nullptr || count < 1 ||
+	    attribute_size != sizeof(VideoOutBufferAttribute2)) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+
+	VideoOutBufferAttribute2 recorded {};
+	std::memcpy(&recorded, attribute, sizeof(recorded));
+
+	std::vector<VideoOutBuffers> buffers(static_cast<size_t>(count));
+	for (int i = 0; i < count; i++) {
+		const auto index    = static_cast<size_t>(i);
+		buffers[index]      = {};
+		buffers[index].data = reinterpret_cast<const void*>(
+		    addresses[index * 2u]); // NOLINT(performance-no-int-to-ptr)
+		buffers[index].metadata =
+		    reinterpret_cast<const void*>( // NOLINT(performance-no-int-to-ptr)
+		        addresses[index * 2u + 1u]);
+	}
+
+	return VideoOutRegisterBuffers2(handle, set_index, index_start, buffers.data(), count,
+	                                &recorded, category, nullptr);
+}
+
+int VideoOutReplaySubmitFlip(int handle, int index) {
+	return VideoOutSubmitFlip(handle, index, VIDEO_OUT_FLIP_MODE_VSYNC, 0);
+}
+
+uint64_t VideoOutReplayFlipCount(int handle) {
+	auto* ctx = DriverState().Get(handle);
+	if (ctx == nullptr) {
+		return 0;
+	}
+	VideoOutFlipStatus status {};
+	DriverState().GetFlipQueue().GetFlipStatus(*ctx, status);
+	return status.count;
+}
+
+bool VideoOutReplayWaitFlipsDrained(int handle, uint32_t timeout_ms) {
+	auto* ctx = DriverState().Get(handle);
+	if (ctx == nullptr) {
+		return false;
+	}
+	return DriverState().GetFlipQueue().WaitDrained(*ctx, timeout_ms);
 }
 
 } // namespace Libs::VideoOut

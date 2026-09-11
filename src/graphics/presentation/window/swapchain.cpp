@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/srtStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -762,6 +763,80 @@ bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
 
 RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
+}
+
+bool Presenter::ReadLastPresentedFrame(PresentedImage* out) {
+	EXIT_IF(out == nullptr);
+
+	auto* frame = m_impl->frames.AcquireLast();
+	if (frame == nullptr || frame->image.image == nullptr) {
+		return false;
+	}
+
+	const auto width  = frame->image.extent.width;
+	const auto height = frame->image.extent.height;
+	const auto size   = static_cast<uint64_t>(width) * height * 4u;
+
+	bool ok = false;
+	{
+		Buffer   readback(m_impl->window.graphic_ctx, m_impl->present_scheduler,
+		                  MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, size);
+		uint64_t tick = 0;
+		{
+			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+			auto&             command_buffer = m_impl->present_scheduler.BeginCommand();
+			auto              command        = command_buffer.Handle();
+			frame->Transit(command, vk::ImageLayout::eTransferSrcOptimal,
+			               vk::AccessFlagBits2::eTransferRead);
+
+			vk::BufferMemoryBarrier2 barrier {};
+			barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+			barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryRead;
+			barrier.dstStageMask        = vk::PipelineStageFlagBits2::eCopy;
+			barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.buffer              = readback.Handle();
+			barrier.offset              = 0;
+			barrier.size                = size;
+			vk::DependencyInfo dependency {};
+			dependency.bufferMemoryBarrierCount = 1;
+			dependency.pBufferMemoryBarriers    = &barrier;
+			command.pipelineBarrier2(dependency);
+
+			vk::BufferImageCopy copy {};
+			copy.bufferOffset      = 0;
+			copy.bufferRowLength   = 0;
+			copy.bufferImageHeight = 0;
+			copy.imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.imageOffset       = {0, 0, 0};
+			copy.imageExtent       = {width, height, 1};
+			command.copyImageToBuffer(frame->image.image, vk::ImageLayout::eTransferSrcOptimal,
+			                          readback.Handle(), copy);
+
+			barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
+			barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+			barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+			command.pipelineBarrier2(dependency);
+
+			tick = m_impl->present_scheduler.Submit();
+		}
+		m_impl->present_scheduler.Wait(tick);
+
+		readback.Invalidate(0, size);
+		const auto mapped = readback.Mapped();
+		if (mapped.size() >= size) {
+			out->width  = width;
+			out->height = height;
+			out->format = frame->image.format == vk::Format::eR8G8B8A8Unorm ? "RGBA8" : "BGRA8";
+			out->pixels.assign(mapped.begin(), mapped.begin() + static_cast<std::ptrdiff_t>(size));
+			ok = true;
+		}
+	}
+
+	m_impl->frames.Release(frame, true);
+	return ok;
 }
 
 void Presenter::Present(Frame& frame, bool reuse) {

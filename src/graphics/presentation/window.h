@@ -9,6 +9,8 @@ namespace Libs::Graphics {
 class Presenter;
 
 [[nodiscard]] Presenter& WindowInit(uint32_t width, uint32_t height);
+// Frame replay (docs/frame-replay.md): the presenter WindowInit created, or nullptr before it.
+[[nodiscard]] Presenter* WindowGetPresenter() noexcept;
 void                     WindowRun();
 void                     WindowShutdown();
 

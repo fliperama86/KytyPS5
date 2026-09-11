@@ -889,6 +889,10 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	return presenter;
 }
 
+Presenter* WindowGetPresenter() noexcept {
+	return g_window != nullptr ? g_window->presenter.get() : nullptr;
+}
+
 void WindowRun() {
 	KYTY_PROFILER_THREAD("Thread_Window");
 	EXIT_IF(g_window == nullptr);

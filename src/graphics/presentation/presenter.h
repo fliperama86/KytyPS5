@@ -3,7 +3,10 @@
 
 #include "common/common.h"
 
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -11,6 +14,15 @@ class CommandBuffer;
 class RenderContext;
 struct ImageInfo;
 struct WindowContext;
+
+// Frame replay (docs/frame-replay.md): the last presented frame copied into host memory,
+// tightly packed, four bytes per pixel.
+struct PresentedImage {
+	uint32_t             width  = 0;
+	uint32_t             height = 0;
+	std::string          format;
+	std::vector<uint8_t> pixels;
+};
 
 class Presenter final {
 public:
@@ -28,6 +40,9 @@ public:
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
 	void                         Present(Frame& frame, bool reuse = false);
+	// Frame replay: copies the frame the swapchain presented last into host memory. False when
+	// nothing has been presented yet.
+	bool                         ReadLastPresentedFrame(PresentedImage* out);
 	void                         Discard(Frame& frame);
 
 private:

@@ -83,6 +83,10 @@ void EmergencyShutdown() {
 	SrtStats::WriteAtExit();
 }
 
+RenderContext* GetRenderContext() noexcept {
+	return g_renderer;
+}
+
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer) {
 	EXIT_IF(type == nullptr);
 

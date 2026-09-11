@@ -5,6 +5,7 @@ The source for the Demon's Souls documentation lives in this repository. Add new
 ## Current guidance
 
 - [Performance roadmap: what is left, ranked, with the frame budget](performance-roadmap.md)
+- [Frame replay harness: scope of the record-once, replay-in-seconds bench](frame-replay.md)
 - [GPU-side descriptor fetch: design, stages, measurements](gpu-descriptor-fetch.md)
 - [Performance handoff ? September 10, 2026](performance-handoff-2026-09-10.md)
 - [Workaround, setup, and limitations](demons-souls-workaround.md)

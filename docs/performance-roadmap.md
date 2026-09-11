@@ -39,6 +39,12 @@ No single item closes the gap. The per-event cost has to fall about four times, 
 render thread stops touching descriptors per draw, stops issuing one Vulkan call per draw, and
 stops parsing on the critical path.
 
+## Item 0: the frame replay harness
+
+Scoped in [frame-replay.md](frame-replay.md). Record one parked-Nexus frame, replay it in a
+loop without the game. Every item below is measured in replay first; one end-to-end run per
+integrated item; the full A/B only at milestones. Build this before item 1.
+
 ## Items, in recommended order
 
 Expected gains are projections from the self-time shares above unless a measurement is cited.

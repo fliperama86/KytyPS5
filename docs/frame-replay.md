@@ -1,0 +1,140 @@
+# Frame replay harness — scope, September 11, 2026
+
+Record one frame of the parked Nexus once, replay it through the real render path in a loop
+without the game. Turns the 40-minute end-to-end measurement into a bench that runs in under a
+minute, deterministic, with Tracy and a screenshot diff. Motivation and the process it serves:
+[performance-roadmap.md](performance-roadmap.md). Status: scoped, not started.
+
+## What it must do
+
+1. **Capture.** In a normal game run, at a chosen frame, write everything the render path needs
+   to reproduce that frame: guest memory, the frame's command submissions, the video-out
+   registration, the command-processor register state, a screenshot of the frame.
+2. **Replay.** Start the emulator without a game, restore the capture, feed the frame's
+   submissions N times through the existing `GuestGpu` queue, report milliseconds per frame,
+   and write the presented image after the last loop.
+3. **Reproduce the stage 1 result.** Acceptance test: replaying a capture of the parked Nexus
+   with `--gpu-descriptors true` and `false` must reproduce the measured ordering
+   (9.81 versus 10.85 FPS, [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md)) within 10%, in
+   under one minute per configuration. Until it does, the harness is not done.
+
+Success criteria: restore under 30 s; loop-to-loop jitter under 2%; the image after the second
+loop matches the capture screenshot or the differences are listed and explained.
+
+## Why it can work: what the render path actually reads
+
+Everything the render thread consumes is reachable from three things, all in the emulator's
+hands:
+
+- **Guest memory.** Command buffers, indirect buffers (`IT_INDIRECT_BUFFER`,
+  `CommandProcessor::ProcessIndirectBuffer`), SRTs, vertex and index data, textures, indirect
+  arguments, labels. The guest address space has a fixed layout (`memoryAddressSpace.inc`, user
+  range 0x1000000000 to 0xfbffffffff on Windows), mapped ranges are tracked in `VirtualRanges`
+  (src/kernel/memory.cpp), direct memory is 13,824 MiB (`PhysicalMemory::TotalSize`). Same
+  addresses can be restored in a fresh process.
+- **Submissions.** `GuestGpu::Submit(draw, constant)`, `SubmitCompute(queue, commands)`,
+  `SubmitFlipPreparation(request_id)`, `Done()` (src/graphics/guest_gpu/graphicsRun.cpp). Spans
+  point into guest memory; the frame number is `m_done_num`. `GraphicsDbgDumpDcb` (src/libs/agc.cpp,
+  `--command-buffer-dump`) already sits on this path and dumps PM4 as text; the recorder replaces
+  it with a binary, replayable record.
+- **Emulator state outside memory.** Video-out buffer registration
+  (`VideoOutRegisterBuffers2`, src/graphics/presentation/videoOut.cpp), the command processors'
+  register files (src/graphics/guest_gpu/hardwareContext.h, plain register structs), the flip
+  request id.
+
+The emulator already boots its subsystems before the game: `Init` in src/emulator.cpp brings up
+Timer, Pthread, Memory, FileSystem and Graphics lifecycles, then `LoadElf` and the guest thread.
+Replay mode runs `Init`, skips `LoadElf`, and starts a feeder thread instead of the guest thread.
+
+## Capture design
+
+Trigger: `--capture-frame <dir>` plus the frame number, or a hotkey while parked. One capture is
+enough; it is reused until the game's memory layout changes (a new save or build that changes
+the scene).
+
+Taken at `Done()` of frame N, on the GPU thread:
+
+1. **Quiesce.** `WaitForIdle()`, so frame N's GPU work is complete.
+2. **Flush GPU-written memory back to guest memory.** Every buffer range the memory tracker
+   marks GPU-modified (`MemoryTracker::ForEachDownloadRange`, `BufferCache::ReadMemory`) and
+   every image the texture cache can read back. Ranges it cannot read back (image-owned ranges
+   where `SyncGpuCleanBacking` returns false today) are listed in the capture manifest as gaps.
+3. **Dump guest memory.** Walk `VirtualRanges`, write `ranges.json` (address, size, protection,
+   name) and `memory.bin` sparse: 16 KiB pages, zero pages skipped, compressed. Expect a few GB
+   and tens of seconds; acceptable for a one-time capture.
+4. **Record the CPU-dirty page set of frame N** from the memory tracker, so replay can re-mark
+   them dirty each loop and the dirty-upload path (`PrepareBda`) is exercised as in the game.
+5. **Dump emulator state.** Video-out registrations, the gfx and compute command-processor
+   register files, the current flip request id.
+6. **Screenshot** of frame N (`des-window.ps1 -Shot` equivalent inside the emulator, or the
+   presenter's readback).
+
+Taken during frame N (between `Done()` of N-1 and `Done()` of N), on the submit path:
+
+7. **Record every submission** in the order the GPU thread *started processing* it, not the
+   order of enqueue: type, queue, a copy of the command dwords and constant dwords, flip request
+   id. Copying at enqueue is safe (the game must have the buffer ready at submit); ordering by
+   processing start makes cross-queue `WAIT_REG_MEM` dependencies implicit, so replay can treat
+   waits as satisfied.
+
+Why snapshot at the end of frame N and replay frame N's submissions: the CPU-written inputs of
+frame N (constants, SRTs, ring slots) are complete and not yet reused, and the GPU-produced
+intermediates (culling results, indirect arguments, descriptors built by compute) regenerate on
+replay. What this misses is documented under limits.
+
+## Replay design
+
+`kyty_emulator --replay <dir> [--loops N] [--replay-image out.png]`, plus the usual flags
+(`--gpu-descriptors`, Tracy build, `--present-mode`).
+
+1. `Init` as today, no ELF, no guest thread.
+2. **Restore memory.** For each recorded range, map it at the same address through the kernel
+   memory layer (a new `Memory::RestoreRange(vaddr, size, prot)` next to the existing map calls,
+   so page-protection tracking stays consistent) and write the pages. Lazy mapping of the
+   snapshot file is a later optimization if restore exceeds 30 s.
+3. **Restore state.** Video-out registrations through the same code path the game uses; the
+   register files directly into the command processors.
+4. **Loop.** For each loop: re-mark the recorded CPU-dirty pages, feed the recorded submissions
+   in recorded order (`Submit`, `SubmitCompute`, `SubmitFlipPreparation`, `Done`), wait for the
+   flip, record wall time. `WAIT_REG_MEM` executes as normal; with the snapshot's final label
+   values and the recorded order it does not block. If it does, the harness reports the address
+   and stops rather than spinning.
+5. **Report.** Milliseconds per loop after a warm-up loop, min, median, jitter; the render
+   thread's zone totals if Tracy is attached. After the last loop, read back the presented image
+   and write it; a script diffs it against the capture screenshot.
+
+## Limits, known up front
+
+- **First loop is wrong for history buffers.** Textures the frame reads before writing
+  (temporal effects) start with whatever the flush produced; from the second loop on they are
+  the replay's own previous output, as in the game. Measure and diff from loop 2.
+- **CPU writes during the frame are not replayed as writes.** The data is there, but the
+  page-protection faults and uploads they cause in the game happen only through the re-marked
+  dirty set. Close enough for render-thread work; not a model of guest-thread cost.
+- **Guest threads are absent.** The 12 core equivalents of game threads are not simulated, so
+  replay under-represents contention. Render-thread time is the metric, not FPS.
+- **Image-owned ranges the texture cache cannot read back** are gaps in the snapshot; the
+  manifest lists them. If a gap feeds a draw, the picture diff shows it.
+- **Register state.** If the frame relies on registers set before frame N that its own constant
+  buffer does not re-set, the register-file restore covers it; if the restore is incomplete, the
+  diff shows it. Open check: confirm the register structs hold no host pointers.
+- **One machine, console session.** Replays are compared with replays, on the same build type.
+
+## Phases
+
+| Phase | Deliverable | Estimate |
+| --- | --- | --- |
+| A. Capture | flag, quiesce and flush, sparse memory dump, submission recorder in processing order, state dump, screenshot, manifest; format documented in this file | 1 agent-day |
+| B. Replay | `--replay`, memory and state restore, feeder thread, loop timing and report, image readback | 1 to 2 agent-days |
+| C. Validation | capture the parked Nexus on the current build; 100 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff | half a day |
+
+Code goes under `src/graphics/replay/` (capture and replay), flags in
+[settings.md](settings.md), the capture format and the report format in this file. Both flags
+are opt-in; the game path is untouched when they are off.
+
+## How it changes the process
+
+Every item on the roadmap is measured in replay first. An agent's brief states the expected
+milliseconds per frame, runs replay before and after, and stops if the number does not move.
+One end-to-end run per integrated item confirms the game still boots, plays and renders; the
+full A/B on the console session is reserved for milestones.

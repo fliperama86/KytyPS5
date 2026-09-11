@@ -50,7 +50,7 @@ How to use it: `_Build/replay-des.ps1 -Capture _Runtime/_Diagnostics/replay/nexu
 -Repeats 2 -Configs '<flags A>', '<flags B>'` prints the comparison table and keeps the reports. A
 60-loop run is 10 s plus a 6 s warm-up; a two-configuration, two-repeat bench is four minutes
 against the 40 minutes an end-to-end A/B costs. The capture to use is
-`_Runtime/_Diagnostics/replay/nexus-3` (format version 3, frame 2025, 6.5 GiB, 40 submissions).
+`_Runtime/_Diagnostics/replay/nexus-5` (format version 5, frame 1739, 6.6 GiB, 40 submissions).
 
 What it reproduces: the parked-Nexus render thread at 71 ms a loop against 92 ms measured
 end to end (no guest threads compete in replay), with the frame's zone structure intact — 20 867
@@ -69,6 +69,19 @@ every buffer registration and retirement and by every map, and a replay loop reu
 loop 1 built. Items 1, 3 and 4 below do not depend on any of this and are safe to measure in replay;
 item 2 is not, and needs the end-to-end protocol. Evidence in
 [frame-replay.md](frame-replay.md), "Phase D, CPU-write timing".
+
+Phase E (format versions 4 and 5, September 11, 2026) corrected that last paragraph and closed the
+count. The parked Nexus has **no buffer churn at all** -- zero registrations, retirements, maps and
+unmaps in each of six consecutive captured frames -- so the residue was never a missing source of
+BDA-generation bumps. The capture now records the game's own scan timeline (`prepare-events.bin`:
+every `PrepareBda` call and whether it scanned), the progress clock ticks twice per draw and
+dispatch, and the marks are applied inline on the GPU thread: the replay makes **9479 preparations
+against 9479 recorded and 156 scans against 160**, with 0 late marks. The 352-scan, 10.5 ms target
+belongs to the September 10 build, where the draw path made no BDA preparations at all; on this
+build the game itself scans 160 times a frame, so the `--gpu-descriptors` A/B (replay ratio 1.005)
+cannot reproduce an effect that is no longer there and needs re-baselining end to end. What is still
+not reproduced is the *cost* of a scan: the replay's scans walk 17.2 dirty ranges against the game's
+4.3, because a replayed frame re-marks the whole recorded dirty page set.
 
 ## Items, in recommended order
 

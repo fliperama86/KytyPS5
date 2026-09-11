@@ -4,13 +4,14 @@ Record one frame of the parked Nexus once, replay it through the real render pat
 without the game. Turns the 40-minute end-to-end measurement into a bench that runs in under a
 minute, deterministic, with Tracy and a screenshot diff. Motivation and the process it serves:
 [performance-roadmap.md](performance-roadmap.md). Status: phases A (capture), B (replay),
-C (validation) and D (CPU-write timing) done. The bench runs from one command,
-`_Build/replay-des.ps1`, and reproduces the parked-Nexus render thread to within a few per cent.
-The one acceptance test it still does **not** pass is the `--gpu-descriptors` A/B. Phase C found
-the reason to be the timing of the guest's CPU writes; phase D recorded and replayed that timing
-exactly, which moved the BDA scan from 28 to 172 calls a loop against the game's 352 but did not
-close the A/B, and measured what the rest of it is: see *Phase D, CPU-write timing* below. The
-capture to use is `nexus-3` (format version 3).
+C (validation), D (CPU-write timing) and E (buffer churn and scan timing) done. The bench runs from
+one command, `_Build/replay-des.ps1`, and reproduces the parked-Nexus render thread to within a few
+per cent. Phase E made the capture record the game's own BDA-scan timeline, so the harness is now
+measured against the game run it came from instead of against a Tracy number from another build:
+the replay makes **9479 preparations against 9479 recorded and 156 scans against 160**. The
+`--gpu-descriptors` A/B still does not reproduce the end-to-end ordering, and phase E says why --
+the game itself no longer scans 352 times a frame on this build. The capture to use is `nexus-5`
+(format version 5).
 
 ## What it must do
 
@@ -56,10 +57,11 @@ Replay mode runs `Init`, skips `LoadElf`, and starts a feeder thread instead of 
 ## Capture design
 
 Trigger: `--frame-capture <dir>`, plus either `--frame-capture-at <N>` for a fixed frame number or
-a file named `trigger` dropped into `<dir>` while the game is parked. `--frame-capture-exit`
-(default true) ends the process once the capture is flushed. All three are in
-[settings.md](settings.md). One capture is enough; it is reused until the game's memory layout
-changes (a new save or build that changes the scene).
+a file named `trigger` dropped into `<dir>` while the game is parked. `--frame-capture-frames <K>`
+(default 1) records K consecutive frames from the trigger frame on, and the snapshot is taken at the
+`Done()` of the last of them. `--frame-capture-exit` (default true) ends the process once the
+capture is flushed. All four are in [settings.md](settings.md). One capture is enough; it is reused
+until the game's memory layout changes (a new save or build that changes the scene).
 
 The on-disk format is [frameCaptureFormat.h](../src/graphics/replay/frameCaptureFormat.h); the
 capture side is `src/graphics/replay/frameCapture.cpp`, driven from `GuestGpu::Done` and
@@ -81,6 +83,13 @@ Taken at `Done()` of frame N, on the GPU thread:
    `BufferCache::InvalidateMemory` or `BufferCache::MarkRegionAsCpuModified` during the frame, in
    arrival order, each keyed to the GPU thread's progress clock. The two are not the same set and
    neither replaces the other; see *Phase D* below.
+4b. **Record what else moved the BDA generation and what it cost.** Version 4 adds
+   `churn-events.bin`: every buffer registration and retirement (`BufferCache::ChangeRegister`) and
+   every guest map and unmap (`GpuResourceManager::MapMemory`/`UnmapMemory`), keyed to the same
+   clock. Version 5 adds `prepare-events.bin`: every `GpuResourceManager::PrepareBda` call of the
+   frame, whether it scanned, and how many dirty ranges and buffers the scan walked. The first is
+   diagnostics -- it is what proved the phase D churn hypothesis wrong -- and the second is the
+   ground truth a replay is measured against. Both are in *Phase E* below.
 5. **Dump emulator state.** Video-out registrations, the gfx and compute command-processor
    register files, the current flip request id, and the two things the render path needs that are
    neither in guest memory nor in the PM4 stream: the partially-resident-texture apertures
@@ -100,7 +109,9 @@ Taken during frame N (between `Done()` of N-1 and `Done()` of N), on the submit 
    order of enqueue: type, queue, a copy of the command dwords and constant dwords, flip request
    id. Copying at enqueue is safe (the game must have the buffer ready at submit); ordering by
    processing start makes cross-queue `WAIT_REG_MEM` dependencies implicit, so replay can treat
-   waits as satisfied.
+   waits as satisfied. A `Done` record closes each frame and, from version 4, carries that frame's
+   number and its progress count, so a multi-frame capture splits into frames without any per-frame
+   index in the manifest.
 
 Why snapshot at the end of frame N and replay frame N's submissions: the CPU-written inputs of
 frame N (constants, SRTs, ring slots) are complete and not yet reused, and the GPU-produced
@@ -109,7 +120,8 @@ replay. What this misses is documented under limits.
 
 ## Replay design
 
-`kyty_emulator --replay <dir> [--replay-loops N] [--replay-image out.raw]`, plus the usual flags
+`kyty_emulator --replay <dir> [--replay-loops N] [--replay-frames M] [--replay-image out.raw]`,
+plus the usual flags
 (`--gpu-descriptors`, Tracy build, `--present-mode`). Flags in [settings.md](settings.md);
 `--replay` and `--game` are mutually exclusive and `--replay` needs neither an app0 directory nor
 an ELF. Everything below lives in `src/graphics/replay/frameReplay.cpp`.
@@ -142,13 +154,17 @@ an ELF. Everything below lives in `src/graphics/replay/frameReplay.cpp`.
    replay with a message naming both sizes. Note that the graphics processor is `Reset()` again by
    the first `Submit` of every frame, in replay exactly as in the game, so the restore matters for
    the compute processors, which carry state across frames.
-4. **Loop.** For each loop: re-mark the recorded CPU-dirty pages
+4. **Loop.** A loop is the recorded sequence of frames, in order; `--replay-frames M` replays the
+   **last** M of them (default: all), because the last is the frame the memory snapshot ends on and
+   every frame before it is that much further from the state the restore puts the guest in. For
+   each frame of each loop: re-mark the recorded CPU-dirty pages
    (`BufferCache::MarkRegionAsCpuModified`, coalesced into runs and applied on the GPU thread) and,
-   with them, the recorded CPU-dirty events that arrived before the frame's first draw; start the
-   marker thread on the rest of the events (see *Phase D*);
-   then feed the recorded submissions in file order (`Submit`, `SubmitCompute`, a fresh CPU flip
-   where the capture recorded a `FlipPreparation`, `Done`), wait for the GPU thread to drain and
-   for every flip queued on the video-out port to present, record wall time. Demon's Souls flips
+   with them, that frame's recorded CPU-dirty events that arrived before its first draw; arm the
+   rest of its events (applied inline on the GPU thread from version 5, by the marker thread for an
+   older capture -- see *Phase D* and *Phase E*);
+   then feed the frame's recorded submissions in file order (`Submit`, `SubmitCompute`, a fresh CPU
+   flip where the capture recorded a `FlipPreparation`), wait for the GPU thread to drain, call
+   `Done()`, wait for every flip queued on the video-out port to present, record wall time. Demon's Souls flips
    from its own graphics command stream, not through `VideoOutSubmitFlip`, so most captures carry
    no `FlipPreparation` record at all and the flip appears as the PM4 stream replays; the loop
    therefore ends on "the port's flip queue is empty", not on a recorded flip. A recorded flip
@@ -163,11 +179,16 @@ an ELF. Everything below lives in `src/graphics/replay/frameReplay.cpp`.
    the capture. The first loop is a warm-up (cold pipelines, cold descriptor sets, cold history
    buffers) and is excluded from min, median, max and jitter. Two series are reported: `ms/loop`
    is first submit to presented flip, `ms/loop gpu` is first submit to GPU-thread idle, which is
-   the render-path number and is free of the vblank thread's presentation cadence. Presentation is
+   the render-path number and is free of the vblank thread's presentation cadence. Both are the
+   sums over the loop's frames, and every frame also gets its own line and its own arrays in the
+   JSON. A version 5 capture adds the line that matters most: the replay's own BDA preparations and
+   scans against the ones the capture recorded in the game. Presentation is
    paced by the virtual vblank, so `ms/loop` is quantised to the vblank period and never falls
    below it; raise `--vblank-frequency` to shrink the quantum, or steer by `ms/loop gpu`. With Tracy
    attached the render thread's zone totals come from Tracy as usual.
-6. **Image.** `--replay-image <path>` copies the last presented swapchain frame into a host buffer
+6. **Image.** `--replay-image <path>` writes one image per frame of the last loop, as
+   `<path>-f1.raw`, `<path>-f2.raw` and so on, plus `<path>` itself for the last of them. Each copies
+   the presented swapchain frame into a host buffer
    (`Presenter::ReadLastPresentedFrame`) and writes it raw and tightly packed, in whatever video-out
    pixel format the guest chose (`VIDEO_OUT_FORMAT_POLICIES`, src/graphics/host_gpu/renderer/image/
    imageInfo.h), with a `<path>.json` sidecar carrying width, height, format, bytes per pixel and
@@ -180,26 +201,36 @@ an ELF. Everything below lives in `src/graphics/replay/frameReplay.cpp`.
 
 ```
 replay: <capture dir>
-  frame          <captured frame number>
+  frame          <first captured frame number>
   ranges         <n> restored, <n> skipped, <n> MiB committed, <n> ms
   memory         <n> pages, <n> MiB, <n> ms
   registers      <n> command processors, <n> bytes each
   video-out      <n> registrations, handle <h>, flip index <i>
-  submissions    <n> records (<n> graphics, <n> compute, <n> flips)
+  frames         <n> recorded (<a> to <b>), <m> replayed per loop (<c> to <b>)
+  submissions    <n> records over the replayed frames (<n> graphics, <n> compute, <n> flips)
   dirty pages    <n> in <n> ranges
-  dirty events   <n> (<n> before the first draw, <n> timed) over <n> draws
-  loops          <n> (<n> measured, loop 1 excluded)
+  prepares       <n> recorded over the replayed frames, <n> of them scanned (the ground truth)
+  dirty events   <n> recorded (<n> timed in the replayed frames) over <n> draws
+  dirty timing   applied inline on the GPU thread at each progress tick
+  loops          <n> (<n> measured, loop 1 excluded), <n> flips presented
   ms/loop        min <a>  median <b>  max <c>  jitter <d>%
   ms/loop gpu    min <a>  median <b>  max <c>  jitter <d>%
-  dirty events   <n> late of <n> timed (<p>%), progress <n> of <n> recorded
+  frame <i> <n>  gpu median <a>  min <b>  max <c> | loop median <d> | events <n> (<n> late) | progress <n> of <n>
+  frame <i>      prepares <n> (<n> recorded), scans <n> (<n> recorded), <a> dirty ranges and <b> buffers a scan (recorded <c> and <d>)
+  dirty events   <n> late of <n> timed (<p>%)
   total          <n> s
 ```
 
-`replay-report.json` carries `capture`, `frame`, `loops`, `warmup_loops`, `restore_ranges_ms`,
-`restore_pages_ms`, `restore_pages`, `restore_bytes`, `submissions`, `dirty_pages`,
-`dirty_events`, `dirty_events_timed`, `dirty_events_late`, `progress_events_captured`,
-`progress_events_replayed`, the full `loop_ms` and `gpu_ms` arrays, and `summary` / `gpu_summary` objects with `min_ms`, `median_ms`,
-`max_ms`, `jitter` and `total_ms`, so two runs diff without re-parsing the console.
+`replay-report.json` carries `capture`, `frame`, `loops`, `warmup_loops`, `recorded_frames`,
+`frames`, `frame_numbers`, `restore_ranges_ms`, `restore_pages_ms`, `restore_pages`,
+`restore_bytes`, `submissions`, `dirty_pages`, `dirty_events`, `dirty_events_timed`,
+`dirty_events_late`, `progress_events_captured`, `progress_events_replayed`, the full `loop_ms` and
+`gpu_ms` arrays, and `summary` / `gpu_summary` objects with `min_ms`, `median_ms`, `max_ms`,
+`jitter` and `total_ms`, so two runs diff without re-parsing the console. Per replayed frame it
+carries `frame_gpu_ms`, `frame_loop_ms`, `frame_gpu_summary`, `frame_summary`,
+`frame_dirty_events_timed`, `frame_dirty_events_late`, `frame_progress_captured`,
+`frame_progress_replayed`, and -- the phase E numbers -- `frame_prepares`, `frame_scans`,
+`frame_scan_dirty_ranges`, `frame_scan_synchronized` with a `_recorded` counterpart for each.
 
 ### Emulator state outside guest memory, and what version 2 records
 
@@ -353,7 +384,7 @@ One command per comparison, from the repository root:
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\_Build\replay-des.ps1' `
-    -Capture '_Runtime\_Diagnostics\replay\nexus-3' -Loops 60 -Repeats 2 -Image `
+    -Capture '_Runtime\_Diagnostics\replay\nexus-5' -Loops 60 -Repeats 2 -Image `
     -Configs '--gpu-descriptors false','--gpu-descriptors true'"
 ```
 
@@ -683,19 +714,209 @@ the write timing, which is now exact:
    the 884 pages of a frame's worth of 1-byte marks, only five of which are in the frame's dirty
    set. Half the calls at a third of the cost is 1.56 ms against 10.47.
 
+> **Points 2 and 3 above are wrong, and phase E measured why.** There is no buffer churn in the
+> parked Nexus at all -- zero registrations, retirements, maps and unmaps in every one of six
+> consecutive frames -- so nothing was missing from the *sources* of the generation bumps. What was
+> missing was the *resolution* of the clock the marks are keyed to, and, above all, a way to check
+> the replay against the game's own scan timeline instead of against a Tracy number taken on
+> another build. See *Phase E* below; the measurements in this section stand, the explanation of
+> the residue does not.
+
 So the rule from phase C narrows rather than lifts: **the harness measures render-path work
 faithfully, and still must not be used to judge a change whose cost lives in the guest's memory
-behaviour — now specifically its buffer and mapping churn, not its page writes.** Stage 1 of the GPU
-descriptor fetch is such a change; roadmap items 1, 3 and 4 are not.
+behaviour.** Stage 1 of the GPU descriptor fetch is such a change; roadmap items 1, 3 and 4 are not.
+Phase E narrows it further: the behaviour in question is *when the guest's page writes arrive
+relative to the render thread's BDA preparations*, and that the harness now reproduces.
 
-Closing it means a format version 4 that records the *other* generation bumps as well — buffer
-registrations and retirements and map/unmap calls, each keyed to the same progress clock — and a
-replay that reproduces them. That is a larger change than phase D: a replay cannot register a guest
-buffer it has no reason to create, so it would need either a synthetic churn source or a real one
-driven from the recorded events. The alternative, and probably the better answer, is roadmap item 2
-itself: make the per-draw dirty sync cheap (a dirty-page list instead of a scan of dirty ranges
-against mapped ranges), after which the zone is small in the game too and the A/B stops depending on
-it.
+## Phase E, buffer churn and scan timing, September 11, 2026
+
+Phase D closed on a hypothesis: the replay's BDA scan count is short because a replay loop never
+registers, retires, maps or unmaps anything, and those generation bumps are what fill the part of
+the game's frame that has no CPU writes. Format version 4 measured the hypothesis and it is
+**false**. Format version 5 then made the capture record the game's own scan timeline, which is
+what the harness should have been measured against all along.
+
+### There is no churn to reproduce
+
+`churn-events.bin` records every `BufferCache::ChangeRegister` (registration and retirement) and
+every `GpuResourceManager::MapMemory` and `UnmapMemory`, each keyed to the progress clock, for every
+captured frame. `nexus-4` is six consecutive parked-Nexus frames
+(`--frame-capture-frames 6`, frames 1774 to 1779):
+
+| frame | 1774 | 1775 | 1776 | 1777 | 1778 | 1779 |
+| --- | --- | --- | --- | --- | --- | --- |
+| buffer registrations | 0 | 0 | 0 | 0 | 0 | 0 |
+| buffer retirements | 0 | 0 | 0 | 0 | 0 | 0 |
+| guest maps / unmaps | 0 | 0 | 0 | 0 | 0 | 0 |
+| CPU-dirty marks | 2677 | 2681 | 2654 | 2663 | 2660 | 2684 |
+| draws plus dispatches | 10 845 | 10 849 | 10 849 | 10 845 | 10 847 | 10 847 |
+
+**Zero, of every kind, in every frame.** The recorder is not broken: a capture of frames 30 to 32 of
+the same run, while the game is still building its scene, records 15 registrations over three frames
+(`_Runtime/_Diagnostics/replay/churn-check`), and `nexus-5`, taken with `--gpu-descriptors true`,
+records 8 registrations and 9 retirements in its frame -- two orders of magnitude below the hundreds
+the phase D hypothesis needed. In the parked Nexus the buffer set and the guest mapping set are
+static. There is no ring rotating, so **no number of looped frames can add churn that the game does
+not have**, and the multi-frame capture, useful as it is for measuring this, cannot close the gap.
+
+The analysis script is `_Runtime/_Diagnostics/replay/nexus-4/analyse-churn.py` (it reads any capture:
+`python analyse-churn.py ../nexus-5`). It prints the churn per kind per frame, the overlap between
+the registration addresses of frame *i* and frames *i-1* to *i-4* -- the ring-period question, which
+in this scene has no data to answer -- the mark sizes, and the distribution of marks over the frame.
+
+Since every other generation bump (`InvalidateMemory`, `MarkRegionAsCpuModified`, and so the host
+fault handler and every kernel write path) is already recorded as a CPU-dirty mark, and churn is
+zero, **every BDA scan the game pays comes from a CPU write the capture already holds.** The
+question stopped being "what is missing" and became "when exactly does each mark arrive".
+
+### The ground truth: the game's own scan timeline
+
+Version 5 records `prepare-events.bin`: one record per `GpuResourceManager::PrepareBda` call of the
+captured frame -- `{frame, progress, scanned, dirty ranges, buffers synchronized, dirty bytes}`.
+`scanned` is exactly one entry of the `GpuResourceManager::SynchronizeBdaBuffers` Tracy zone, so a
+capture now carries the number the acceptance test is about, measured inside the game run that
+produced the capture. `nexus-5`, game frame 1739, taken with `--gpu-descriptors true`:
+
+| | nexus-5, in the game |
+| --- | --- |
+| BDA preparations | **9479** (352 of them from compute dispatches, the rest from draws) |
+| of those, scans | **160** (1.7%) |
+| per scan | 4.3 dirty ranges, 4.3 buffers, 107.6 KiB |
+| per frame | 693 dirty ranges, 16.8 MiB synchronized |
+| CPU-dirty marks | 2743, of which 1991 before the first draw |
+| timed marks | 752 on 301 distinct progress ticks |
+
+The shape is the point. Preparations are spread evenly over the frame -- about 1080 per tenth --
+while the scans are not: 127 of the 160 fall in the second tenth, exactly where the guest's writes
+are (470 of the 752 timed marks). The scan count is a function of *where the guest's page writes
+fall relative to the preparations*, and of nothing else.
+
+### The captures
+
+`nexus-4` and `nexus-5` follow the phase C procedure exactly (launch with `--frame-capture <abs>`,
+`_Build/des-navigate.ps1 -NoElevate -WaitForFrame 1000 -HoldSeconds 4 -Presses 12 -GapSeconds 3`,
+`des-window.ps1 -Show` then `-Shot` as `reference.png`, then create `trigger`); `_Build/capture-frame.ps1`
+wraps the launch with the environment the root launcher sets, which the game needs to reach gameplay.
+
+| | nexus-3 (v3) | nexus-4 (v4) | nexus-5 (v5) |
+| --- | --- | --- | --- |
+| frames | 1 (2025) | 6 (1774 to 1779) | 1 (1739) |
+| flags | default | default | `--gpu-descriptors true` |
+| write time | 5.72 s | 5.78 s | 5.66 s |
+| mapped ranges / committed | 6355 / 4940 | 6394 / 4974 | 6425 / 5005 |
+| non-zero 16 KiB pages | 425 177 (6.49 GiB) | 426 663 (6.51 GiB) | 424 329 (6.47 GiB) |
+| CPU-dirty pages | 72 444 | 76 058 | 75 272 |
+| CPU-dirty events | 2941 | 16 032 (2654 to 2684 a frame) | 2755 |
+| churn events | -- | **0** | 21 (8 registrations, 9 retirements) |
+| prepare events / scans | -- | -- | **9479 / 160** |
+| submissions | 40 | 240 | 40 |
+| PRT apertures / shaders | 1 / 9815 | 1 / 9824 | 1 / 9810 |
+
+The picture is unchanged by any of it: the last frame of nexus-4 replayed against its reference is
+R 11.3, G 9.2, B 5.0 mean absolute difference, and nexus-5 is R 11.0, G 8.5, B 4.4, against phase
+D's R 10.5, G 8.3, B 4.4 -- the same two causes, the auto-exposure history buffer among the capture's
+gaps and two streamed HUD icons in the sparse part of a PRT aperture.
+
+### The finer clock and inline application
+
+Two changes make a replay able to reproduce that:
+
+- **The progress clock ticks twice per draw and dispatch** (version 5): once when it starts and once
+  after its resource preparation stage. The second tick is unconditional, not tied to whether the
+  stage needed a BDA preparation, so the clock does not depend on `--gpu-descriptors`. A mark that
+  arrives before a draw's `PrepareBda` and one that arrives after it used to collapse onto one
+  value; now they do not. On nexus-5 the frame is 21 638 ticks against 10 819 draws and dispatches.
+  The always-on cost of the clock is now two relaxed atomic increments per draw and dispatch instead
+  of one, plus a relaxed load of a null hook pointer at each; a run with neither `--frame-capture`
+  nor `--replay` is otherwise untouched, and `PrepareBda` gains one relaxed load of a null sink.
+- **The marks are applied inline on the GPU thread**, from the progress hook, at the tick they were
+  recorded at, through the same `InvalidateMemory` the game's own writes reach. The phase D marker
+  thread waits for the counter to pass a value and then marks from another thread, so it could
+  arrive after the preparation it was meant to precede. A capture older than version 5 keeps the
+  marker thread, because its progress values mean something else.
+
+### The result
+
+`--replay-loops 40 --vblank-frequency 360 --gpu-descriptors true`, nexus-5, 39 measured loops:
+
+| | game (recorded) | replay | |
+| --- | --- | --- | --- |
+| BDA preparations a frame | 9479 | **9479** | exact |
+| BDA scans a frame | 160 | **156** | -2.5% |
+| progress ticks a frame | 21 638 | 21 638 | exact |
+| late marks | -- | 0 of 752 a loop | |
+| dirty ranges a scan | 4.3 | 17.2 | 4.0x |
+| buffers synchronized a scan | 4.3 | 17.2 | 4.0x |
+| `SynchronizeBdaBuffers` | -- | 1.01 ms, 156 calls, 6.5 us each | Tracy, 30 minus 5 loops |
+
+With `--gpu-descriptors false` the same replay makes 357 preparations and 16 scans: the flag is what
+decides how many stages need a BDA preparation at all, which is why the ground truth was captured
+with it on.
+
+The count is reproduced. The **cost per scan is not**: the replay's scans walk four times as many
+dirty ranges as the game's, because every replayed frame re-marks the whole recorded CPU-dirty page
+set (76 058 pages) to make the loop upload the frame's working set, and those ranges land in the
+frame's first scans. They are cheap ranges -- already-resident buffers -- so the replay pays 6.5 us
+a scan, 1.0 ms a frame. That is a fidelity question about the *inputs* of a scan, not about its
+timing, and it is the next thing to close if the BDA zone ever needs to be judged in replay.
+
+### The 352 scans, and what acceptance means now
+
+The acceptance target -- 352 scans at 29.7 us, 10.47 ms a frame -- comes from
+`_Runtime/_Diagnostics/gpufetch/real3-self.csv`, a Tracy capture of the game on the build of
+September 10 (51 402 zone entries over 146 frames). In that run `SynchronizeBdaBuffers` (352.1 a
+frame) and `RenderCompute::PrepareBda` (351.9 a frame) are the same number: *every compute
+preparation scanned*, and the draw path made no BDA preparations at all.
+
+On the build of this branch the same scene with the same flag makes 9479 preparations a frame, 9127
+of them from draws, and 160 of them scan. The replay's Tracy agrees with its own counter
+(`RenderCompute::PrepareBda` 351.8 a loop, `SynchronizeBdaBuffers` 156). So **the game itself no
+longer does 352 scans a frame**: the target is a number from another build, and the harness is now
+measured against the ground truth the capture carries.
+
+Acceptance, restated:
+
+- Scans within 25% of the recorded ground truth: **160 recorded, 156 replayed, met.**
+- Scans within 25% of 352: **not met, and not meetable** -- the game does 160 on this build.
+- `--gpu-descriptors` true/false ratio within 10% of 1.10 (that is 0.99 to 1.21), `ms/loop gpu`
+  medians, `_Build/replay-des.ps1 -Loops 40 -Repeats 2` (`nexus-5/ab-phasee/`):
+
+| config | run 1 | run 2 | median | gpu min | scans a frame |
+| --- | --- | --- | --- | --- | --- |
+| `--gpu-descriptors false` | 71.54 | 71.61 | **71.58** | 69.73 | 16 |
+| `--gpu-descriptors true` | 71.99 | 71.93 | **71.96** | 69.78 | 156 |
+
+Ratio true/false **1.005**. It is inside the stated window by arithmetic, and it does not reproduce
+what the window was for: end to end, `true` is 10% *slower* than `false` (102 against 92 ms of
+render thread); in replay it is 0.5% slower, within run-to-run noise (0.1%). The 10 ms the A/B is
+made of was 352 scans at 29.7 us on the old build. Today the game's own scan budget for that frame
+is 160 scans, and the replay pays 1.0 ms of it. **The A/B as written cannot be reproduced, because
+the effect it measures is no longer there to reproduce; re-baselining it needs a fresh end-to-end
+Tracy run of the game on this build.** That run is also the only way to get today's cost per scan in
+the game, which the capture does not record -- adding the scan's duration to `PrepareEventRecord` is
+a one-line extension and the obvious next step if the number is wanted without a 40-minute run.
+
+### The multi-frame loop, and why K is 1 on this title
+
+`--frame-capture-frames K` and `--replay-frames M` work, and the six-frame nexus-4 is what measured
+the churn above. But **only the last frame of a capture can be replayed on this title.** The memory
+snapshot is taken at the end of the last captured frame, and the guest advances a label in guest
+memory once or twice per frame; an earlier frame's `WAIT_REG_MEM` then waits for a value the
+snapshot has already passed, with `func` 3 (equal), and never completes:
+
+| replayed frame | frames before the snapshot | waits for | memory holds |
+| --- | --- | --- | --- |
+| 1779 (the last) | 0 | -- | replays, 0 late marks, 78.8 ms |
+| 1778 | 1 | 0x6f1 | 0x6f3 |
+| 1774 | 5 | 0x6ed | 0x6f3 |
+
+The label is guest-CPU-written, and a replay reproduces the *dirtying* of guest memory, not its
+data, so no ordering of the loop helps: after the last frame the state is the snapshot's again, and
+frame 1 of the next iteration is as stale as before. `--replay-frames` therefore keeps the **tail**
+of a capture, and a multi-frame capture is a diagnostic instrument rather than a longer loop. Making
+K > 1 replayable means recording, per frame, the values of the labels that frame's waits read, and
+writing them back before the frame -- the same shape of mechanism as `RestoreRange`, and worth doing
+only for a title whose frames actually differ.
 
 ## Phases
 
@@ -705,6 +926,7 @@ it.
 | B. Replay | `--replay`, memory and state restore, feeder thread, loop timing and report, image readback | 1 to 2 agent-days |
 | C. Validation | capture the parked Nexus on the current build; 60 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff; one command. Done, and the A/B does not reproduce — see *Phase C validation* above | half a day |
 | D. CPU-write timing | format version 3: a progress clock on the GPU thread, `dirty-events.bin`, a marker thread that replays each write where it happened. Done; the timing is exact (0 late events, 11 259 of 11 259 progress) and the BDA scan goes from 28 to 172 calls a loop, but the A/B still does not reproduce — see *Phase D* above | half a day |
+| E. Buffer churn and scan timing | format version 4: `churn-events.bin` and multi-frame captures, which measured the churn at **zero** and refuted the phase D explanation. Format version 5: `prepare-events.bin` (the game's own scan timeline), a clock that ticks twice per draw and dispatch, and inline application of the marks on the GPU thread. Done; the replay makes 9479 preparations against 9479 recorded and 156 scans against 160, and the A/B's 352-scan target is shown to belong to an older build — see *Phase E* above | one day |
 
 Phase B status, September 11, 2026: `--replay` replays a real capture end to end. On title-2, the
 title screen at frame 300 captured with format version 2, it restores 1190 ranges (6123 MiB) in
@@ -729,8 +951,9 @@ format did not carry:
    followed by a reserved hole, read through `Memory::TryReadPrtBacking`, which refuses outside a
    registered aperture. Restoring the one aperture Demon's Souls registers fixes every such image.
 
-That recapture is done. `nexus-3`, format version 3, is the capture to use; `nexus-2` is the
-phase C reference and `nexus-1` is kept only because its screenshot documents the scene.
+That recapture is done. **`nexus-5`, format version 5, is the capture to use**; `nexus-4` (format 4,
+six frames) is the churn measurement, `nexus-3` is the phase D reference, `nexus-2` the phase C one
+and `nexus-1` is kept only because its screenshot documents the scene.
 
 Code goes under `src/graphics/replay/` (capture and replay), flags in
 [settings.md](settings.md), the capture format and the report format in this file. Both flags

@@ -593,6 +593,63 @@ void VideoOutShutdown() {
 	g_video_out_driver.reset();
 }
 
+std::vector<VideoOutRegistrationSnapshot> VideoOutSnapshotRegistrations() {
+	static_assert(sizeof(VideoOutBufferAttribute2) <=
+	              VideoOutRegistrationSnapshot::ATTRIBUTE_MAX_SIZE);
+	static_assert(VIDEO_OUT_BUFFER_NUM_MAX == VideoOutRegistrationSnapshot::BUFFER_NUM_MAX);
+
+	std::vector<VideoOutRegistrationSnapshot> snapshot;
+	if (g_video_out_driver == nullptr) {
+		return snapshot;
+	}
+
+	auto& state = DriverState();
+	for (int handle = 1; handle < VideoOutDriver::Impl::VIDEO_OUT_NUM_MAX; handle++) {
+		auto* config = state.Get(handle);
+		if (config == nullptr) {
+			continue;
+		}
+		Common::LockGuard lock(config->mutex);
+		if (!config->opened || config->closing) {
+			continue;
+		}
+		for (int set_index = 0; set_index < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX; set_index++) {
+			const auto& group = config->groups[set_index];
+			if (!group.occupied) {
+				continue;
+			}
+			VideoOutRegistrationSnapshot entry {};
+			entry.handle         = handle;
+			entry.set_index      = set_index;
+			entry.index_start    = -1;
+			entry.category       = group.category;
+			entry.width          = group.attribute.width;
+			entry.height         = group.attribute.height;
+			entry.attribute_size = static_cast<uint32_t>(sizeof(VideoOutBufferAttribute2));
+			std::memcpy(entry.attribute.data(), &group.attribute,
+			            sizeof(VideoOutBufferAttribute2));
+			for (int index = 0; index < VIDEO_OUT_BUFFER_NUM_MAX; index++) {
+				const auto& buffer = config->buffers[index];
+				if (buffer.group_index != set_index) {
+					continue;
+				}
+				if (entry.index_start < 0) {
+					entry.index_start = index;
+				}
+				entry.buffers[static_cast<size_t>(entry.count)] = {buffer.data_address,
+				                                                   buffer.metadata_address};
+				entry.count++;
+			}
+			if (entry.index_start < 0) {
+				entry.index_start = 0;
+			}
+			snapshot.push_back(entry);
+		}
+	}
+
+	return snapshot;
+}
+
 VideoOutDriver::Impl::~Impl() {
 	if (m_present_thread.joinable()) {
 		m_present_thread.request_stop();

@@ -7,7 +7,11 @@
 #include "common/abi.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
+#include <cstdint>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 class CommandBuffer;
@@ -49,6 +53,27 @@ private:
 [[nodiscard]] VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height,
                                            Graphics::Presenter& presenter);
 void                          VideoOutShutdown();
+
+// One live VideoOutRegisterBuffers2 registration, for the frame capture (docs/frame-replay.md).
+// `attribute` holds the raw VideoOutBufferAttribute2 bytes the guest passed, `attribute_size` how
+// many of them are meaningful. `buffers` holds `count` {data, metadata} guest addresses.
+struct VideoOutRegistrationSnapshot {
+	static constexpr int      BUFFER_NUM_MAX    = 16;
+	static constexpr uint32_t ATTRIBUTE_MAX_SIZE = 128;
+
+	int      handle         = 0;
+	int      set_index      = 0;
+	int      index_start    = 0;
+	int      count          = 0;
+	int      category       = 0;
+	uint32_t width          = 0;
+	uint32_t height         = 0;
+	uint32_t attribute_size = 0;
+	std::array<uint8_t, ATTRIBUTE_MAX_SIZE>                    attribute {};
+	std::array<std::pair<uint64_t, uint64_t>, BUFFER_NUM_MAX> buffers {};
+};
+
+[[nodiscard]] std::vector<VideoOutRegistrationSnapshot> VideoOutSnapshotRegistrations();
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);

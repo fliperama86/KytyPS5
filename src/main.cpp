@@ -73,6 +73,13 @@ static void PrintUsage() {
 	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
+	::printf("  --frame-capture <dir>                Capture one frame for the replay harness\n"
+	         "                                       into <dir>. Created if missing.\n");
+	::printf("  --frame-capture-at <num>             Capture GPU frame <num>. Without it the\n"
+	         "                                       capture waits for a file named trigger\n"
+	         "                                       inside the capture directory.\n");
+	::printf("  --frame-capture-exit <true|false>    Quit after writing the capture.\n"
+	         "                                       Default: true.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
@@ -319,6 +326,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--command-buffer-dump-folder") {
 			options.config.command_buffer_dump_folder = value;
+		} else if (arg == "--frame-capture") {
+			options.config.frame_capture_enabled = true;
+			options.config.frame_capture_folder  = Common::FixFilenameSlash(value);
+		} else if (arg == "--frame-capture-at") {
+			int32_t frame     = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), frame);
+			if (error != std::errc {} || end != value.data() + value.size() || frame < 0) {
+				::printf("invalid frame number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.frame_capture_at = frame;
+		} else if (arg == "--frame-capture-exit") {
+			if (!ParseBool(value, options.config.frame_capture_exit)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--graphics-debug-dump") {
 			if (!ParseBool(value, options.config.graphics_debug_dump_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

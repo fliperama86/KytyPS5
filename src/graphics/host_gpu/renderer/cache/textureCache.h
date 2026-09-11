@@ -74,6 +74,15 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Frame capture (docs/frame-replay.md): reads every GPU-modified image back into guest memory.
+	// Images the download path cannot handle are appended to `gaps` and stay GPU-owned; the
+	// capture lists them. GPU thread only. Returns the number of images read back.
+	struct CaptureGap {
+		uint64_t    address = 0;
+		uint64_t    size    = 0;
+		const char* reason  = "";
+	};
+	uint32_t FlushGpuModifiedImages(std::vector<CaptureGap>& gaps);
 
 private:
 	enum class TransferDirection { Upload, Download };

@@ -63,9 +63,12 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		// Frame capture id (docs/frame-replay.md); 0 unless --frame-capture is recording.
+		uint64_t capture_id = 0;
 	};
 
 	void              Enqueue(Submission submission);
+	void              CaptureFrame(int frame_num);
 	void              WaitForIdle();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);

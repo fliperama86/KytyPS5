@@ -6,6 +6,7 @@
 #include "common/virtualMemory.h"
 
 #include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 class GpuResourceManager;
@@ -47,6 +48,19 @@ struct VirtualQueryInfo {
 };
 
 static_assert(sizeof(VirtualQueryInfo) == 72, "VirtualQueryInfo struct size is incorrect");
+
+// One entry of the mapped-range table, as the frame capture writes it (docs/frame-replay.md).
+// `type` is the kernel's VirtualRangeType ordinal; `is_committed` is false for the reserved types.
+struct VirtualRangeSnapshot {
+	uint64_t start        = 0;
+	uint64_t size         = 0;
+	uint64_t offset       = 0;
+	int32_t  protection   = 0;
+	int32_t  memory_type  = 0;
+	uint32_t type         = 0;
+	bool     is_committed = false;
+	char     name[KERNEL_MAXIMUM_NAME_LENGTH] {};
+};
 
 struct KernelBatchMapEntry {
 	void*         start;
@@ -119,6 +133,9 @@ bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t si
 // the CPU would read there. GPU thread only; empty when the GPU is not up.
 [[nodiscard]] std::string DescribeGpuAddress(uint64_t vaddr);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Every mapped range, reserved ones included, sorted by address. For the frame capture; taken
+// under the range lock alone, so it is consistent with itself but not with a concurrent syscall.
+[[nodiscard]] std::vector<VirtualRangeSnapshot> SnapshotVirtualRanges();
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;

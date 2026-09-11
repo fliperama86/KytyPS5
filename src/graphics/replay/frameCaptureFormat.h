@@ -67,7 +67,12 @@ static_assert(sizeof(SubmissionRecord) == 24);
 
 // One command processor's register file, raw bytes of the emulator's register structs. `size`
 // bytes follow the header. queue_id 0 is the graphics processor, 1.. the compute processors, in
-// GuestGpu::GetProcessor order.
+// GuestGpu::GetProcessor order; processors that were never created are not written.
+//
+// The `size` bytes are three blocks, back to back, each memcpy'd from the live struct:
+// HW::Context, then HW::UserConfig, then HW::Shader (graphics/guest_gpu/hardwareContext.h). All
+// three are trivially copyable and hold guest addresses only, so the same build restores them
+// with a memcpy; `size` lets a replay reject a capture from a build whose structs changed.
 struct RegisterFileRecord {
 	uint32_t queue_id = 0;
 	uint32_t size     = 0;

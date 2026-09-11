@@ -456,6 +456,27 @@ public:
 		return clamped_size;
 	}
 
+	std::vector<VirtualRangeSnapshot> Snapshot() {
+		Common::LockGuard lock(m_mutex);
+
+		std::vector<VirtualRangeSnapshot> snapshot;
+		snapshot.reserve(m_ranges.size());
+		for (const auto& r: m_ranges) {
+			VirtualRangeSnapshot entry {};
+			entry.start        = r.start;
+			entry.size         = r.size;
+			entry.offset       = r.offset;
+			entry.protection   = r.protection;
+			entry.memory_type  = r.memory_type;
+			entry.type         = static_cast<uint32_t>(r.type);
+			entry.is_committed = IsCommittedRangeType(r.type);
+			CopyVirtualRangeName(entry.name, r.name);
+			snapshot.push_back(entry);
+		}
+
+		return snapshot;
+	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
 
@@ -925,6 +946,16 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 		GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
 	}
 	return true;
+}
+
+std::vector<VirtualRangeSnapshot> SnapshotVirtualRanges() {
+	if (g_virtual_ranges == nullptr) {
+		return {};
+	}
+
+	// Only the range lock: the capture runs on the GPU thread, and a guest thread inside a memory
+	// syscall can be waiting on that thread, so g_memory_operation_mutex must not be taken here.
+	return g_virtual_ranges->Snapshot();
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

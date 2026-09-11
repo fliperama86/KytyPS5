@@ -218,6 +218,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/*.inc"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/replay/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/replay/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.cpp"

@@ -2175,6 +2175,36 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
+uint32_t TextureCache::FlushGpuModifiedImages(std::vector<CaptureGap>& gaps) {
+	std::scoped_lock lock {m_lock};
+
+	// TryDownloadImage stages through the shared download buffer and exits if the image does not
+	// fit; skip those instead and let the capture list them.
+	const auto staging_size = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size();
+
+	uint32_t downloaded = 0;
+	m_slot_images.ForEach([&](ImageId id, Image& image) {
+		if (!image.registered || !image.IsGpuModified() || image.info.data.Empty()) {
+			return;
+		}
+		if (image.info.data.size <= staging_size && TryDownloadImage(id)) {
+			downloaded++;
+			return;
+		}
+		const char* reason = "image readback unsupported";
+		if (image.info.data.size > staging_size) {
+			reason = "image larger than the download staging buffer";
+		} else if (image.depth_id) {
+			reason = "image has a separate depth plane";
+		} else if (!image.SafeToDownload()) {
+			reason = "image is buffer-modified or CPU-dirty";
+		}
+		gaps.push_back({image.info.data.address, image.info.data.size, reason});
+	});
+	m_download_images.clear();
+	return downloaded;
+}
+
 void TextureCache::ProcessDownloadImages() {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {

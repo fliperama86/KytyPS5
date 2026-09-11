@@ -121,6 +121,15 @@ public:
 	void               ProcessDescriptorFeedback();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	// Frame capture (docs/frame-replay.md): writes every GPU-modified byte of every cached buffer
+	// back to guest memory and clears the GPU ownership, keeping the buffers. GPU thread only.
+	// Returns the number of bytes written back.
+	uint64_t FlushGpuModifiedMemory();
+	// Frame capture: the CPU-dirty set of the range, without clearing it.
+	template <typename Func>
+	void ForEachCpuModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		m_memory_tracker.ForEachCpuModifiedRange(vaddr, size, std::forward<Func>(func));
+	}
 	[[nodiscard]] uint64_t BdaGeneration() const noexcept {
 		return m_bda_generation.load(std::memory_order_acquire);
 	}

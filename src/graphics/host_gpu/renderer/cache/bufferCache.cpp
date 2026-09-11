@@ -690,6 +690,45 @@ void BufferCache::RunGarbageCollector() {
 	}
 }
 
+uint64_t BufferCache::FlushGpuModifiedMemory() {
+	if (!GuestGpu::IsGpuThread()) {
+		EXIT("BufferCache: capture flush off the GPU thread\n");
+	}
+
+	std::vector<DownloadCopy> copies;
+	std::vector<BufferId>     flushed;
+	uint64_t                  bytes = 0;
+	for (const auto& [vaddr, id]: m_buffers) {
+		(void)vaddr;
+		auto& buffer = m_slot_buffers[id];
+		if (buffer.is_deleted ||
+		    !m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			continue;
+		}
+		m_memory_tracker.ForEachDownloadRange<false>(
+		    buffer.CpuAddress(), buffer.Size(),
+		    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
+			    m_gpu_modified_ranges.ForEachIntersection(
+			        dirty_address, dirty_size, [&](RangeSet::Range range) {
+				        copies.push_back({&buffer, range.address - buffer.CpuAddress(),
+				                          range.address, range.size});
+				        bytes += range.size;
+			        });
+		    });
+		flushed.push_back(id);
+	}
+	if (copies.empty()) {
+		return 0;
+	}
+
+	DownloadBufferMemory(copies);
+	for (const auto id: flushed) {
+		auto& buffer = m_slot_buffers[id];
+		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+	}
+	return bytes;
+}
+
 void BufferCache::RecordShaderWrite(uint64_t hash, uint32_t stage, uint64_t address,
                                     uint64_t size, bool dma, bool formatted, bool gpu_fetch) {
 	if (m_shader_writes.size() < ShaderWriteRingSize) {

@@ -103,6 +103,22 @@ std::filesystem::path GetCommandBufferDumpFolder() {
 	return g_config->command_buffer_dump_folder;
 }
 
+bool FrameCaptureEnabled() {
+	return g_config->frame_capture_enabled;
+}
+
+std::filesystem::path GetFrameCaptureFolder() {
+	return g_config->frame_capture_folder;
+}
+
+int32_t GetFrameCaptureFrame() {
+	return g_config->frame_capture_at;
+}
+
+bool FrameCaptureExitEnabled() {
+	return g_config->frame_capture_exit;
+}
+
 bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }

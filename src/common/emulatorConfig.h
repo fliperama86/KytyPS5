@@ -67,6 +67,12 @@ struct ConfigOptions {
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
+	// One-frame capture for the replay harness (docs/frame-replay.md). Off unless a folder is
+	// given; frame_capture_at < 0 waits for a file named "trigger" inside that folder.
+	bool                  frame_capture_enabled = false;
+	std::filesystem::path frame_capture_folder;
+	int32_t               frame_capture_at   = -1;
+	bool                  frame_capture_exit = true;
 	bool                   graphics_debug_dump_enabled = false;
 	OutputDirection        printf_direction            = OutputDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
@@ -106,6 +112,11 @@ std::filesystem::path  GetShaderLogFolder();
 
 bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
+
+bool                  FrameCaptureEnabled();
+std::filesystem::path GetFrameCaptureFolder();
+int32_t               GetFrameCaptureFrame();
+bool                  FrameCaptureExitEnabled();
 
 bool GraphicsDebugDumpEnabled();
 

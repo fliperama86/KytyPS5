@@ -3,7 +3,8 @@
 Record one frame of the parked Nexus once, replay it through the real render path in a loop
 without the game. Turns the 40-minute end-to-end measurement into a bench that runs in under a
 minute, deterministic, with Tracy and a screenshot diff. Motivation and the process it serves:
-[performance-roadmap.md](performance-roadmap.md). Status: scoped, not started.
+[performance-roadmap.md](performance-roadmap.md). Status: phase A (capture) implemented,
+phase B (replay) not started.
 
 ## What it must do
 
@@ -48,9 +49,15 @@ Replay mode runs `Init`, skips `LoadElf`, and starts a feeder thread instead of 
 
 ## Capture design
 
-Trigger: `--capture-frame <dir>` plus the frame number, or a hotkey while parked. One capture is
-enough; it is reused until the game's memory layout changes (a new save or build that changes
-the scene).
+Trigger: `--frame-capture <dir>`, plus either `--frame-capture-at <N>` for a fixed frame number or
+a file named `trigger` dropped into `<dir>` while the game is parked. `--frame-capture-exit`
+(default true) ends the process once the capture is flushed. All three are in
+[settings.md](settings.md). One capture is enough; it is reused until the game's memory layout
+changes (a new save or build that changes the scene).
+
+The on-disk format is [frameCaptureFormat.h](../src/graphics/replay/frameCaptureFormat.h); the
+capture side is `src/graphics/replay/frameCapture.cpp`, driven from `GuestGpu::Done` and
+`GuestGpu::Process`.
 
 Taken at `Done()` of frame N, on the GPU thread:
 
@@ -67,7 +74,12 @@ Taken at `Done()` of frame N, on the GPU thread:
 5. **Dump emulator state.** Video-out registrations, the gfx and compute command-processor
    register files, the current flip request id.
 6. **Screenshot** of frame N (`des-window.ps1 -Shot` equivalent inside the emulator, or the
-   presenter's readback).
+   presenter's readback). *Not implemented.* The presenter has no readback path at all: its
+   `Frame::image` is `eTransferSrc`, but nothing copies it to a host-visible buffer and
+   `Presenter` exposes no entry point for it. A capture therefore has no `frame.png` or
+   `frame.raw`; the manifest still carries `width` and `height`, taken from the video-out
+   attribute group. Adding the readback belongs with phase B, which needs the same code to write
+   the image after the last loop.
 
 Taken during frame N (between `Done()` of N-1 and `Done()` of N), on the submit path:
 
@@ -117,14 +129,26 @@ replay. What this misses is documented under limits.
   manifest lists them. If a gap feeds a draw, the picture diff shows it.
 - **Register state.** If the frame relies on registers set before frame N that its own constant
   buffer does not re-set, the register-file restore covers it; if the restore is incomplete, the
-  diff shows it. Open check: confirm the register structs hold no host pointers.
+  diff shows it. The register structs hold no host pointers: `HW::Context`, `HW::UserConfig` and
+  `HW::Shader` are trivially copyable and every address in them is a guest address, which the
+  capture asserts. Two things phase B must know about them:
+  - The **graphics** register file is not interesting. `GuestGpu::Submit` sets
+    `reset_processor` from `m_graphics_done`, which `Done()` sets, so the first graphics
+    submission of every frame calls `CommandProcessor::Reset` and clears the context, user-config,
+    shader and const-RAM state. Frame N rebuilds it from its own packets.
+  - The **compute** register files do carry over: `SubmitCompute` never resets. The capture takes
+    them at `Done()` of frame N, which is the state frame N+1 starts from, not frame N. For a
+    loop that is the consistent choice; the first loop can differ.
+  - Const RAM (`CommandProcessor::m_const_ram`, 48 KiB) is not in `registers.bin`. It is cleared
+    by the same per-frame `Reset` on the graphics queue and rebuilt by the frame's constant-engine
+    packets, which the capture records.
 - **One machine, console session.** Replays are compared with replays, on the same build type.
 
 ## Phases
 
 | Phase | Deliverable | Estimate |
 | --- | --- | --- |
-| A. Capture | flag, quiesce and flush, sparse memory dump, submission recorder in processing order, state dump, screenshot, manifest; format documented in this file | 1 agent-day |
+| A. Capture | flag, quiesce and flush, sparse memory dump, submission recorder in processing order, state dump, manifest; format in `frameCaptureFormat.h`. Done except the screenshot, which needs a presenter readback path | 1 agent-day |
 | B. Replay | `--replay`, memory and state restore, feeder thread, loop timing and report, image readback | 1 to 2 agent-days |
 | C. Validation | capture the parked Nexus on the current build; 100 loops; compare ms per loop with the 106 ms render-thread frame from `real3-self.csv`; A/B `--gpu-descriptors`; image diff | half a day |
 

@@ -101,6 +101,19 @@ public:
 		    vaddr, size, [](uint64_t, uint64_t) noexcept {}, std::forward<Func>(func));
 	}
 
+	// Every CPU-modified range in [vaddr, vaddr + size), without clearing the dirty state or
+	// touching page protection. The frame capture records the set; the game path never reads it.
+	template <typename Func>
+	void ForEachCpuModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->template ForEachModifiedRange<DirtySource::Cpu, false>(
+			    manager->GetCpuAddr() + offset, bytes, func);
+		});
+	}
+
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {

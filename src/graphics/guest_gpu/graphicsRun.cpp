@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/replay/frameCapture.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
@@ -24,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -169,6 +171,11 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	submission.constant_commands = constant_commands;
 	submission.reset_processor   = m_graphics_done;
 	m_graphics_done              = false;
+	if (Replay::RecordingFrame(m_done_num.load())) {
+		submission.capture_id =
+		    Replay::RecordEnqueue(Replay::SubmissionKind::Graphics, 0, draw_commands,
+		                          constant_commands, 0);
+	}
 	Enqueue(std::move(submission));
 }
 
@@ -183,6 +190,10 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
+	if (Replay::RecordingFrame(m_done_num.load())) {
+		submission.capture_id =
+		    Replay::RecordEnqueue(Replay::SubmissionKind::Compute, queue, commands, {}, 0);
+	}
 	Enqueue(std::move(submission));
 }
 
@@ -194,6 +205,10 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 	submission.reset_processor = m_graphics_done;
 	submission.flip_request_id = request_id;
 	m_graphics_done            = false;
+	if (Replay::RecordingFrame(m_done_num.load())) {
+		submission.capture_id = Replay::RecordEnqueue(Replay::SubmissionKind::FlipPreparation, 0, {},
+		                                              {}, request_id);
+	}
 	Enqueue(std::move(submission));
 }
 
@@ -202,8 +217,49 @@ void GuestGpu::Done() {
 	if (!IsGpuThread()) {
 		WaitForIdle();
 	}
+	if (Replay::Armed()) {
+		const auto frame_num = m_done_num.load();
+		if (Replay::RecordingFrame(frame_num)) {
+			Replay::RecordDone();
+		}
+		if (Replay::ShouldCapture(frame_num)) {
+			CaptureFrame(frame_num);
+		} else {
+			Replay::ResetFrame();
+		}
+	}
 	m_graphics_done = true;
 	m_done_num++;
+}
+
+// Runs the one-frame capture on the GPU thread with the queues already drained; the caller holds
+// the submission mutex, so nothing can enqueue behind it (docs/frame-replay.md).
+void GuestGpu::CaptureFrame(int frame_num) {
+	SendCommandSync([this, frame_num] {
+		// Drain this thread's own command buffer and wait for the Vulkan device.
+		m_gfx_cp->BufferWait();
+
+		std::vector<Replay::ProcessorRegisters> processors;
+		processors.push_back({0, &m_gfx_cp->GetCtx(), &m_gfx_cp->GetUcfg(), &m_gfx_cp->GetShCtx()});
+		for (uint32_t i = 0; i < ComputeQueueCount; i++) {
+			auto& processor = m_compute_cp[i];
+			if (processor == nullptr) {
+				continue;
+			}
+			processors.push_back({1 + i, &processor->GetCtx(), &processor->GetUcfg(),
+			                      &processor->GetShCtx()});
+		}
+
+		const bool ok = Replay::WriteCapture(m_renderer, frame_num, processors);
+		Replay::ResetFrame();
+		if (Replay::ExitAfterCapture()) {
+			std::puts("FrameCapture: exiting after the capture");
+			std::fflush(stdout);
+			// Every capture file is closed and flushed by now. Terminate without running static
+			// destructors: other guest threads are still live and a normal exit can hang.
+			std::_Exit(ok ? 0 : 1);
+		}
+	});
 }
 
 int GuestGpu::GetFrameNum() const {
@@ -573,6 +629,9 @@ bool GuestGpu::Process(Submission& submission) {
 
 	if (first_slice) {
 		submission.started = true;
+		if (submission.capture_id != 0) {
+			Replay::RecordStarted(submission.capture_id);
+		}
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});

@@ -105,6 +105,11 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	// The descriptor is evaluated in-shader from its SRT root (docs/gpu-descriptor-fetch.md,
+	// stage 1). The host binds nothing for it; the shader reads the V# through the flat program
+	// and the data through the BDA page table, and checks the baked stride/format/swizzle against
+	// the runtime V#, reporting a mismatch through the DescriptorFeedback binding.
+	bool                   gpu_fetch          = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -269,11 +274,15 @@ enum class DescriptorBindingKind : uint32_t {
 	FaultBuffer,
 	FlattenedSrt,
 	ShaderData,
+	// Storage buffer of u32 bits, one bit per program feedback slot. A shader with gpu_fetch
+	// resources sets its slot's bit when a runtime V# disagrees with the specialization it was
+	// compiled against. The host reads it back with the fault buffer.
+	DescriptorFeedback,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -393,14 +402,23 @@ struct DescriptorBinding {
 };
 
 struct BindingLayout {
+	static constexpr uint32_t NoFeedbackSlot = UINT32_MAX;
+
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	// Shader-data dword holding the program's DescriptorFeedback slot id, NoFeedbackSlot when the
+	// stage has no gpu_fetch resources. Packed by the host next to the user-data registers.
+	uint32_t                       feedback_slot_dword = NoFeedbackSlot;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+		const uint32_t base = memory_offset_dword + (memory_offset_count + 3u) / 4u;
+		if (feedback_slot_dword == NoFeedbackSlot) {
+			return base;
+		}
+		return base < feedback_slot_dword + 1u ? feedback_slot_dword + 1u : base;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -431,6 +449,9 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// Any buffer resource has gpu_fetch. Implies the BdaPagetable, FaultBuffer and
+	// DescriptorFeedback bindings, the physical addressing model and a PrepareBda before use.
+	bool                             gpu_descriptors    = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

@@ -89,6 +89,35 @@ Expected win: `MaterializeResources` buffer share, `RebindBuffers` (7%), the buf
 and the GPU-drain readbacks of GPU-written SRT data that the CPU can no longer avoid reading
 (indirect dispatch arguments stay). Sized by the stats dump.
 
+### Stage 1 interface (landed, `--gpu-descriptors`, default off)
+
+The pieces the recompiler and the renderer share, so the two sides can be built in parallel:
+
+- `BufferResource::gpu_fetch`: set by the resource-plan side for a buffer resource whose
+  descriptor source has a valid flat root with no clean-context read, no user-data register
+  outside the binding layout, and whose resource is read-only (not `written`, not `atomic`) in
+  stage 1. The emitter evaluates the root in the shader prologue and routes the resource's loads
+  through `LoadBdaDword`. The renderer binds nothing for it and skips its root on the CPU.
+- `ShaderInfo::gpu_descriptors`: true when any buffer has `gpu_fetch`. The binding layout then
+  carries `BdaPagetable`, `FaultBuffer` and `DescriptorFeedback`, the module uses the physical
+  addressing model, and the renderer calls `PrepareBda` before every draw or dispatch of the
+  program, exactly as for `uses_dma`.
+- `DescriptorBindingKind::DescriptorFeedback`: a storage buffer of u32 bits, one bit per program
+  feedback slot. The shader compares the runtime V# fields it speculated on (`packed_stride`,
+  `descriptor_format`, `descriptor_swizzle`) against the baked constants and sets its slot bit on
+  any mismatch. The renderer owns the buffer, allocates slot ids per program-cache entry, and
+  reads the bits back on the fault-buffer schedule.
+- `BindingLayout::feedback_slot_dword`: the shader-data dword (push constants or the `ShaderData`
+  overflow buffer, same as user-data registers) where the renderer packs the program's slot id.
+  `NoFeedbackSlot` when the stage has no `gpu_fetch` resource. `ShaderDataDwords()` covers it.
+- Renderer policy on a feedback bit: the next draw of that program materializes on the CPU path,
+  which yields the new tuple and selects or compiles the matching variant; the shader then
+  resumes GPU fetch. More than eight mismatches for one program in a session pins it to the CPU
+  path. First encounter of a program always goes through the CPU path, since the tuple is needed
+  to compile.
+- Setting: `--gpu-descriptors <t|f>` (`Config::gpu_descriptors_enabled`,
+  `GpuDescriptorsEnabled()`). Off: no resource gets `gpu_fetch`, nothing else changes.
+
 ### Stage 2: vertex fetch in-shader
 
 The vertex shader reads vertex data through BDA using the V#s from its own roots, fetch-shader

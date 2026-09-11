@@ -79,6 +79,10 @@ bool ShaderStorageImageBoundsCheckEnabled() {
 	return g_config->shader_storage_image_bounds_check_enabled;
 }
 
+bool GpuDescriptorsEnabled() {
+	return g_config->gpu_descriptors_enabled;
+}
+
 ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }

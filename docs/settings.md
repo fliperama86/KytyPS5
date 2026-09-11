@@ -9,11 +9,21 @@ window, user, and path options omitted here.
 
 | Flag | Default | What it does | Exists for |
 | --- | --- | --- | --- |
-| `--shader-lds-waitcnt-barrier <true\|| `--shader-storage-bounds-check <true\||| `--graphics-debug-dump <true\|| `--thread-affinity <auto\|none>` | `auto` | `auto` enumerates the host L3 caches at startup and, when there are at least two of unequal size in one processor group, pins the render and presentation threads to the largest cache's logical processors and every guest thread to the rest, logging one line with the sizes and the derived masks. A uniform host, a single L3 cache, more than one processor group and every non-Windows platform derive nothing. `none` derives nothing anywhere. | Multi-CCD hosts with asymmetric L3, such as the Ryzen 9 9950X3D; see the CCD affinity section in [demons-souls-performance.md](demons-souls-performance.md). |
+| `--shader-lds-waitcnt-barrier <true\|false>` | `false` | Emits a subgroup-scope `OpControlBarrier` for every `S_WAITCNT` in a compute shader that uses LDS. | Demon's Souls, whose waves exchange LDS data after `S_WAITCNT` without an `S_BARRIER`. It costs frame rate and is not needed by other titles. |
+| `--shader-storage-bounds-check <true\|false>` | `true` | Wraps each storage-image write in an `OpImageQuerySize` compare and branch; `false` emits the plain `OpImageWrite`. | The Demon's Souls GPU-crash investigation (out-of-bounds `IMAGE_STORE` losing the device). On by default because an unbounded write can take the device down on any game. |
+| `--graphics-debug-dump <true\|false>` | `false` | Names Vulkan objects, dumps pipelines and shaders, and enables `VK_EXT_device_fault` plus NV diagnostic checkpoints. | Device-loss and GPU-fault investigations. |
+| `--thread-affinity <auto\|none>` | `auto` | `auto` enumerates the host L3 caches at startup and, when there are at least two of unequal size in one processor group, pins the render and presentation threads to the largest cache's logical processors and every guest thread to the rest, logging one line with the sizes and the derived masks. A uniform host, a single L3 cache, more than one processor group and every non-Windows platform derive nothing. `none` derives nothing anywhere. | Multi-CCD hosts with asymmetric L3, such as the Ryzen 9 9950X3D; see the CCD affinity section in [demons-souls-performance.md](demons-souls-performance.md). |
+| `--gpu-descriptors <true\|false>` | `false` | Shaders evaluate eligible buffer descriptors in-shader through the BDA page table instead of the render thread materializing them; see [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), stage 1. Experimental. | Demon's Souls per-draw cost; measure with the parked Nexus protocol. |
 | `--profiler-direction <None\|Network>` | `None` | Starts the Tracy profiler server. `Play Demon's Souls.cmd profile` passes it. | Frame-rate and render-thread zone work. |
-| `--vulkan-validation <true\|| `--gpu-assisted-validation <true\|| `--spirv-debug-printf <true\|| `--shader-validation <true\|| `--shader-optimization-type <None\|Size\|Performance>` | `None` | SPIR-V optimizer pass level. | Shader experiments. |
+| `--vulkan-validation <true\|false>` | `false` | Vulkan validation layers. | General debugging. |
+| `--gpu-assisted-validation <true\|false>` | `false` | GPU-assisted validation; implies `--vulkan-validation`. Very slow. | Finding out-of-bounds shader accesses. |
+| `--spirv-debug-printf <true\|false>` | `false` | Routes `debugPrintfEXT` from generated SPIR-V to the console. | Shader recompiler debugging. |
+| `--shader-validation <true\|false>` | `false` | Runs the SPIR-V validator on every generated module. | Shader recompiler debugging. |
+| `--shader-optimization-type <None\|Size\|Performance>` | `None` | SPIR-V optimizer pass level. | Shader experiments. |
 | `--shader-log-direction <Silent\|Console\|File>` | `Silent` | Dumps decoded RDNA2, IR, and SPIR-V (folder from `--shader-log-folder`). | Shader recompiler debugging. |
-| `--command-buffer-dump <true\|| `--readback-linear-images <true\|| `--playgo-hack` | off | Uses the bundled PlayGo stub fallback when the title's chunks do not load. | Games that stall in PlayGo. |
+| `--command-buffer-dump <true\|false>` | `false` | Writes guest command buffers (folder from `--command-buffer-dump-folder`). | GPU command-stream investigations. |
+| `--readback-linear-images <true\|false>` | `false` | Reads writable linear images back to guest memory on submit. | Titles that read GPU-written linear images on the CPU. |
+| `--playgo-hack` | off | Uses the bundled PlayGo stub fallback when the title's chunks do not load. | Games that stall in PlayGo. |
 | `--redzone` (Windows) | off | Protects the guest SysV red zone across host callbacks. | Guest-fault investigations. |
 | `--rd` | off | Loads the RenderDoc capture layer. | Frame captures. |
 

@@ -64,6 +64,9 @@ static void PrintUsage() {
 	         "                                       in an LDS compute shader. Default: false.\n");
 	::printf("  --shader-storage-bounds-check <t|f>  Bounds-check storage image writes in the\n"
 	         "                                       generated SPIR-V. Default: true.\n");
+	::printf("  --gpu-descriptors <t|f>              Evaluate eligible buffer descriptors in the\n"
+	         "                                       shader instead of on the render thread.\n"
+	         "                                       Experimental. Default: false.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -289,6 +292,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--shader-storage-bounds-check") {
 			if (!ParseBool(value, options.config.shader_storage_image_bounds_check_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-descriptors") {
+			if (!ParseBool(value, options.config.gpu_descriptors_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

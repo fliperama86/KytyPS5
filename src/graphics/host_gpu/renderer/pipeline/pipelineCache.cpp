@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/srtStats.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -204,6 +205,80 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// KYTY_DEBUG_SRT_STATS support. Nothing below runs unless the collector is on.
+constexpr uint64_t StatsMix(uint64_t seed, uint64_t value) {
+	return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6u) + (seed >> 2u));
+}
+
+// Identity of the specialized buffer layout: the tuple, over every buffer resource, of the
+// packed stride, descriptor format and descriptor swizzle a GPU-side fetch would have to predict.
+uint64_t StatsBufferLayoutKey(const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	uint64_t key = StatsMix(0xcbf29ce484222325ull, specialization.buffers.size());
+	for (const auto& buffer: specialization.buffers) {
+		key = StatsMix(key, buffer.packed_stride);
+		key = StatsMix(key, static_cast<uint64_t>(buffer.descriptor_format));
+		key = StatsMix(key, buffer.descriptor_swizzle);
+	}
+	return key;
+}
+
+// Identity of the decoded vertex-fetch layout, matching the per-resource words that
+// BuildStageStaticKey puts into the program cache key.
+uint64_t StatsVertexLayoutKey(const ShaderVertexInputInfo& info) {
+	uint64_t key = StatsMix(0xcbf29ce484222325ull, static_cast<uint64_t>(info.resources_num));
+	for (int i = 0; i < info.resources_num; i++) {
+		const auto& resource    = info.resources[i];
+		const auto& destination = info.resources_dst[i];
+		for (const uint32_t word:
+		     {static_cast<uint32_t>(destination.register_start),
+		      static_cast<uint32_t>(destination.registers_num),
+		      static_cast<uint32_t>(destination.fetch_index),
+		      static_cast<uint32_t>(destination.attr_id), static_cast<uint32_t>(resource.Stride()),
+		      static_cast<uint32_t>(resource.SwizzleEnabled()),
+		      static_cast<uint32_t>(resource.DstSelXYZW()),
+		      static_cast<uint32_t>(resource.RawFormat()),
+		      static_cast<uint32_t>(resource.OutOfBounds()),
+		      static_cast<uint32_t>(resource.AddTid())}) {
+			key = StatsMix(key, word);
+		}
+	}
+	return key;
+}
+
+SrtStats::StageEvent StatsStageEvent(const char*                                         stage_name,
+                                     const ShaderRecompiler::IR::ResourcePlan&           plan,
+                                     const ShaderRecompiler::IR::BindingLayout&          bindings,
+                                     const ShaderRecompiler::IR::ResourceSpecialization& spec) {
+	SrtStats::StageEvent event;
+	event.stage_name            = stage_name;
+	event.shader_hash           = plan.shader_hash;
+	event.descriptor_sources    = static_cast<uint32_t>(plan.descriptor_sources.size());
+	event.buffer_sources        = static_cast<uint32_t>(plan.info.buffers.size());
+	event.scalar_buffer_sources = static_cast<uint32_t>(std::ranges::count_if(
+	    plan.info.buffers, [](const ShaderRecompiler::IR::BufferResource& b) { return b.scalar; }));
+	event.image_sources         = static_cast<uint32_t>(plan.info.images.size());
+	event.sampler_sources       = static_cast<uint32_t>(plan.info.samplers.size());
+	for (const auto& image: plan.info.images) {
+		if (image.source < plan.descriptor_sources.size() &&
+		    plan.descriptor_sources[image.source].indirect_image.has_value()) {
+			event.indirect_image_sources++;
+		}
+	}
+	event.flat_insts = static_cast<uint32_t>(plan.flat.insts.size());
+	for (const auto& inst: plan.flat.insts) {
+		if (inst.op == ShaderRecompiler::IR::SrtFlatOp::ReadAddress ||
+		    inst.op == ShaderRecompiler::IR::SrtFlatOp::ReadBuffer) {
+			event.flat_reads++;
+		}
+	}
+	event.buffer_layout_key = StatsBufferLayoutKey(spec);
+	event.uses_dma          = plan.info.uses_dma;
+	// A stage whose user data did not fit the 32-dword push block reaches its offsets through a
+	// ShaderData descriptor instead.
+	event.push_overflow = bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
+	return event;
+}
+
 } // namespace
 
 struct PipelineCache::ProgramCache {
@@ -298,6 +373,22 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// KYTY_DEBUG_SRT_STATS: one (draw, stage) event, with the vertex-fetch layout attached for the
+	// stages that have one.
+	template <typename InputInfo>
+	static void
+	RecordStageStats(const char* stage_name, const InputInfo& input_info,
+	                 const ShaderRecompiler::IR::ResourcePlan&           plan,
+	                 const ShaderRecompiler::IR::BindingLayout&          bindings,
+	                 const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		auto event = StatsStageEvent(stage_name, plan, bindings, specialization);
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			event.vertex_layout_key = StatsVertexLayoutKey(input_info);
+			event.has_vertex_layout = true;
+		}
+		SrtStats::RecordStage(event);
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -310,12 +401,25 @@ struct PipelineCache::ProgramCache {
 			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
 			stage = ShaderType::Compute;
 		}
-		const char* label = nullptr;
+		const char* label      = nullptr;
+		const char* stage_name = nullptr;
 		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
+			case ShaderType::Vertex:
+				label      = "ShaderRecompiler VS";
+				stage_name = "vs";
+				break;
+			case ShaderType::Mesh:
+				label      = "ShaderRecompiler MS";
+				stage_name = "ms";
+				break;
+			case ShaderType::Pixel:
+				label      = "ShaderRecompiler PS";
+				stage_name = "ps";
+				break;
+			case ShaderType::Compute:
+				label      = "ShaderRecompiler CS";
+				stage_name = "cs";
+				break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
 
@@ -359,6 +463,10 @@ struct PipelineCache::ProgramCache {
 				    });
 			}();
 			if (permutation != entry->second.permutations.end()) {
+				if (SrtStats::Enabled()) {
+					RecordStageStats(stage_name, input_info, entry->second.resource_plan,
+					                 permutation->program.bindings, permutation->specialization);
+				}
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = std::move(resources)};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -405,6 +513,10 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
+		if (SrtStats::Enabled()) {
+			RecordStageStats(stage_name, input_info, entry->second.resource_plan,
+			                 permutation.program.bindings, permutation.specialization);
+		}
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 

@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/srtStats.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
@@ -69,10 +70,17 @@ void Initialize() {
 
 void Shutdown() {
 	EXIT_IF(g_renderer == nullptr);
+	SrtStats::WriteAtExit();
 	g_renderer->ShutdownGpu();
 	VideoOut::VideoOutShutdown();
 	WindowShutdown();
 	g_renderer = nullptr;
+}
+
+// Runs on every exit path, including std::quick_exit from the window thread and the _Exit a fatal
+// EXIT() takes, so an opt-in diagnostic dump survives an abrupt end.
+void EmergencyShutdown() {
+	SrtStats::WriteAtExit();
 }
 
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer) {

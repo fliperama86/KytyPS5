@@ -71,6 +71,101 @@ The final `srt-pmr-steady.tracy` capture is **excluded from the stationary compa
 
 The combined runtime binary SHA-256 is `8a7c7dd79b01b8d22ff8952d61e6e6d821d054b4ecaebd7a9bbb9c384bae0881`, with source snapshot `srt-pmr-source.patch`. Launch it using `Play Demon's Souls - performance.cmd` in the existing runtime directory. The prior working `kyty_emulator.exe` is preserved.
 
+## Render-thread per-draw work ? September 10, 2026
+
+The parked Nexus scene issues about 9,300 draws and 1,900 dispatches per frame, and `Thread_Gpu`
+is the bottleneck. Four changes were tried against the `7e37a84` baseline, each measured with the
+procedure in [Reaching the Nexus](reaching-the-nexus.md): 30-second clean windows in the same
+parked scene, plus a 20-second Tracy capture taken afterwards with the measurement already
+finished. Scene noise is roughly +/-4% per window, so read the trend and the zone self times, not
+any single window.
+
+| Build | FPS | CPU core equivalents | Mean GPU |
+| --- | ---: | ---: | ---: |
+| `7e37a84` baseline | 10.000 | 12.665 | 24.3% |
+| `0183bc8` incremental BDA ranges | 10.122 | 12.648 | 25.7% |
+| `bc74f63` context dirty mask, pipeline and dynamic-state memo | 10.398 | 12.573 | 26.0% |
+| `61d5917` per-stage allocation pooling | 10.703 | 12.535 | 27.2% |
+| rebind memo (not kept) | 10.729 | 12.557 | 27.2% |
+
+Zone self times divide by the 20.1-second capture window; every zone below runs on the render
+thread, so the share is that thread's share.
+
+### Incremental BDA synchronization
+
+`GpuResourceManager::PrepareBda` early-outs on a buffer generation and a mapped-range generation.
+When either moved it rescanned every mapped range, walking every registered buffer's whole extent
+through the memory tracker. The buffer cache now records the guest pages each invalidation touches
+in a `RangeSet` beside the generation; preparation takes that set, intersects it with the mapped
+ranges and synchronizes only those intervals. Every place that advanced the generation already had
+a range in hand: buffer registration, `InvalidateMemory`, CPU-dirty readback, mapping and
+unmapping. Buffer retirement still advances the generation without recording a range, because a
+deleted buffer has nothing to upload and a later lookup registers and dirties its replacement.
+The recorded range is widened to whole tracker pages, since the tracker marks dirty pages, not
+bytes.
+
+In the capture after the change a scan cost 146 microseconds on average against 0.70 milliseconds
+before. The scan count varies strongly with the scene (2,078 to 6,370 scans across three
+20-second captures of the same parked view), so the total is not a stable comparison; the
+per-scan cost is.
+
+### Context dirty mask, pipeline lookup and dynamic state
+
+`HW::Context` now carries one bit per top-level register block that the draw path re-reads every
+draw, set by the setters themselves rather than by a register-offset table. Doing it in the
+setters covers every writer, including register loads and context save/restore, without having to
+map the whole context register space; a restored context is marked entirely dirty. The draw path
+clears the bits it consumed.
+
+Two consumers use it. `SetGraphicsDynamicParams` re-recorded fifteen Vulkan dynamic-state commands
+per draw; it now compares the register bits plus a small memo of what it reads that is not a
+register (the attachment identity, the derived depth and stencil state, the vertex program) and
+returns early when nothing moved: 195 nanoseconds per draw down to 36, 0.359 s to 0.062 s.
+`PipelineCache::CreateGraphicsPipeline` hashed the 166-byte static-parameter block one byte at a
+time on every draw; it now compares the freshly built key against the last one and returns the
+remembered pipeline on a match: 238 nanoseconds down to 99, 0.438 s to 0.197 s. The bound pipeline
+is only re-bound when it actually changes.
+
+Both memos are keyed on a command-buffer epoch, because the bound pipeline and the dynamic state
+die with the command buffer. `CommandBuffer::Begin`, rebinding a different register set, and the
+blit helper (which records its own graphics pipeline, viewport and scissor) all advance it.
+
+### Per-stage allocations
+
+Every stage of every draw copied its user-SGPR registers into a fresh vector and built the
+resource specialization into two more. The shader parameters now carry a span over the guest
+registers; only the NGG vertex path rewrites them, and it uses scratch that survives the call. The
+specialization is handed to its destination by swap, so the destination's previous allocation
+comes back for the next draw. `PrepareProgram` fell from 94 to 70 nanoseconds for vertex, 518 to
+385 for compute, and `BuildResourceSpecialization` from 59 to 56.
+
+The resource snapshot was left alone. It is moved into the per-draw stage runtime and outlives its
+producer, so pooling it means changing who owns it, not adding a pool.
+
+### Rebind memo, rejected
+
+`RenderExecutor::RebindBuffers` is the largest remaining instrumented zone at 1.36 s of 20.1 s
+(6.8%) over 4.3 million calls. An attempt to skip the buffer-cache walk for a slot whose guest
+range, host buffer and resource flags were unchanged, gated on an unchanged buffer-cache
+generation, moved the zone from 318 to 301 nanoseconds per call and the frame rate by less than
+the scene's noise. It was reverted.
+
+The reason is the gate, not the memo. After the incremental-BDA change the buffer-cache generation
+advances on every transition that marks a tracked page CPU-modified, which is what the memo needs
+it to do, but it is a single global counter and the guest faults on tracked pages continuously.
+Between two consecutive draws it has almost always moved, so the memo almost never hits. Skipping
+this work needs a per-buffer or per-page write generation, which is a larger change. Written,
+formatted and small-buffer streamed slots must be excluded in any case: they copy or take
+ownership on every call, and an image-backed texel buffer can change without the buffer cache
+knowing.
+
+### What is left
+
+`EvaluateRuntimeSourcesImpl` dominates the render thread: 5.88 s of the 20.1-second capture (29%)
+over 4.3 million calls, about 1.37 microseconds per stage per draw. It is seven times the size of
+anything else measured here and is the obvious next target.
+
+
 ## Reproducing a capture
 
 Build the vendored tools in a Visual Studio developer shell (matching Tracy versions is required):

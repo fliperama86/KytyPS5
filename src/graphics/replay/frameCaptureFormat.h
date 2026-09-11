@@ -1,0 +1,104 @@
+#pragma once
+
+// Frame capture format shared by the capture side (src/graphics/replay/frameCapture.cpp) and the
+// replay side (src/graphics/replay/frameReplay.cpp). See docs/frame-replay.md.
+//
+// A capture is a directory:
+//
+//   manifest.json     format_version, title_id, commit, frame, width, height, counts, gaps
+//   ranges.bin        RangeRecord[]            every mapped guest range at capture time
+//   memory.bin        PageRecord[]             every non-zero 16 KiB page of committed ranges
+//   dirty-pages.bin   uint64_t[]               pages the CPU modified during the captured frame
+//   submissions.bin   SubmissionRecord stream  the captured frame, in processing-start order
+//   registers.bin     RegisterFileRecord stream  command-processor register files at frame start
+//   videoout.bin      VideoOutRecord stream    buffer registrations, one per attribute group
+//   frame.png         the presented frame (may be absent; then frame.raw + manifest width/height)
+//
+// All integers little-endian, all records packed, no padding. Streams are read until end of file.
+
+#include <cstddef>
+#include <cstdint>
+
+namespace Libs::Graphics::Replay {
+
+constexpr uint32_t kFormatVersion = 1;
+constexpr uint64_t kPageSize      = 16384;
+
+#pragma pack(push, 1)
+
+// One mapped guest range as tracked by the kernel memory layer. `type` is the kernel's
+// VirtualRangeType value; `prot` the guest protection bits. Replay maps committed ranges at the
+// same address with the same protection and restores their pages; reserved ranges are reserved.
+struct RangeRecord {
+	uint64_t vaddr = 0;
+	uint64_t size  = 0;
+	uint32_t prot  = 0;
+	uint32_t type  = 0;
+	char     name[32] {};
+};
+static_assert(sizeof(RangeRecord) == 56);
+
+// One 16 KiB page of guest memory. Zero pages are not written.
+struct PageRecord {
+	uint64_t vaddr = 0;
+	uint8_t  data[kPageSize] {};
+};
+static_assert(sizeof(PageRecord) == 8 + kPageSize);
+
+enum class SubmissionKind : uint32_t {
+	Graphics        = 0, // command_dwords then constant_dwords follow the header
+	Compute         = 1, // command_dwords follow the header; queue_id is the guest queue id
+	FlipPreparation = 2, // no dwords; flip_request_id is set
+	Done            = 3, // no dwords; marks GuestGpu::Done()
+};
+
+// One submission of the captured frame. The header is followed by `command_dwords` uint32_t and
+// then `constant_dwords` uint32_t. Records appear in the order the GPU thread started processing
+// them, so replaying them in file order on one thread satisfies every WAIT_REG_MEM as the
+// original run did.
+struct SubmissionRecord {
+	uint32_t kind            = 0; // SubmissionKind
+	uint32_t queue_id        = 0; // GuestGpu queue id as passed to SubmitCompute; 0 for graphics
+	uint64_t flip_request_id = 0;
+	uint32_t command_dwords  = 0;
+	uint32_t constant_dwords = 0;
+};
+static_assert(sizeof(SubmissionRecord) == 24);
+
+// One command processor's register file, raw bytes of the emulator's register structs. `size`
+// bytes follow the header. queue_id 0 is the graphics processor, 1.. the compute processors, in
+// GuestGpu::GetProcessor order.
+struct RegisterFileRecord {
+	uint32_t queue_id = 0;
+	uint32_t size     = 0;
+};
+static_assert(sizeof(RegisterFileRecord) == 8);
+
+// One video-out buffer registration (VideoOutRegisterBuffers2 call). `attribute_size` raw bytes of
+// VideoOutBufferAttribute2 follow the header, then `count` pairs of uint64_t
+// {data_address, metadata_address}.
+struct VideoOutRecord {
+	int32_t  handle         = 0;
+	int32_t  set_index      = 0;
+	int32_t  index_start    = 0;
+	int32_t  count          = 0;
+	int32_t  category       = 0;
+	uint32_t attribute_size = 0;
+};
+static_assert(sizeof(VideoOutRecord) == 24);
+
+#pragma pack(pop)
+
+// manifest.json keys, all at the top level, written by the capture side. The replay side needs
+// only format_version and frame; everything else is for people and scripts.
+//
+//   "format_version": 1
+//   "title_id": "PPSA01342"
+//   "commit": "<git hash of the capturing build>"
+//   "frame": <GuestGpu frame number of the captured frame>
+//   "width": <presented width>, "height": <presented height>
+//   "ranges": <count>, "pages": <count>, "dirty_pages": <count>, "submissions": <count>
+//   "gaps": [ {"vaddr": <hex string>, "size": <hex string>, "reason": "<text>"}, ... ]
+//           ranges the capture could not read back from the GPU (image-owned or unsupported)
+
+} // namespace Libs::Graphics::Replay

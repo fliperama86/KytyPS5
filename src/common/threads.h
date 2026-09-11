@@ -10,6 +10,11 @@ namespace Common {
 
 void InitializeThreads();
 
+// Pins the calling thread to the host CPU set named by a hexadecimal mask in the environment
+// variable, and logs one line when it does. The variable is read once per process; an unset,
+// empty or unparseable value leaves the thread alone. Windows only, a no-op elsewhere.
+void ApplyThreadAffinityFromEnv(const char* variable, const char* thread_label);
+
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 

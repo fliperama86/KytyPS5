@@ -209,6 +209,51 @@ shader and user-data pointer and invalidate it from the page writes that can cha
 to make the individual read cheaper. `RenderExecutor::RebindBuffers` remains the second-largest
 zone at 1.38 s over 4.3 million calls; the note above on why its memo was rejected still applies.
 
+### CCD affinity
+
+If the render thread is memory-latency bound, where Windows puts it matters. This host is a Ryzen 9
+9950X3D: two eight-core CCDs, and `GetLogicalProcessorInformationEx` reports **96 MB of L3 behind
+logical CPUs 0-15 and 32 MB behind 16-31**, so the 3D V-cache die is the low half. Twelve guest
+worker threads spin at 100% each and, left alone, the scheduler spreads everything over both dies.
+
+`KYTY_GPU_THREAD_AFFINITY`, `KYTY_PRESENT_THREAD_AFFINITY` and `KYTY_GUEST_THREAD_AFFINITY`
+(see [settings.md](settings.md)) pin those threads to a hexadecimal mask at startup. Five 30-second
+clean windows in the parked Nexus, same binary, same session (Remote Desktop):
+
+| Run | GPU + present | Guest threads | FPS | CPU cores | GPU % |
+| --- | --- | --- | --- | --- | --- |
+| `none` | unset | unset | 10.938 | 12.57 | 28.1 |
+| `gpu-lo` | `0xFFFF` (V-cache) | `0xFFFF0000` | **11.532** | 12.59 | 28.2 |
+| `gpu-lo` repeat | `0xFFFF` (V-cache) | `0xFFFF0000` | **11.387** | 12.57 | 28.1 |
+| `gpu-hi` | `0xFFFF0000` | `0xFFFF` | 10.611 | 12.51 | 25.3 |
+| `gpu-only-lo` | `0xFFFF` (V-cache) | unset | 10.982 | 12.63 | 27.5 |
+
+Splitting the render and presentation threads onto the V-cache die and the guest threads onto the
+other one is worth **4 to 5%**, twice the scene's run-to-run spread (10.70-10.98 across every
+unpinned sample of this build). The mirror image loses 3%, so the effect is the cache and not the
+split.
+
+Neither half of the arrangement pays on its own. `gpu-only-lo` pins the render thread to the 96 MB
+die and lands on the unpinned number, because the twelve spinning guest workers are still free to
+land there and evict its working set; `gpu-hi` separates the two groups just as cleanly as `gpu-lo`
+and is the worst run of the five, because the thread that needs the cache is not on it. Both
+conditions are needed: the render thread on the large L3, and nothing else allowed onto it.
+
+Total CPU is flat at 12.5 to 12.6 core-equivalents everywhere, so this is not a throughput change;
+the frame rate moves because the render thread's scattered SRT reads hit in cache more often.
+`gpu-lo` also shifts about 0.3 core-equivalents from user to kernel time, which is the guest workers
+contending harder on sixteen cores instead of thirty-two, and costs nothing here because they spin.
+
+The variables stay off by default: the masks are specific to this CPU, and a fixed mask on a host
+with a different CCD layout, or with one CCD, would be a pessimization. On this machine set
+
+```powershell
+$env:KYTY_GPU_THREAD_AFFINITY = '0xFFFF'; $env:KYTY_PRESENT_THREAD_AFFINITY = '0xFFFF'
+$env:KYTY_GUEST_THREAD_AFFINITY = '0xFFFF0000'
+```
+
+before launching. Deriving the masks from the cache topology at runtime instead of hard-coding them
+is the obvious way to make this a default, and has not been done.
 
 ## Reproducing a capture
 

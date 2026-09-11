@@ -41,4 +41,7 @@ All are read once, on the code path named, and all are off when unset. The root
 | `KYTY_DEBUG_RESOURCE_TRACE` | unset | Set to a file path: records the last 128 compute dispatches with their bindings and writes them there on device loss. | GPU crash report. |
 | `KYTY_DEBUG_GPU_FAULT_FILE` | unset | Set to a file path: saves the vendor fault binary from `VK_EXT_device_fault`. Needs `--graphics-debug-dump true`. | GPU crash report. |
 | `KYTY_DEBUG_SERIALIZE_DISPATCH` | unset | Set to anything: flushes and waits after every compute dispatch. Very slow; isolates which dispatch faults. | GPU crash report. |
+| `KYTY_GPU_THREAD_AFFINITY` (Windows) | unset | Hexadecimal CPU mask pinned onto the render thread `Thread_Gpu` with `SetThreadAffinityMask`. Logs one line with the thread id and mask. | Scheduling experiments on multi-CCD hosts; see the CCD affinity section in [demons-souls-performance.md](demons-souls-performance.md). |
+| `KYTY_PRESENT_THREAD_AFFINITY` (Windows) | unset | The same, for the video-out presentation thread. | Same. |
+| `KYTY_GUEST_THREAD_AFFINITY` (Windows) | unset | The same, for the guest main thread and every thread the guest creates through `pthread_create`. | Same. |
 | `KYTY_BORDERLESS` (macOS) | unset | Set to anything: creates a borderless SDL window, avoiding macOS 26 title-bar exceptions under Rosetta. | Upstream macOS workaround. |

@@ -228,6 +228,8 @@ What stage 1 needs to pay off, both foreseeable from the stats dump:
    evaluation for a fetched program is images, samplers and conditions only.
 2. Make the per-draw dirty sync cheap: track dirtied pages as a small list instead of scanning
    dirty ranges against mapped ranges on every generation change.
+   Superseded by [bda-sync-design.md](bda-sync-design.md): the scan's inputs are already small;
+   the cost is the copy of freshly written guest memory on the render thread.
 
 Projected from the profile: 26% + 10% of the thread down to a few percent, about 16 FPS in this
 scene. Bring-up diagnostics (permutation log, CPU retry, fault ring, stub) are in the tree behind

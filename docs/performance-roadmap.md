@@ -196,6 +196,9 @@ Two pieces, both foreseeable from the stats dump:
   replay; what the game's scan makes is not recorded yet and is the measurement that would settle
   where the 26 µs goes. Removes most of the 10.7 ms.
 
+Design for the sync half, with the hypothesis for the 26 us and the validation plan:
+[bda-sync-design.md](bda-sync-design.md) (September 12).
+
 Expected: about 16 FPS in this scene (projection in the design document).
 
 ### 3. Stages 2 and 3: vertex fetch in-shader, bindless images and samplers

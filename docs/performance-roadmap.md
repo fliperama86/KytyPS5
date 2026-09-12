@@ -176,15 +176,32 @@ Not measured: Vulkan validation. `VK_LAYER_KHRONOS_validation` is not installed 
 
 ### 2. Finish stage 1 of GPU-side descriptor fetch
 
-Status: stage 1 landed behind `--gpu-descriptors` (default off), measured slower, causes known.
-[gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Stage 1 measured" and its re-baseline of
-September 11 (11.63 FPS off against 9.67 on, ratio 1.202).
+Status, September 12, 2026: **both halves are written and measured, and neither pays in replay.**
+Stage 1 landed behind `--gpu-descriptors` (default off), measured slower, causes known
+([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Stage 1 measured" and its re-baseline of
+September 11: 11.63 FPS off against 9.67 on, ratio 1.202). Stage 1b, the flat SRT reads in-shader,
+landed behind `--gpu-srt-reads` (default off) and is measured in the same document, "Stage 1b
+measured": 128 programs and 6,926 of 7,017 slots lowered, no feedback mismatch, no pinned program,
+the image unchanged, and **`EvaluateRuntimeSourcesImpl` down 0.8%**, not the 30%+ the projection
+below assumed. The sync half is design P behind `--bda-async-protect`, also default off and also
+unpriced by replay.
+
+**What the stage 1b measurement changed about this item.** The 28 ms of `SrtWalker.cpp` is not the
+SRT walk: `gd=false` evaluates every descriptor source and every flat slot at 1.44 us an event,
+`gd=true` skips 6.9 of the 8.5 descriptor dwords and costs 1.58, and adding the slot skip (17.8 of
+21.5 slots gone) leaves it at 1.57. `srt_evaluator_bench` prices the whole evaluation of a
+Nexus-shaped plan at 228 ns, of which the slot skip is worth 75. So the cost is the fixed per-call
+work, paid 20,739 times a loop, and the levers left are calling it less often (once a program a
+frame instead of once a stage a draw) or removing the last host consumer of the walk, which is
+stage 3.
 
 Two pieces, both foreseeable from the stats dump:
 
 - Move the flattened SRT scalar reads (`srt_reads`, the `flat_reads` roots) in-shader with the
-  same lowering as the descriptor roots. Then `EvaluateRuntimeSourcesImpl` no longer walks the
-  chain for fetched programs. Removes most of the 28 ms.
+  same lowering as the descriptor roots. **Done, and it removes none of the 28 ms** -- see the
+  status above and "Stage 1b measured". It removes 0.5 ms a loop of `RebindBuffers` and
+  `FindBuffers`, because a program with every slot lowered loses the `FlattenedSrt` binding and the
+  upload that fills it.
 - Make the per-draw dirty sync cheap: track dirtied pages as a list instead of scanning dirty
   ranges against mapped ranges on every generation change. Re-measured on the build of
   September 11: **399 scans a frame at 26.8 µs, 10.68 ms** (`PrepareBda` runs 9845 times a frame and
@@ -209,7 +226,10 @@ is about 5 ms of a 103 ms frame -- 10.3 ms of syscall latency moved off the rend
 of second uploads and boundary scans paid back. The replay cannot see the saving, only the price,
 so the end-to-end A/B is what settles it and it has not been run yet.
 
-Expected: about 16 FPS in this scene (projection in the design document).
+Expected: the design document's projection was about 16 FPS in this scene. It assumed the 26% of
+the render thread in `EvaluateRuntimeSourcesImpl` follows the descriptor and read roots out of the
+host; the measurement above says it does not, so what is left of this item is the sync half's
+projected 5 ms a frame, and the per-event cost itself belongs to item 3.
 
 ### 3. Stages 2 and 3: vertex fetch in-shader, bindless images and samplers
 

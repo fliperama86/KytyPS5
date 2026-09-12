@@ -161,6 +161,146 @@ Where each piece of the host half lives.
   `gpu_fetch_feedback_bits` and `gpu_fetch_programs_pinned` in the JSON summary, and one console
   line every 600 frames with the run totals and the window since the previous line.
 
+### Stage 1b: flat reads in-shader (landed, `--gpu-srt-reads`, default off)
+
+The second half of roadmap item 2. Stage 1 moved the buffer *descriptor* roots into the shader and
+left the flattened SRT scalar reads (`ResourcePlan::srt_reads`, the `flat_reads` roots) on the
+render thread, where `EvaluateRuntimeSourcesImpl` writes them into the `FlattenedSrt` storage
+buffer the shader reads with `ReadConst`. Stage 1b lowers those too, with the same machinery.
+
+**Marking.** `MarkGpuFetchBuffers` (ir/passes/GpuDescriptorFetch.cpp) now also fills
+`ShaderInfo::gpu_read_slots`, one byte per flat slot. A slot is marked when `--gpu-srt-reads` is on
+(which also needs `--gpu-descriptors`), the program has no side effects (the same rule stage 1
+applies: not `uses_dma`, no written or atomic buffer or image), the slot is not in
+`clean_flat_slots`, and `GpuFetchReadLowerable` accepts its `flat_reads[slot]` root by the same
+criteria as a descriptor root -- valid, no clean-context read, no `GetShaderBase`, every user-data
+register inside the binding layout, every result register produced by the schedule. A program with
+any marked slot gets `info.gpu_descriptors`, so it carries `BdaPagetable`, `FaultBuffer` and
+`DescriptorFeedback`, uses the physical addressing model and gets a `PrepareBda` before every draw,
+**even when no buffer was marked**: a program can now qualify on its reads alone.
+
+**Emitter.** `EmitGpuFetchDescriptors` (spirvEmitterGpuFetch.cpp) lowers each marked slot with
+`EmitSrtFlatRoot` in the function prologue, narrows the single result to u32, selects zero when the
+root is invalid -- exactly what an invalid descriptor root does, and the unmapped page it failed on
+has already set its fault bit -- and parks the id in `EmitterState::gpu_read_values[slot]`. The
+`ReadConst` case of spirvEmitterMemory.cpp takes that id when the slot has one and falls back to
+the `FlattenedSrt` load otherwise. `IR::UsesFlattenedRuntime` (BindingLayout.h) is now the single
+decision both `AllocateBindings` and the SPIR-V validator use: the binding exists only while some
+slot is still evaluated on the host or an image needs the indirect search table, so a program with
+every slot lowered and no indirect image loses the descriptor entirely and the renderer uploads
+nothing for it.
+
+**Renderer.** `EvaluateRuntimeSources` gains `skip_flat_slots` beside `skip_sources`; a skipped slot
+is left zero in `snapshot.flattened_srt` and the evaluator never runs its root.
+`GpuFetchOverride::flat_slots` carries the mask and `ProgramCache::Get` passes the override on
+**both** paths -- the GPU-fetch path and the CPU path -- because a module compiled with in-shader
+reads never loads those slots from the buffer, so the host never has to produce them whatever the
+draw does with its descriptors. `specialization` is null on the CPU path, which keeps `skip_sources`
+empty there, so the first-encounter and feedback behaviour of stage 1 is unchanged.
+
+**What stays on the CPU, and why.** Clean slots: a clean-context read goes through the host's
+specialization reader and has no shader equivalent. Slots of a program with side effects: the whole
+program stays on the CPU path, as in stage 1. Slots whose root reads `GetShaderBase` or a user-data
+register outside the layout. And the indirect-image search table, which is not a slot at all: it is
+appended to the same buffer past the slots (`indirect_mapping_offset`), so any program with
+`indirect_search_iterations` keeps the `FlattenedSrt` binding whatever its slots do. In the parked
+Nexus this leaves **91 slots of 7,017** on the host across the 128 programs that lower anything,
+1.3%.
+
+**Stats.** `KYTY_DEBUG_SRT_STATS` adds `flat_read_slots` and `gpu_read_slots` per shader in the
+JSON, `flat_read_slots_sum` / `gpu_read_slots_sum` in the summary, `gpu_read_programs`,
+`gpu_read_slots_shader` and `gpu_read_slots_cpu` in the summary and in the 600-frame console line.
+
+#### Stage 1b measured, September 12, 2026
+
+**It does not pay, and the reason is not the reads.** Replay bench, nexus-6, 40 loops, two repeats
+interleaved, `-Image`; reports in `_Runtime/_Diagnostics/replay/nexus-6/runs-1b/`:
+
+| per loop | `gd=false` | `gd=true` reads off | `gd=true` reads **on** |
+| --- | --- | --- | --- |
+| `ms/loop gpu`, min of the two runs | **73.06** | **76.90** | **77.52** |
+| `ms/loop gpu`, median | 74.83 / 75.09 | 81.62 / 80.74 | 80.21 / 80.59 |
+| drains / GPU-range syncs | 14 / 10 248 | 14 / 10 248 | 14 / 10 248 |
+| BDA scans of the recorded frame | 0.4 | 11.6 | 11.6 |
+| image vs `reference.png` | R 9.8 G 7.8 B 4.1 | R 9.8 G 7.8 B 4.1 | R 9.8 G 7.8 B 4.1 |
+
+The image is unchanged. The three raw dumps are not byte-identical, but neither are two runs of the
+same configuration: two 40-loop runs of `gd=true` with reads on differ in 0.248% of pixels with a
+maximum channel difference of 24, and reads on against reads off differ in 0.267% with the same
+mean, so the difference is the replay's own run-to-run noise floor, not a change in the picture.
+Loop 1's image is the same as loop 40's in every configuration (identical hashes), so nothing
+renders a frame late.
+
+**Tracy, per loop**, from the slope of the zone totals over four captures a configuration (two at 30
+loops, two at 60; `tracy-1b/`). One 30/60 pair has about +-6 ms of noise on this zone -- the same
+configuration differenced four ways spans 27.6 to 40.2 ms -- so the number below is the least-squares
+slope through all four points, whose intercepts agree to 0.1 ms:
+
+| zone, ms/loop (calls/loop) | `gd=false` | `gd=true` reads off | `gd=true` reads **on** |
+| --- | --- | --- | --- |
+| `EvaluateRuntimeSourcesImpl` | 29.82 (20 739) | 32.80 (20 739) | **32.53** (20 739) |
+| `RenderExecutor::RebindBuffers` | 2.88 (20 598) | 1.82 (20 639) | **1.46** (20 512) |
+| `RenderExecutor::FindBuffers` | 1.03 (20 248) | 0.60 (18 244) | **0.42** (19 800) |
+| `RenderExecutor::PrepareBindings` | 1.11 | 1.28 | 1.26 |
+| `RenderExecutor::CommitBindings` | 1.86 (11 148) | 2.52 | 2.27 |
+| `MaterializeSnapshot` | 1.61 | 1.66 | 1.57 |
+| `ProgramCache::MaterializeResources` | 0.51 (9 500) | 1.00 | 0.99 |
+| `GpuResourceManager::SynchronizeBdaBuffers` | 0.14 (16) | 0.32 (462) | 0.30 (465) |
+
+`EvaluateRuntimeSourcesImpl` falls by **0.8%**, against the 30% the hypothesis needed. What stage 1b
+does buy is the `FlattenedSrt` upload: `RebindBuffers` and `FindBuffers` together drop 0.54 ms a
+loop, which is the whole measured effect.
+
+**The stats run** (`KYTY_DEBUG_SRT_STATS=1`, three loops, 33 frames, 62,034 stage events;
+`_Diagnostics/srt-stats-20260912-033257.json`):
+
+| | |
+| --- | --- |
+| programs with reads lowered | **128** of 493 shaders |
+| slots lowered / kept on the host | **6,926 / 91** |
+| flat slots an event | 21.47, of which **17.77** lowered |
+| descriptor sources an event | 1.97 (1.72 buffer, 0.15 image, 0.09 sampler) |
+| descriptor dwords an event | 8.46 |
+| flat program instructions an event | 23.73, of which 21.52 memory reads |
+| `gpu_fetch_draws` / dispatches | 28,428 of 28,500 / 0 |
+| feedback bits / pinned programs | **0 / 0** |
+| `gpu_fetch_cpu_first` | 133 |
+
+So 83% of the slots the host used to evaluate are gone, with no feedback mismatch and no pinned
+program, and the zone that evaluates them does not move.
+
+**Why, measured.** `srt_evaluator_bench` prices the same skip synthetically (400,000 iterations a
+shape, `--iterations=400000`). `body_slots` are slots no descriptor source consumes; `body_skip` is
+the evaluator with those skipped, `all_skip` with every slot skipped:
+
+| shape | sources | slots | walker ns | flat ns | body_skip ns | all_skip ns |
+| --- | --- | --- | --- | --- | --- | --- |
+| `typical-ps` | 14 | 80 | 7685 | 1079 | 1092 | 829 |
+| `heavy-ps` | 28 | 160 | 22044 | 2528 | 2532 | 2054 |
+| `nexus-mix` | 3 | 25 | 1097 | **228** | **153** | **116** |
+
+`nexus-mix` reproduces the parked Nexus average above (2 buffers, 1 sampler, 13 body-only slots).
+The skip works and is worth **33%** of the evaluator there -- and 0% on the shapes where every slot
+is also a descriptor dword, because then the source root runs the same instruction anyway. But
+228 ns is the *whole* evaluation of that shape, while the game and the replay spend **1.44 to 1.58
+us** in this zone per stage event. Skipping 17.8 reads of 21.5 saves 75 ns of it.
+
+The third row of the Tracy table says the same thing from the other end: `gd=false` evaluates every
+descriptor source and every slot and costs **1.44 us** an event; `gd=true` skips 6.9 of the 8.5
+descriptor dwords and costs **1.58 us**; adding the slot skip leaves it at **1.57 us**. The zone is
+insensitive to how much of the plan it evaluates, so its cost is the fixed per-call work --
+plan-shape validation, the scratch vectors, the snapshot the caller swaps out -- and not the SRT
+walk. That is the same reason stage 1 did not pay, and it is why the projection in "What stage 1
+needs to pay off" was wrong: the flattened reads are two thirds of the *reads*, not two thirds of
+the *cost*.
+
+**What this leaves for item 2.** Nothing more to take out of the evaluation itself; the remaining
+26% of the render thread is a fixed cost paid 20,739 times a loop, so the lever is calling it less
+often (one evaluation a program a frame instead of one a stage a draw) or not at all (stage 3, which
+removes the image and sampler roots, the last thing the host still needs from the walk). The setting
+is kept default off: it is correct, it is 0.5 ms a loop of `RebindBuffers` and `FindBuffers`, and it
+costs nothing while off.
+
 ### Stage 1 measured, September 11, 2026
 
 Parked Nexus, Remote Desktop session, same build, 4 minute warm-up, 30 s sample:

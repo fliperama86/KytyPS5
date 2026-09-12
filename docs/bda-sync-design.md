@@ -1,8 +1,10 @@
 # Cheap BDA sync (roadmap item 2, first half)
 
 Status, September 12, 2026: cause measured (below); design P (re-protection off the render thread)
-landed behind `--bda-async-protect` (default off) and measured in replay, see "P measured"; next
-is the flat SRT reads in-shader.
+landed behind `--bda-async-protect` (default off) and measured in replay, see "P measured". The
+flat SRT reads are now in-shader too, behind `--gpu-srt-reads`, and measured: they do not move
+`EvaluateRuntimeSourcesImpl` ([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Stage 1b
+measured"), so the end-to-end A/B of design P is what is left of this item.
 Companion to [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md) ("What stage 1 needs to pay
 off", point 2, and "Scan breakdown, September 12") and [performance-roadmap.md](performance-roadmap.md)
 item 2.

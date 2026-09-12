@@ -27,6 +27,9 @@ std::atomic_uint64_t g_import_ns {0};
 std::atomic_uint64_t g_entry_writes {0};
 std::atomic_uint64_t g_data_fault_pages {0};
 std::atomic_uint64_t g_prologue_fault_pages {0};
+std::atomic_uint64_t g_side_effect_skips {0};
+std::atomic_uint64_t g_compute_clears {0};
+std::atomic_uint64_t g_compute_clear_refused {0};
 
 } // namespace
 
@@ -41,6 +44,9 @@ BdaPrologueCounters ReadBdaPrologueCounters() noexcept {
 	counters.entry_writes         = g_entry_writes.load(std::memory_order_relaxed);
 	counters.data_fault_pages     = g_data_fault_pages.load(std::memory_order_relaxed);
 	counters.prologue_fault_pages = g_prologue_fault_pages.load(std::memory_order_relaxed);
+	counters.side_effect_skips    = g_side_effect_skips.load(std::memory_order_relaxed);
+	counters.compute_clears       = g_compute_clears.load(std::memory_order_relaxed);
+	counters.compute_clear_refused = g_compute_clear_refused.load(std::memory_order_relaxed);
 	return counters;
 }
 
@@ -49,6 +55,9 @@ void ResetBdaPrologueFrameCounters() noexcept {
 	g_entry_writes.store(0, std::memory_order_relaxed);
 	g_data_fault_pages.store(0, std::memory_order_relaxed);
 	g_prologue_fault_pages.store(0, std::memory_order_relaxed);
+	g_side_effect_skips.store(0, std::memory_order_relaxed);
+	g_compute_clears.store(0, std::memory_order_relaxed);
+	g_compute_clear_refused.store(0, std::memory_order_relaxed);
 }
 
 void NoteBdaPrologueEntryWrites(uint64_t count) noexcept {
@@ -58,6 +67,15 @@ void NoteBdaPrologueEntryWrites(uint64_t count) noexcept {
 void NoteBdaFaultPages(uint64_t pages, bool prologue) noexcept {
 	(prologue ? g_prologue_fault_pages : g_data_fault_pages)
 	    .fetch_add(pages, std::memory_order_relaxed);
+}
+
+void NoteGpuFetchSkips(uint64_t skips) noexcept {
+	g_side_effect_skips.fetch_add(skips, std::memory_order_relaxed);
+}
+
+void NoteComputeClear(bool consumed) noexcept {
+	(consumed ? g_compute_clears : g_compute_clear_refused)
+	    .fetch_add(1, std::memory_order_relaxed);
 }
 
 GuestMemoryImport::GuestMemoryImport(GraphicContext& graphics, CommandScheduler& scheduler)

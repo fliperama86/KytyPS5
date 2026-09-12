@@ -18,6 +18,9 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <limits>
 #include <span>
 #include <vector>
@@ -634,10 +637,25 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	// Step 2 of docs/sync-points-design.md: the modules the setting changes are large, and
+	// the driver takes seconds over some of them on a cold cache. Report the slow ones.
+	const bool trace_side_effects = input_info.stage.program->info.gpu_fetch_side_effects;
+	const auto pipeline_started   = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	if (trace_side_effects) {
+		const auto pipeline_ms = std::chrono::duration<double, std::milli>(
+		                             std::chrono::steady_clock::now() - pipeline_started)
+		                             .count();
+		if (pipeline_ms >= 250.0) {
+			std::printf("gpu-fetch-side-effects: cs 0x%016" PRIx64 " pipeline compiled in "
+			            "%.0f ms\n",
+			            input_info.stage.program->shader_hash, pipeline_ms);
+			std::fflush(stdout);
+		}
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

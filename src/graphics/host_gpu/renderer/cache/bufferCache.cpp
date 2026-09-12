@@ -1130,6 +1130,17 @@ void BufferCache::NotePrologueMisses(uint32_t misses) {
 	}
 }
 
+void BufferCache::NoteGpuFetchSkips(uint32_t skips) {
+	m_gpu_fetch_skip_diag[0] += skips;
+	if (m_gpu_fetch_skip_diag[1]++ < 4) {
+		std::printf("gpu-fetch-side-effects: %" PRIu32 " dispatches skipped their side effects "
+		            "because a prologue root did not evaluate (%" PRIu64 " in this run); the "
+		            "program falls back to the CPU path on its next dispatch\n",
+		            skips, m_gpu_fetch_skip_diag[0]);
+		std::fflush(stdout);
+	}
+}
+
 void BufferCache::ReleaseGuestRange(uint64_t vaddr, uint64_t size) {
 	if (!m_prologue_enabled || !m_guest_import->Available() || size == 0) {
 		return;

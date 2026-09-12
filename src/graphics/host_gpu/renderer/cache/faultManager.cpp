@@ -23,9 +23,11 @@ namespace {
 
 constexpr size_t MaxPageFaults    = 1024;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
-// One dword, padded so each download area stays 64-byte aligned: how many prologue reads found no
-// entry since the last pass (docs/sync-points-design.md, step 1).
-constexpr size_t PrologueCounterSize = 64;
+// Two dwords, padded so each download area stays 64-byte aligned: how many prologue reads found
+// no entry since the last pass (docs/sync-points-design.md, step 1), and how many dispatches of a
+// side-effect program the prologue's safety net skipped (step 2).
+constexpr size_t PrologueCounterSize  = 64;
+constexpr size_t PrologueCounterBytes = 2 * sizeof(uint32_t);
 constexpr size_t DownloadAreaSize    = PageFaultAreaSize + PrologueCounterSize;
 
 } // namespace
@@ -148,9 +150,11 @@ void FaultManager::ProcessFaultBuffer() {
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	if (m_prologue_counter) {
 		// Step 1: the prologue's miss counter, taken and cleared beside the bitmap it shares.
-		const vk::BufferCopy copy {BitmapBytes, offset + PageFaultAreaSize, sizeof(uint32_t)};
+		// Step 2 added the safety net's skip counter in the dword behind it; both travel in the
+		// same eight-byte copy.
+		const vk::BufferCopy copy {BitmapBytes, offset + PageFaultAreaSize, PrologueCounterBytes};
 		command.copyBuffer(m_fault_buffer.Handle(), m_download_buffer.Handle(), 1, &copy);
-		command.fillBuffer(m_fault_buffer.Handle(), BitmapBytes, sizeof(uint32_t), 0u);
+		command.fillBuffer(m_fault_buffer.Handle(), BitmapBytes, PrologueCounterBytes, 0u);
 	}
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
@@ -167,11 +171,14 @@ void FaultManager::ProcessFaultBuffer() {
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
 		}
 		if (m_prologue_counter) {
-			const auto misses =
-			    *std::bit_cast<const uint32_t*>(mapped + PageFaultAreaSize);
-			if (misses != 0) {
-				NoteBdaFaultPages(misses, true);
-				m_buffer_cache.NotePrologueMisses(misses);
+			const auto* counters = std::bit_cast<const uint32_t*>(mapped + PageFaultAreaSize);
+			if (counters[0] != 0) {
+				NoteBdaFaultPages(counters[0], true);
+				m_buffer_cache.NotePrologueMisses(counters[0]);
+			}
+			if (counters[1] != 0) {
+				NoteGpuFetchSkips(counters[1]);
+				m_buffer_cache.NoteGpuFetchSkips(counters[1]);
 			}
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {

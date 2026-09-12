@@ -1430,7 +1430,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 				}
 			}
 
-			const uint32_t timeout = loop == 0 ? WARMUP_TIMEOUT_MS : WAIT_TIMEOUT_MS;
+			const uint32_t configured = Config::GetReplayTimeoutMs();
+			const uint32_t timeout =
+			    configured != 0 ? configured : (loop == 0 ? WARMUP_TIMEOUT_MS : WAIT_TIMEOUT_MS);
 			if (!gpu.WaitForIdleFor(timeout)) {
 				g_wait_diagnostics.store(false, std::memory_order_relaxed);
 				if (marker) {
@@ -1633,6 +1635,10 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			prologue_per_loop.data_fault_pages += field(&BdaPrologueCounters::data_fault_pages);
 			prologue_per_loop.prologue_fault_pages +=
 			    field(&BdaPrologueCounters::prologue_fault_pages);
+			prologue_per_loop.side_effect_skips += field(&BdaPrologueCounters::side_effect_skips);
+			prologue_per_loop.compute_clears += field(&BdaPrologueCounters::compute_clears);
+			prologue_per_loop.compute_clear_refused +=
+			    field(&BdaPrologueCounters::compute_clear_refused);
 		}
 		writer_pre_wait_ns_per_loop += mean_of(frame_writer_pre_wait_ns[i]);
 		writer_wait_ns_per_loop += mean_of(frame_writer_wait_ns[i]);
@@ -1649,6 +1655,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			prologue_first_loop.data_fault_pages += frame_prologue[i].front().data_fault_pages;
 			prologue_first_loop.prologue_fault_pages +=
 			    frame_prologue[i].front().prologue_fault_pages;
+			prologue_first_loop.side_effect_skips += frame_prologue[i].front().side_effect_skips;
 		}
 	}
 	const auto prologue_totals = ReadBdaPrologueCounters();
@@ -1711,6 +1718,10 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		         static_cast<unsigned long long>(prologue_per_loop.prologue_fault_pages),
 		         static_cast<unsigned long long>(prologue_first_loop.prologue_fault_pages),
 		         static_cast<unsigned long long>(prologue_per_loop.entry_writes));
+		::printf("  side effects   %llu dispatches skipped a loop by the prologue safety net "
+		         "(--gpu-fetch-side-effects %s)\n",
+		         static_cast<unsigned long long>(prologue_per_loop.side_effect_skips),
+		         Config::GpuFetchSideEffectsEnabled() ? "on" : "off");
 		::printf("  guest imports  %llu ranges alive, %.1f MiB, %.0f ms to import; %llu released, "
 		         "%llu failed\n",
 		         static_cast<unsigned long long>(prologue_totals.import_ranges),
@@ -1719,6 +1730,10 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		         static_cast<unsigned long long>(prologue_totals.import_releases),
 		         static_cast<unsigned long long>(prologue_totals.import_failures));
 	}
+	::printf("  compute clears %llu consumed a loop by the recognizers, %llu refused for "
+	         "want of a descriptor\n",
+	         static_cast<unsigned long long>(prologue_per_loop.compute_clears),
+	         static_cast<unsigned long long>(prologue_per_loop.compute_clear_refused));
 	::printf("  drains         %llu a loop of %llu GPU-range syncs (readbacks on the render thread)\n",
 	         static_cast<unsigned long long>(drains_per_loop),
 	         static_cast<unsigned long long>(syncs_per_loop));
@@ -1866,6 +1881,16 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		       << ",\n";
 		report << "  \"bda_prologue_fault_pages_loop1\": "
 		       << prologue_first_loop.prologue_fault_pages << ",\n";
+		report << "  \"gpu_fetch_side_effects\": "
+		       << (Config::GpuFetchSideEffectsEnabled() ? "true" : "false") << ",\n";
+		report << "  \"gpu_fetch_side_effect_skips_per_loop\": "
+		       << prologue_per_loop.side_effect_skips << ",\n";
+		report << "  \"gpu_fetch_side_effect_skips_loop1\": "
+		       << prologue_first_loop.side_effect_skips << ",\n";
+		report << "  \"compute_clears_per_loop\": " << prologue_per_loop.compute_clears
+		       << ",\n";
+		report << "  \"compute_clears_refused_per_loop\": "
+		       << prologue_per_loop.compute_clear_refused << ",\n";
 		report << "  \"bda_prologue_entry_writes_per_loop\": " << prologue_per_loop.entry_writes
 		       << ",\n";
 		report << "  \"guest_import_ranges\": " << prologue_totals.import_ranges << ",\n";

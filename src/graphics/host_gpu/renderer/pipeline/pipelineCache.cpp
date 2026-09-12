@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -132,8 +133,18 @@ constexpr std::chrono::steady_clock::duration DriverCacheSaveInterval = std::chr
 
 std::string PipelineCacheTitleId() {
 	std::string title_id;
-	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
-	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
+	// A replay has no title, and without an id the driver cache is disabled -- which makes every
+	// bench run recompile every pipeline from scratch. That is minutes on the modules
+	// --gpu-fetch-side-effects produces (docs/sync-points-design.md, step 2), all of it inside the
+	// warm-up loop the statistics exclude, so the capture gets an id of its own and repeated runs
+	// of the same capture start warm.
+	if (Config::ReplayEnabled()) {
+		const auto name = Common::PathToString(Config::GetReplayDir().filename());
+		title_id        = name.empty() ? std::string {"replay"} : "replay-" + name;
+	} else if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
+	            title_id.empty()) &&
+	           (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) ||
+	            title_id.empty())) {
 		return {};
 	}
 	if (!std::ranges::all_of(title_id, [](unsigned char c) {
@@ -453,8 +464,29 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Compute: stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
+		const auto compile_started = std::chrono::steady_clock::now();
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		// Step 2 of docs/sync-points-design.md: one line per program that carries the prologue
+		// safety net, so a run says which programs the setting moved and what they cost to emit.
+		if (result.program.info.gpu_fetch_side_effects) {
+			uint32_t fetched = 0;
+			for (const auto& buffer: result.program.info.buffers) {
+				fetched += buffer.gpu_fetch ? 1u : 0u;
+			}
+			uint32_t lowered = 0;
+			for (const auto slot: result.program.info.gpu_read_slots) {
+				lowered += slot != 0u ? 1u : 0u;
+			}
+			std::printf("gpu-fetch-side-effects: %s 0x%016" PRIx64 " marked, %u fetched buffers, "
+			            "%u of %zu reads lowered, %zu SPIR-V words, %.0f ms to emit\n",
+			            stage_name, options.shader_hash, fetched, lowered,
+			            result.program.info.gpu_read_slots.size(), result.spirv.size(),
+			            std::chrono::duration<double, std::milli>(
+			                std::chrono::steady_clock::now() - compile_started)
+			                .count());
+			std::fflush(stdout);
+		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);

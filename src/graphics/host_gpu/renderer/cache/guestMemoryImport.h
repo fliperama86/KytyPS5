@@ -41,12 +41,22 @@ struct BdaPrologueCounters {
 	uint64_t entry_writes         = 0; // prologue page-table entries written
 	uint64_t data_fault_pages     = 0;
 	uint64_t prologue_fault_pages = 0;
+	// Step 2: dispatches the prologue's safety net skipped because a root of a side-effect
+	// program did not evaluate. Zero is what the step is for.
+	uint64_t side_effect_skips    = 0;
+	// Step 2, the compute clear recognizers (renderCompute.cpp): dispatches they consumed, and
+	// dispatches they refused because the program decodes some of its own descriptors and the
+	// snapshot no longer says what it writes.
+	uint64_t compute_clears       = 0;
+	uint64_t compute_clear_refused = 0;
 };
 
 [[nodiscard]] BdaPrologueCounters ReadBdaPrologueCounters() noexcept;
 void                              ResetBdaPrologueFrameCounters() noexcept;
 void                              NoteBdaPrologueEntryWrites(uint64_t count) noexcept;
 void                              NoteBdaFaultPages(uint64_t pages, bool prologue) noexcept;
+void                              NoteGpuFetchSkips(uint64_t skips) noexcept;
+void                              NoteComputeClear(bool consumed) noexcept;
 
 class GuestMemoryImport {
 public:

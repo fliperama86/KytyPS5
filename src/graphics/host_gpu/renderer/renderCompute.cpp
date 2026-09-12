@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/guestMemoryImport.h"
 #include "graphics/host_gpu/renderer/gpuFaultTrace.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -63,6 +64,17 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
                                       ShaderBufferResource& resolved_descriptor,
                                       uint32_t& resolved_clear, uint64_t& resolved_size);
 
+// Step 2 of docs/sync-points-design.md. The clear recognizers read the snapshot descriptors to
+// decide what a dispatch writes, and a resource the shader fetches for itself has none: its
+// dwords stay zero and the address the dispatch uses is whatever the shader decodes. A program
+// that lowered only its flattened SRT reads still has every descriptor on the host, so it is the
+// fetched buffers that disqualify a recognizer, not gpu_descriptors as such -- which matters now
+// that a program with side effects, the only kind these recognizers ever match, can carry them.
+static bool HasFetchedDescriptors(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	return std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
+	                   [](const auto& buffer) { return buffer.gpu_fetch; });
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer& buffer, uint32_t group_x,
                                                 uint32_t group_y, uint32_t group_z,
@@ -71,6 +83,12 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	const auto& resources = input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
+	}
+	// Without every descriptor the recognizer cannot prove the dispatch is a full overwrite of a
+	// metadata surface, and consuming it wrongly would replace a real dispatch with a clear.
+	if (HasFetchedDescriptors(program)) {
+		NoteComputeClear(false);
+		return false;
 	}
 	auto& cache = buffer.GetContext().GetTextureCache();
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
@@ -115,10 +133,13 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
                               uint64_t& resolved_size) {
 	const auto& resources = input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
-	// A gpu_descriptors shader decodes its own V#s, so the snapshot descriptors this recognizer
-	// reads are not what the dispatch would actually write. Execute it instead.
-	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer ||
-	    input.stage.program->info.gpu_descriptors) {
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
+		return false;
+	}
+	// A shader that decodes its own V#s writes where the shader says, not where the snapshot
+	// does. Execute it instead.
+	if (HasFetchedDescriptors(*input.stage.program)) {
+		NoteComputeClear(false);
 		return false;
 	}
 	const auto element_size = fill.words * sizeof(uint32_t);
@@ -164,7 +185,7 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
 	const auto& user_data = resources.user_data;
 	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
 	    !program.info.images.empty() || !program.info.samplers.empty() ||
-	    program.info.uses_dma || program.info.gpu_descriptors ||
+	    program.info.uses_dma || HasFetchedDescriptors(program) ||
 	    input.dispatch_thread_dimensions || mode != 0x41u || user_data.size() != 10 ||
 	    program.user_data_base != 0) {
 		return false;
@@ -368,12 +389,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
 		                                                     thread_group_y, thread_group_z,
 		                                                     mode)) {
+			NoteComputeClear(true);
 			ResetBindings();
 			return;
 		}
 		if (indirect_args == 0 &&
 		    TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 		                                thread_group_z, mode)) {
+			NoteComputeClear(true);
 			ResetBindings();
 			return;
 		}

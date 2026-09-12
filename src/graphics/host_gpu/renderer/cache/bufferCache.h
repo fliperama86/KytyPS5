@@ -95,6 +95,9 @@ public:
 	// Prologue reads that found no entry since the last fault-processing pass. Zero is the whole
 	// point of step 1, so the first few are reported loudly.
 	void NotePrologueMisses(uint32_t misses);
+	// Step 2: dispatches of a side-effect program the prologue skipped because one of its roots
+	// did not evaluate. Zero is the whole point, so the first few are reported loudly too.
+	void NoteGpuFetchSkips(uint32_t skips);
 	void ReleaseGuestRange(uint64_t vaddr, uint64_t size);
 	// Records the prologue entries that changed since the last call, so they are in the command
 	// buffer before the draws that read them. One predictable branch when nothing changed.
@@ -256,6 +259,8 @@ private:
 	// Entries changed since the last flush, page to device address, coalesced by page.
 	std::map<uint64_t, uint64_t>                      m_prologue_pending;
 	std::array<uint64_t, 2>                           m_prologue_fault_diag {};
+	// Step 2: total skips and the number of reports already printed.
+	std::array<uint64_t, 2>                           m_gpu_fetch_skip_diag {};
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;

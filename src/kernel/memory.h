@@ -135,6 +135,14 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// How many times SyncGpuCleanBacking has actually downloaded a GPU-dirty range, which is a device
+// drain (BufferCache::ReadMemory -> DownloadBufferMemory -> Scheduler::WaitPriorityOperations).
+// Relaxed; the replay report prints it per loop as "drains" (docs/performance-roadmap.md, item 1).
+[[nodiscard]] uint64_t GpuBackingDrainCount();
+// How many times it was called on a GPU range at all, drained or not: the calls the profiler sees
+// as CpOpDispatchIndirect::SyncArguments and friends, most of which find nothing to download.
+[[nodiscard]] uint64_t GpuBackingSyncCount();
+void                   ResetGpuBackingDrainCount();
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
 // Stage 1 diagnostics (docs/gpu-descriptor-fetch.md): what the GPU caches know about one guest
 // address (BDA page-table mapping, owning buffer, dirty state, recent page faults) plus the dword

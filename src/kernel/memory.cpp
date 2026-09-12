@@ -934,18 +934,36 @@ std::string DescribeGpuAddress(uint64_t vaddr) {
 	    probe.fault.pages_total, probe.fault.pages_known, writers);
 }
 
+static std::atomic_uint64_t g_gpu_backing_drains {0};
+static std::atomic_uint64_t g_gpu_backing_syncs {0};
+
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;
 	}
+	g_gpu_backing_syncs.fetch_add(1, std::memory_order_relaxed);
 	if (!Graphics::GuestGpu::IsGpuThread() ||
 	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
 	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		g_gpu_backing_drains.fetch_add(1, std::memory_order_relaxed);
 		GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
 	}
 	return true;
+}
+
+uint64_t GpuBackingDrainCount() {
+	return g_gpu_backing_drains.load(std::memory_order_relaxed);
+}
+
+uint64_t GpuBackingSyncCount() {
+	return g_gpu_backing_syncs.load(std::memory_order_relaxed);
+}
+
+void ResetGpuBackingDrainCount() {
+	g_gpu_backing_drains.store(0, std::memory_order_relaxed);
+	g_gpu_backing_syncs.store(0, std::memory_order_relaxed);
 }
 
 std::vector<VirtualRangeSnapshot> SnapshotVirtualRanges() {

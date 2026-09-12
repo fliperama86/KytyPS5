@@ -1136,6 +1136,11 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		});
 	}
 	std::vector<std::vector<PrepareSummary>> frame_prepares(frame_count);
+	// Per frame, per loop: how many times the render thread drained the device to read GPU-written
+	// memory back (SyncGpuCleanBacking -> BufferCache::ReadMemory). Roadmap item 1 removes the
+	// indirect-argument ones, which is all of them in this capture.
+	std::vector<std::vector<uint64_t>> frame_drains(frame_count);
+	std::vector<std::vector<uint64_t>> frame_syncs(frame_count);
 	uint64_t late_events = 0;
 
 	for (uint32_t loop = 0; loop < loops; loop++) {
@@ -1170,6 +1175,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 				g_inline_marking.events = &frame.timed_events;
 			}
 			g_prepare_counters.Reset();
+			Memory::ResetGpuBackingDrainCount();
 
 			const auto frame_start = Clock::now();
 			for (size_t i = frame.first; i < frame.first + frame.count; i++) {
@@ -1254,6 +1260,8 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			     g_prepare_counters.scan_ns.load(std::memory_order_relaxed),
 			     g_prepare_counters.protect_calls.load(std::memory_order_relaxed),
 			     g_prepare_counters.protect_pages.load(std::memory_order_relaxed)});
+			frame_drains[index].push_back(Memory::GpuBackingDrainCount());
+			frame_syncs[index].push_back(Memory::GpuBackingSyncCount());
 			frame_gpu_ms[index].push_back(gpu_done);
 			frame_loop_ms[index].push_back(frame_done);
 			gpu_total += gpu_done;
@@ -1308,6 +1316,30 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		                   total.protect_calls / counted, total.protect_pages / counted};
 	}
 
+	// The same average for the device drains, and their total over one loop.
+	std::vector<uint64_t> drain_mean(frame_count, 0);
+	std::vector<uint64_t> sync_mean(frame_count, 0);
+	uint64_t              drains_per_loop = 0;
+	uint64_t              syncs_per_loop  = 0;
+	const auto            mean_of = [](const std::vector<uint64_t>& samples) -> uint64_t {
+		const auto skipped = samples.size() > 1 ? 1u : 0u;
+		const auto counted = samples.size() - skipped;
+		if (counted == 0) {
+			return 0;
+		}
+		uint64_t total = 0;
+		for (size_t loop = skipped; loop < samples.size(); loop++) {
+			total += samples[loop];
+		}
+		return total / counted;
+	};
+	for (size_t i = 0; i < frame_count; i++) {
+		drain_mean[i] = mean_of(frame_drains[i]);
+		sync_mean[i]  = mean_of(frame_syncs[i]);
+		drains_per_loop += drain_mean[i];
+		syncs_per_loop += sync_mean[i];
+	}
+
 	// 5. Report. The first loop is a warm-up: pipelines, descriptor sets and history buffers are
 	// all cold, so it is excluded from the statistics (docs/frame-replay.md, limits).
 	const size_t skip       = loop_ms.size() > 1 ? 1 : 0;
@@ -1329,11 +1361,16 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	}
 	PrintStats("ms/loop", loop_stats);
 	PrintStats("ms/loop gpu", gpu_stats);
+	::printf("  drains         %llu a loop of %llu GPU-range syncs (readbacks on the render thread)\n",
+	         static_cast<unsigned long long>(drains_per_loop),
+	         static_cast<unsigned long long>(syncs_per_loop));
 	for (size_t i = 0; i < frame_count; i++) {
 		::printf("  frame %-2zu %-5llu gpu median %8.3f  min %8.3f  max %8.3f | loop median %8.3f",
 		         i + 1, static_cast<unsigned long long>(recorded[frame_base + i].number),
 		         frame_gpu_stats[i].median, frame_gpu_stats[i].min, frame_gpu_stats[i].max,
 		         frame_loop_stats[i].median);
+		::printf(" | drains %llu of %llu syncs", static_cast<unsigned long long>(drain_mean[i]),
+		         static_cast<unsigned long long>(sync_mean[i]));
 		if (use_events) {
 			::printf(" | events %zu (%llu late) | progress %u of %u",
 			         recorded[frame_base + i].timed_events.size(),
@@ -1431,6 +1468,13 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		report << "  \"frame_summary\": [";
 		for (size_t i = 0; i < frame_count; i++) {
 			report << (i == 0 ? "" : ",") << JsonStats(frame_loop_stats[i]);
+		}
+		report << "],\n";
+		report << "  \"drains_per_loop\": " << drains_per_loop << ",\n";
+		report << "  \"syncs_per_loop\": " << syncs_per_loop << ",\n";
+		report << "  \"frame_drains\": [";
+		for (size_t i = 0; i < frame_count; i++) {
+			report << (i == 0 ? "" : ",") << drain_mean[i];
 		}
 		report << "],\n";
 		report << "  \"frame_dirty_events_timed\": [";

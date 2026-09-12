@@ -177,7 +177,8 @@ Not measured: Vulkan validation. `VK_LAYER_KHRONOS_validation` is not installed 
 ### Item 1b: GPU readbacks inside the SRT evaluation
 
 Status, September 12, 2026: **characterised, fixed the only way the fix could work, measured
-neutral, and parked behind `--gpu-readback-producer-wait` (default off).** The cost is real and
+neutral, and parked behind `--gpu-readback-producer-wait` (default off); periodic submits added
+the same day, worth 3.2 ms of 73.7 and parked behind `--gpu-submit-interval` (default 0).** The cost is real and
 large -- 22 to 27 ms of the parked Nexus's 73 ms replay loop -- but it is the device executing the
 draw the render thread has just recorded, not a wait the readback's shape can shorten.
 
@@ -357,7 +358,9 @@ Three things this leaves, in order of how much they would be worth:
   instalments. Submitting the open command buffer periodically instead of only at a drain would put
   that work in flight while the render thread records, so a fault would wait for a small tail
   instead of 230 draws. It does nothing for the median fault, whose producer is the immediately
-  preceding dispatch, but it is the only lever that touches the 70%.
+  preceding dispatch, but it is the only lever that touches the 70%. **Built and measured; see
+  *Periodic submits* below. Worth 3.2 ms a loop, below this item's 5 ms hard stop, parked behind
+  `--gpu-submit-interval`.**
 - **Coalesce the faults.** 96.9 faults a loop land on **26 distinct pages**, and the download
   already widens to a 512 KiB window. A page read three or four times a loop is being re-dirtied
   between reads, so widening further would not help; batching the reads a single evaluation makes
@@ -366,6 +369,97 @@ Three things this leaves, in order of how much they would be worth:
 Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/readback/` (the two characterisation runs and their
 `readback-faults-{off,on}.json`), `.../runs-rb-ab/` (the 40-loop bench), `.../runs-rb-image/` (the
 images and the `--gpu-descriptors true` pair), `_Runtime/_Diagnostics/replay/title-2/runs-rb/`.
+
+#### Periodic submits
+
+September 12, 2026: **built, measured, worth 3.2 ms a loop of 73.7, and parked behind
+`--gpu-submit-interval` (default 0).** The brief's hard stop was 5 ms; it fired.
+
+This is the second of the three things the characterisation left: let the device run ahead. Today
+the open command buffer is handed to the queue only when something drains it or at a guest
+submission boundary -- 197 `vkQueueSubmit`s a loop for 22 368 draws -- so between drains the device
+idles while the render thread records, and at each of the 97 read faults the render thread waits
+for everything it has recorded since the last one. `--gpu-submit-interval N` counts the draws and
+dispatches the render thread records and, every N of them, ends the open command buffer and
+submits it **without a wait** (`CommandScheduler::NoteDrawRecorded` -> `Flush`), called from
+`CommandProcessor::DrawIndex`, `DrawIndexAuto` and `DispatchDirect` after the executor has
+recorded the command. `--gpu-submit-after-writes` submits after any draw or dispatch that claimed
+a range for the GPU (`ObtainBuffer` with `is_written`) as well.
+
+**The one condition that decides whether it pays: only outside a dynamic-rendering pass.** The
+first version submitted wherever the counter said so, ending the open pass as `CommandBuffer::End`
+does anyway. That measured **7.6 ms a loop worse** at N=32 (81.1 against 73.5) even though it cut
+the fault wait by 5 ms: cutting a pass in half makes the device store every attachment and reload
+it in the next buffer, and a pass whose load operations clear would clear a second time, because
+two consecutive draws that share a render state re-enter `BeginRendering` as a no-op today.
+Restricting the submit to boundaries where no pass is open turned the same flag from -7.6 ms to
++3.0 ms, and removes the clear hazard outright: outside a pass the next draw calls
+`BeginRendering` either way. A dispatch ends the pass before it records, so the producers this
+exists for -- the compute passes the SRT evaluation reads back from -- are exactly the boundaries
+that are free.
+
+nexus-6, `--gpu-descriptors false`, 40 loops, two repeats, both runs shown, loop 1 excluded
+(`_Runtime/_Diagnostics/replay/nexus-6/runs-submit/`):
+
+| `--gpu-submit-interval` | `ms/loop gpu` min | `ms/loop gpu` median | `ms/loop` median | submits a loop | read faults a loop | wait ms a loop |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 (baseline) | 71.94 / 71.72 | 73.91 / 73.57 | 75.16 / 74.69 | 197 | 96 | 38.35 / 38.11 |
+| 8 | 69.31 / 68.85 | 71.35 / 70.49 | 73.36 / 72.40 | 423 | 96 | 29.69 / 30.75 |
+| **16** | **68.78 / 68.24** | **70.79 / 70.41** | **72.40 / 71.69** | 318 | 96 | 31.60 / 32.08 |
+| 32 | 69.44 / 69.13 | 71.22 / 70.78 | 73.29 / 72.39 | 264 | 96 | 32.83 / 33.33 |
+| 64 | 69.08 / 69.38 | 70.81 / 71.30 | 72.17 / 72.79 | 237 | 96 | 33.86 / 33.41 |
+| 128 | 70.21 / 70.51 | 72.31 / 72.18 | 73.91 / 73.24 | 219 | 96 | 34.59 / 35.43 |
+| 32, `--gpu-submit-after-writes true` | 93.91 / 93.66 | 95.72 / 95.23 | 98.24 / 98.09 | 1 738 | 96 | 23.15 / 21.29 |
+
+The presented image is the same in every configuration: mean absolute difference against
+`reference.png` R=9.8 G=7.8 B=4.1, and the pixel difference against the flag-off image (28k to 55k
+pixels of 8.3M, maximum channel delta 31 to 37) sits inside the band two runs of the same
+configuration already show on this build (59k, maximum 32). Images and their runs in
+`.../runs-submit-image/` and `.../runs-submit-band/`. No `EXIT`, no stderr output at all in any of
+the 14 runs.
+
+**What the table says.** A submission costs about 20 us, and the wait it buys back saturates. The
+first 120 extra submissions a loop (0 -> 16) return 6 ms of fault wait for 2.4 ms of submission
+cost. The next 1 500 (16 -> after-writes, and an `--gpu-submit-interval 1` probe at 1 916
+submissions a loop and 17.4 ms of wait) return 9 more milliseconds of wait for 30 of submission.
+That is the whole shape: the 26 to 38 ms of device wait is the device's own work, and the most a
+submission schedule can do is overlap it with the recording, not remove it. The floor the probes
+reach -- about 17 ms a loop of wait -- is the producers themselves, which is exactly what the
+characterisation predicted for the 70% whose producer is the immediately preceding dispatch.
+
+`--gpu-descriptors true`, same capture and protocol (`.../runs-submit-gd/`):
+
+| | `ms/loop gpu` min | `ms/loop gpu` median | `ms/loop` median | submits a loop | wait ms a loop |
+| --- | --- | --- | --- | --- | --- |
+| interval 0 | 75.57 / 75.98 | 79.80 / 79.55 | 81.09 / 80.26 | 197 | 44.04 / 43.34 |
+| interval 16 | 72.03 / 71.65 | 76.91 / 74.70 | 77.95 / 77.02 | 318 | 36.06 / 39.22 |
+
+title-2, 40 loops, two repeats (`_Runtime/_Diagnostics/replay/title-2/runs-submit/`): **neutral.**
+`ms/loop gpu` median 246.87 / 246.31 at interval 0 against 246.87 / 250.36 at 16, minimum 11.24 /
+11.27 against 10.76 / 10.57, `ms/loop` median 252.74 / 250.14 against 252.85 / 255.90; 62
+submissions a loop against 78. That capture takes 6 read faults a loop and 232 ms of wait in them,
+so its drains are not mid-frame and there is nothing for an interval to overlap.
+
+**Recommendation: keep the default at 0.** The win is real, reproducible and image-clean on the
+parked Nexus in both descriptor modes, but it is 4.3% rather than the 14% the hypothesis priced,
+it is nothing on the other capture, and it changes the shape of every submission the emulator
+makes for every title. It is worth turning on for Demon's Souls once an end-to-end run confirms
+the replay number, and worth revisiting if item 2 or item 3 removes enough of the CPU side that
+the 32 ms of remaining fault wait becomes the frame.
+
+Diagnostics: the replay report now prints `submits N a loop (vkQueueSubmit, graphics timeline);
+read faults N a loop, N.NN ms of device wait in them` under the drains line, and
+`submits_per_loop`, `read_faults_per_loop`, `read_fault_wait_ms_per_loop`, `gpu_submit_interval`
+and `gpu_submit_after_writes` in `replay-report.json`. The fault count and the wait are counted in
+every build now, not only under `--gpu-readback-diagnostics`: one relaxed add and one
+`steady_clock` pair per fault, about a hundred a loop.
+
+Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/runs-submit/` (the seven-configuration bench),
+`.../runs-submit-image/` and `.../runs-submit-band/` (images and the run-to-run band),
+`.../runs-submit-gd/` (`--gpu-descriptors true`), `.../smoke-si/` and `.../smoke-si2/` (the
+in-pass version and the pass-boundary version at the same interval),
+`_Runtime/_Diagnostics/replay/title-2/runs-submit/`.
+
 
 ### 2. Finish stage 1 of GPU-side descriptor fetch
 
@@ -500,8 +594,11 @@ drains a loop, taken when the evaluator reads a page the GPU has just written, a
 loop is the device doing work the render thread never lets it start early. The producer-only
 readback built for it is correct and measures neutral, because 70% of those drains wait for a draw
 the render thread has only just recorded. What is left is to stop the CPU reading those bytes
-(stages 1b and 3, now priced in device time) or to stop it recording a whole command buffer before
-submitting any of it.
+(stages 1b and 3, now priced in device time). Recording a whole command buffer before submitting
+any of it has now been measured too: submitting every sixteen draws and dispatches, at the
+boundaries where no dynamic-rendering pass is open, takes the loop from 73.7 to 70.5 ms with the
+image unchanged -- real, reproducible, 4.3%, nothing on title-2, and below the 5 ms the experiment
+was run for. It is parked behind `--gpu-submit-interval`, default 0.
 
 ## Measurement protocol, corrections
 

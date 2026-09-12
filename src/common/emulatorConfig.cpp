@@ -191,6 +191,10 @@ uint32_t GetReplaySpinThreads() {
 	return g_config->replay_spin_threads;
 }
 
+ReplayWriter GetReplayWriter() {
+	return g_config->replay_writer;
+}
+
 std::filesystem::path GetReplayImage() {
 	return g_config->replay_image;
 }

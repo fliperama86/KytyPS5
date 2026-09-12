@@ -116,6 +116,10 @@ static void PrintUsage() {
 	::printf("  --replay-spin-threads <num>          Spin that many threads on the guest CPUs for\n"
 	         "                                       the replay, as the game's job workers do.\n"
 	         "                                       Default: 0.\n");
+	::printf("  --replay-writer <none|guest|render>   Rewrite each dirty event's bytes from a\n"
+	         "                                       thread on that CPU group immediately\n"
+	         "                                       before the replay marks the range.\n"
+	         "                                       Default: none.\n");
 	::printf("  --replay-image <path>                Write the last replayed frame there.\n");
 }
 
@@ -472,6 +476,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.replay_spin_threads = threads;
+		} else if (arg == "--replay-writer") {
+			if (value == "none") {
+				options.config.replay_writer = Config::ReplayWriter::None;
+			} else if (value == "guest") {
+				options.config.replay_writer = Config::ReplayWriter::Guest;
+			} else if (value == "render") {
+				options.config.replay_writer = Config::ReplayWriter::Render;
+			} else {
+				::printf("invalid writer mode for %s: %s (none, guest or render)\n", arg.c_str(),
+				         value.c_str());
+				return false;
+			}
 		} else if (arg == "--replay-image") {
 			options.config.replay_image = Common::FixFilenameSlash(value);
 		} else if (arg == "--keymap") {

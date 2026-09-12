@@ -33,6 +33,11 @@ enum class PresentMode { Fifo, Mailbox, Immediate };
 // None leaves every thread where the scheduler puts it.
 enum class ThreadAffinity { Auto, None };
 
+// Which CPU group the replay's memory writer runs on, or None for no writer at all. It rewrites
+// the bytes of a dirty event's range just before the replay marks it, so the BDA scan that
+// follows copies lines another core wrote moments earlier (docs/bda-sync-design.md, step 0).
+enum class ReplayWriter { None, Guest, Render };
+
 using Keymap = std::vector<std::string>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
@@ -103,6 +108,9 @@ struct ConfigOptions {
 	// Host threads that spin on the guest CPUs for the length of a replay, imitating the game's
 	// job-system workers, which busy-wait in guest code. 0 leaves the machine to the replay.
 	uint32_t               replay_spin_threads         = 0;
+	// The replay's memory writer: none, or one thread on the guest or the render CPU group that
+	// rewrites each dirty event's range immediately before the mark. See docs/bda-sync-design.md.
+	ReplayWriter           replay_writer               = ReplayWriter::None;
 	std::filesystem::path  replay_image;
 	ThreadAffinity         thread_affinity             = ThreadAffinity::Auto;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -164,6 +172,7 @@ uint32_t              GetReplayLoops();
 uint32_t              GetReplayFrames();
 bool                  ReplayDirtySetOnce();
 uint32_t              GetReplaySpinThreads();
+ReplayWriter          GetReplayWriter();
 std::filesystem::path GetReplayImage();
 
 ThreadAffinity GetThreadAffinity();

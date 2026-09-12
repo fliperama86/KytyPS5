@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
@@ -355,6 +356,162 @@ void SpinPause() noexcept {
 #endif
 }
 
+// Imitating the guest's writes to the memory a BDA scan is about to copy (step 0 of
+// docs/bda-sync-design.md).
+//
+// In the game the bytes a scan's memcpy reads were written by a guest thread on the other CCD
+// moments earlier, so every cache line is a cross-CCD transfer; in a replay nothing writes them
+// between loops and the lines are cold in DRAM. This thread puts that freshness back: around every
+// dirty mark the replay applies, it walks the marked range one 64-byte line at a time and performs
+// a volatile load and a store of the same value, which leaves the bytes unchanged and the line
+// dirty in its own core's cache. --replay-writer, off by default.
+//
+// The handoff is synchronous: the caller publishes the ranges, spins until the writer is done and
+// only then goes on, so the rewrite always precedes the BDA scan the mark provokes. The wait is
+// timed on the caller's side and reported apart from ms/loop, because it is the harness's cost and
+// not the render path's.
+//
+// The rewrite runs *after* the mark, not before it, and it has to. Before the mark the range's
+// pages are still write-protected by the GPU tracker, so the first store faults; the host fault
+// handler resolves that through BufferCache::InvalidateMemory, which for a GPU-dirty range reads
+// it back with SendCommandSync -- and the thread it would have to wait for is the GPU thread,
+// which is the one spinning here. Applying the mark first clears the GPU-dirty bits and leaves
+// every page of the range writable, so the rewrite touches memory the way a guest thread does and
+// cannot deadlock. Either order puts the write between the last upload and the next one, which is
+// what the experiment is about (docs/frame-replay.md, "Writer imitation").
+class MemoryWriter final {
+public:
+	MemoryWriter(Common::ThreadAffinityGroup group, const std::vector<RestoredRange>* ranges)
+	    : m_ranges(ranges) {
+		m_thread = std::thread([this, group] {
+			Common::ApplyThreadAffinity(group, "ReplayWriter");
+			uint64_t served = 0;
+			for (;;) {
+				// Quit first: the destructor sets the flag and then bumps the ticket to wake this
+				// thread, and by then the last job's ranges are nobody's to touch.
+				if (m_quit.load(std::memory_order_relaxed)) {
+					return;
+				}
+				const auto ticket = m_request.load(std::memory_order_acquire);
+				if (ticket == served) {
+					SpinPause();
+					continue;
+				}
+				Rewrite();
+				served = ticket;
+				m_done.store(served, std::memory_order_release);
+			}
+		});
+	}
+
+	~MemoryWriter() {
+		m_quit.store(true, std::memory_order_relaxed);
+		m_request.fetch_add(1, std::memory_order_release);
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(MemoryWriter);
+
+	// Called from whichever thread is about to apply the marks, one at a time: the GPU thread for
+	// the pre-event batch and for every inline mark, the feeder for the late ones.
+	void Touch(const DirtyEventRecord* events, size_t count) {
+		if (count == 0) {
+			return;
+		}
+		m_events = events;
+		m_count  = count;
+		const auto ticket = m_request.load(std::memory_order_relaxed) + 1;
+		const auto start  = Clock::now();
+		m_request.store(ticket, std::memory_order_release);
+		while (m_done.load(std::memory_order_acquire) != ticket) {
+			SpinPause();
+		}
+		m_wait_ns.fetch_add(static_cast<uint64_t>(
+		                        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
+		                                                                             start)
+		                            .count()),
+		                    std::memory_order_relaxed);
+	}
+
+	void Reset() noexcept {
+		ResetWait();
+		m_bytes.store(0, std::memory_order_relaxed);
+		m_skipped_pages.store(0, std::memory_order_relaxed);
+	}
+
+	void ResetWait() noexcept { m_wait_ns.store(0, std::memory_order_relaxed); }
+
+	[[nodiscard]] uint64_t WaitNs() const noexcept {
+		return m_wait_ns.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] uint64_t Bytes() const noexcept { return m_bytes.load(std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t SkippedPages() const noexcept {
+		return m_skipped_pages.load(std::memory_order_relaxed);
+	}
+
+private:
+	// A page the writer may touch: restored, committed and mapped read-write by the guest. A page
+	// in a range the capture left reserved, or one the guest mapped read-only, is skipped and
+	// counted; a store there would fault on something the host fault handler cannot resolve.
+	static bool IsRewritablePage(const RestoredRange* range) noexcept {
+		if (range == nullptr) {
+			return false;
+		}
+		const auto mode = ModeFromProt(range->prot);
+		return mode == VirtualMemory::Mode::ReadWrite ||
+		       mode == VirtualMemory::Mode::ExecuteReadWrite;
+	}
+
+	void Rewrite() {
+		constexpr uint64_t LINE = 64;
+		uint64_t           bytes   = 0;
+		uint64_t           skipped = 0;
+		for (size_t i = 0; i < m_count; i++) {
+			const auto& event = m_events[i];
+			// A recorded mark is usually one byte wide -- the host fault handler invalidates the
+			// faulting address, not the guest's store -- while the mark it applies dirties the
+			// whole 4 KiB tracker page and the scan that follows copies that page. The imitation
+			// has to cover what the scan copies, so the range is widened to tracker pages.
+			uint64_t   address = event.vaddr & ~(TRACKER_PAGE_SIZE - 1);
+			const auto end =
+			    (event.vaddr + event.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+			while (address < end) {
+				const auto page     = address & ~(kPageSize - 1);
+				const auto page_end = std::min(page + kPageSize, end);
+				if (!IsRewritablePage(FindRange(*m_ranges, page))) {
+					skipped++;
+					address = page_end;
+					continue;
+				}
+				// One load and one store per 64-byte line, of the value already there: the bytes
+				// do not change, and the line ends up dirty in this core's cache.
+				for (auto line = address & ~(LINE - 1); line < page_end; line += LINE) {
+					auto* word = reinterpret_cast<volatile uint64_t*>(line); // NOLINT
+					const auto value = *word;
+					*word            = value;
+				}
+				bytes += page_end - address;
+				address = page_end;
+			}
+		}
+		m_bytes.fetch_add(bytes, std::memory_order_relaxed);
+		m_skipped_pages.fetch_add(skipped, std::memory_order_relaxed);
+	}
+
+	const std::vector<RestoredRange>* m_ranges = nullptr;
+	const DirtyEventRecord*           m_events = nullptr;
+	size_t                            m_count  = 0;
+	std::thread                       m_thread;
+	std::atomic_uint64_t              m_request {0};
+	std::atomic_uint64_t              m_done {0};
+	std::atomic_bool                  m_quit {false};
+	std::atomic_uint64_t              m_wait_ns {0};
+	std::atomic_uint64_t              m_bytes {0};
+	std::atomic_uint64_t              m_skipped_pages {0};
+};
+
 // Replays the frame's CPU writes *when* they happened (docs/frame-replay.md, phase D).
 //
 // In the game the guest dirties pages throughout the frame, interleaved with the GPU thread's
@@ -368,7 +525,7 @@ void SpinPause() noexcept {
 // left at once and reports how many were late, which is what the replay report prints.
 class DirtyEventMarker final {
 public:
-	explicit DirtyEventMarker(BufferCache& cache): m_cache(cache) {
+	DirtyEventMarker(BufferCache& cache, MemoryWriter* writer): m_cache(cache), m_writer(writer) {
 		m_thread = std::thread([this] { Run(); });
 	}
 
@@ -434,6 +591,10 @@ private:
 				// from another thread trips the tracker's "CPU dirty state conflicts with GPU
 				// dirty state" check.
 				m_cache.InvalidateMemory(event.vaddr, event.size);
+				// The rewrite follows the mark; see MemoryWriter for why it cannot precede it.
+				if (m_writer != nullptr) {
+					m_writer->Touch(&event, 1);
+				}
 			}
 
 			lock.lock();
@@ -445,6 +606,7 @@ private:
 	}
 
 	BufferCache&                         m_cache;
+	MemoryWriter*                        m_writer = nullptr;
 	const std::vector<DirtyEventRecord>* m_events = nullptr;
 	std::thread                          m_thread;
 	std::mutex                    m_mutex;
@@ -469,6 +631,7 @@ private:
 struct InlineMarking {
 	BufferCache*                         cache  = nullptr;
 	const std::vector<DirtyEventRecord>* events = nullptr;
+	MemoryWriter*                        writer = nullptr;
 	std::atomic_size_t                   cursor {0};
 };
 
@@ -487,6 +650,11 @@ void InlineProgressHook(uint32_t progress) {
 		// drain the device, and nothing may apply this event twice.
 		state.cursor.store(++cursor, std::memory_order_relaxed);
 		state.cache->InvalidateMemory(event.vaddr, event.size);
+		// Then the writer rewrites the range, so the scan this mark provokes copies lines that are
+		// dirty in another core's cache (docs/bda-sync-design.md, step 0).
+		if (state.writer != nullptr) {
+			state.writer->Touch(&event, 1);
+		}
 	}
 }
 
@@ -676,7 +844,8 @@ std::string DescribeLastBlockedWait() {
 }
 
 int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_wanted,
-              bool dirty_set_once, uint32_t spin_threads, const std::filesystem::path& image) {
+              bool dirty_set_once, uint32_t spin_threads, Config::ReplayWriter writer_mode,
+              const std::filesystem::path& image) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SetUnhandledExceptionFilter(ReplayCrashFilter);
 #endif
@@ -1056,6 +1225,12 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	::printf("  dirty pages    %zu in %zu ranges, re-marked %s\n", dirty_pages.size(),
 	         dirty_ranges.size(), dirty_set_once ? "once at restore" : "before every frame");
 	::printf("  spin threads   %u on the guest CPUs\n", spin_threads);
+	::printf("  writer         %s\n",
+	         writer_mode == Config::ReplayWriter::Guest
+	             ? "one thread on the guest CPUs, rewriting each marked range at its mark"
+	             : writer_mode == Config::ReplayWriter::Render
+	                   ? "one thread on the render CPUs, rewriting each marked range at its mark"
+	                   : "none");
 	if (prepare_events_present && !prepare_events.empty()) {
 		uint64_t recorded_prepares = 0;
 		uint64_t recorded_scans    = 0;
@@ -1113,12 +1288,22 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	std::vector<PresentedImage> frame_images;
 	const auto                  run_start = Clock::now();
 
+	// The memory writer, if this run wants one: it lives for the whole run and is handed the
+	// ranges of every mark, on the thread that is about to apply it.
+	std::unique_ptr<MemoryWriter> writer;
+	if (writer_mode != Config::ReplayWriter::None) {
+		writer = std::make_unique<MemoryWriter>(writer_mode == Config::ReplayWriter::Render
+		                                            ? Common::ThreadAffinityGroup::Render
+		                                            : Common::ThreadAffinityGroup::Guest,
+		                                        &restored);
+	}
 	std::unique_ptr<DirtyEventMarker> marker;
 	if (use_events && !inline_events) {
-		marker = std::make_unique<DirtyEventMarker>(buffer_cache);
+		marker = std::make_unique<DirtyEventMarker>(buffer_cache, writer.get());
 	}
 	if (inline_events) {
-		g_inline_marking.cache = &buffer_cache;
+		g_inline_marking.cache  = &buffer_cache;
+		g_inline_marking.writer = writer.get();
 		GuestGpu::SetProgressHook(&InlineProgressHook);
 	}
 	// The replay's own preparations, counted through the sink the capture writes its stream from.
@@ -1141,6 +1326,14 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	// indirect-argument ones, which is all of them in this capture.
 	std::vector<std::vector<uint64_t>> frame_drains(frame_count);
 	std::vector<std::vector<uint64_t>> frame_syncs(frame_count);
+	// Per frame, per loop: what the memory writer cost and did. The wait is the render thread's,
+	// the rest the writer's; both are the harness's own and are reported apart from ms/loop. The
+	// pre-event batch is applied before the frame's clock starts, as it always has been, so its
+	// wait is counted on its own: only the in-frame one is inside ms/loop gpu.
+	std::vector<std::vector<uint64_t>> frame_writer_pre_wait_ns(frame_count);
+	std::vector<std::vector<uint64_t>> frame_writer_wait_ns(frame_count);
+	std::vector<std::vector<uint64_t>> frame_writer_bytes(frame_count);
+	std::vector<std::vector<uint64_t>> frame_writer_skipped(frame_count);
 	uint64_t late_events = 0;
 
 	for (uint32_t loop = 0; loop < loops; loop++) {
@@ -1155,6 +1348,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			// pages stay dirty across frames without being re-marked, and re-marking them every
 			// frame inflates what each BDA scan has to walk (phase E).
 			const bool mark_batch = !dirty_set_once && !dirty_ranges.empty();
+			if (writer) {
+				writer->Reset();
+			}
 			if (mark_batch || !frame.pre_events.empty()) {
 				gpu.SendCommandSync([&]() {
 					if (mark_batch) {
@@ -1164,6 +1360,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 					}
 					for (const auto& event: frame.pre_events) {
 						buffer_cache.InvalidateMemory(event.vaddr, event.size);
+					}
+					if (writer) {
+						writer->Touch(frame.pre_events.data(), frame.pre_events.size());
 					}
 				});
 			}
@@ -1175,6 +1374,12 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 				g_inline_marking.events = &frame.timed_events;
 			}
 			g_prepare_counters.Reset();
+			// What the pre-event batch cost, before the counters start again for the frame
+			// itself; the bytes and the skipped pages stay cumulative over the loop.
+			const auto pre_wait_ns = writer ? writer->WaitNs() : 0;
+			if (writer) {
+				writer->ResetWait();
+			}
 			Memory::ResetGpuBackingDrainCount();
 
 			const auto frame_start = Clock::now();
@@ -1223,6 +1428,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 				for (size_t i = cursor; i < frame.timed_events.size(); i++) {
 					buffer_cache.InvalidateMemory(frame.timed_events[i].vaddr,
 					                              frame.timed_events[i].size);
+					if (writer) {
+						writer->Touch(&frame.timed_events[i], 1);
+					}
 				}
 				const auto late = frame.timed_events.size() - cursor;
 				frame_late[index] += late;
@@ -1260,6 +1468,10 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			     g_prepare_counters.scan_ns.load(std::memory_order_relaxed),
 			     g_prepare_counters.protect_calls.load(std::memory_order_relaxed),
 			     g_prepare_counters.protect_pages.load(std::memory_order_relaxed)});
+			frame_writer_pre_wait_ns[index].push_back(pre_wait_ns);
+			frame_writer_wait_ns[index].push_back(writer ? writer->WaitNs() : 0);
+			frame_writer_bytes[index].push_back(writer ? writer->Bytes() : 0);
+			frame_writer_skipped[index].push_back(writer ? writer->SkippedPages() : 0);
 			frame_drains[index].push_back(Memory::GpuBackingDrainCount());
 			frame_syncs[index].push_back(Memory::GpuBackingSyncCount());
 			frame_gpu_ms[index].push_back(gpu_done);
@@ -1285,6 +1497,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	g_wait_diagnostics.store(false, std::memory_order_relaxed);
 	spinners.reset();
 	GuestGpu::SetProgressHook(nullptr);
+	g_inline_marking.writer = nullptr;
 	Replay::SetPrepareSink(nullptr);
 	g_inline_marking.events = nullptr;
 	const auto run_ms = MillisSince(run_start);
@@ -1333,11 +1546,19 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		}
 		return total / counted;
 	};
+	uint64_t writer_pre_wait_ns_per_loop = 0;
+	uint64_t writer_wait_ns_per_loop  = 0;
+	uint64_t writer_bytes_per_loop    = 0;
+	uint64_t writer_skipped_per_loop  = 0;
 	for (size_t i = 0; i < frame_count; i++) {
 		drain_mean[i] = mean_of(frame_drains[i]);
 		sync_mean[i]  = mean_of(frame_syncs[i]);
 		drains_per_loop += drain_mean[i];
 		syncs_per_loop += sync_mean[i];
+		writer_pre_wait_ns_per_loop += mean_of(frame_writer_pre_wait_ns[i]);
+		writer_wait_ns_per_loop += mean_of(frame_writer_wait_ns[i]);
+		writer_bytes_per_loop += mean_of(frame_writer_bytes[i]);
+		writer_skipped_per_loop += mean_of(frame_writer_skipped[i]);
 	}
 
 	// 5. Report. The first loop is a warm-up: pipelines, descriptor sets and history buffers are
@@ -1361,6 +1582,14 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	}
 	PrintStats("ms/loop", loop_stats);
 	PrintStats("ms/loop gpu", gpu_stats);
+	if (writer) {
+		::printf("  writer         %.0f us a loop waiting in the frame (+%.0f us in the pre-event "
+		         "batch, outside the timing), %.1f MiB rewritten, %llu pages skipped\n",
+		         static_cast<double>(writer_wait_ns_per_loop) / 1000.0,
+		         static_cast<double>(writer_pre_wait_ns_per_loop) / 1000.0,
+		         static_cast<double>(writer_bytes_per_loop) / (1024.0 * 1024.0),
+		         static_cast<unsigned long long>(writer_skipped_per_loop));
+	}
 	::printf("  drains         %llu a loop of %llu GPU-range syncs (readbacks on the render thread)\n",
 	         static_cast<unsigned long long>(drains_per_loop),
 	         static_cast<unsigned long long>(syncs_per_loop));
@@ -1509,6 +1738,15 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		report << "],\n";
 		report << "  \"dirty_set_once\": " << (dirty_set_once ? "true" : "false") << ",\n";
 		report << "  \"spin_threads\": " << spin_threads << ",\n";
+		report << "  \"writer_mode\": \""
+		       << (writer_mode == Config::ReplayWriter::Guest     ? "guest"
+		           : writer_mode == Config::ReplayWriter::Render  ? "render"
+		                                                          : "none")
+		       << "\",\n";
+		report << "  \"writer_wait_us\": " << writer_wait_ns_per_loop / 1000 << ",\n";
+		report << "  \"writer_pre_wait_us\": " << writer_pre_wait_ns_per_loop / 1000 << ",\n";
+		report << "  \"writer_bytes\": " << writer_bytes_per_loop << ",\n";
+		report << "  \"writer_skipped_pages\": " << writer_skipped_per_loop << ",\n";
 		report << "  \"frame_scan_protect_calls\": [";
 		for (size_t i = 0; i < frame_count; i++) {
 			report << (i == 0 ? "" : ",") << prepare_mean[i].protect_calls;

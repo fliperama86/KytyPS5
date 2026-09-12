@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_REPLAY_FRAMEREPLAY_H_
 #define EMULATOR_SRC_GRAPHICS_REPLAY_FRAMEREPLAY_H_
 
+#include "common/emulatorConfig.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -18,8 +20,12 @@ namespace Libs::Graphics::Replay {
 // replayed frame; the frame's recorded CPU-write events are applied per frame either way.
 // `spin_threads` host threads busy-wait on the guest CPU set for the length of the run, imitating
 // the game's job-system workers, which spin in guest code while the render thread works.
+// `writer`, when it is not None, is one thread on that CPU group which rewrites the bytes of every
+// dirty event's range immediately before the replay marks it, so the BDA scan that follows copies
+// cache lines another core dirtied moments earlier (docs/bda-sync-design.md, step 0).
 int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames,
-              bool dirty_set_once, uint32_t spin_threads, const std::filesystem::path& image);
+              bool dirty_set_once, uint32_t spin_threads, Config::ReplayWriter writer,
+              const std::filesystem::path& image);
 
 // WAIT_REG_MEM diagnostics, so a wait that never completes ends the replay with the address and
 // the compare parameters instead of spinning. Off outside a replay; the recording call is behind

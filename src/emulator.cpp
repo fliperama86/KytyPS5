@@ -194,7 +194,7 @@ static void ExecuteReplay() {
 		    const int code = Libs::Graphics::Replay::RunReplay(
 		        Config::GetReplayDir(), Config::GetReplayLoops(), Config::GetReplayFrames(),
 		        Config::ReplayDirtySetOnce(), Config::GetReplaySpinThreads(),
-		        Config::GetReplayImage());
+		        Config::GetReplayWriter(), Config::GetReplayImage());
 		    std::quick_exit(code);
 	    },
 	    nullptr);

@@ -190,10 +190,14 @@ unpriced by replay.
 SRT walk: `gd=false` evaluates every descriptor source and every flat slot at 1.44 us an event,
 `gd=true` skips 6.9 of the 8.5 descriptor dwords and costs 1.58, and adding the slot skip (17.8 of
 21.5 slots gone) leaves it at 1.57. `srt_evaluator_bench` prices the whole evaluation of a
-Nexus-shaped plan at 228 ns, of which the slot skip is worth 75. So the cost is the fixed per-call
-work, paid 20,739 times a loop, and the levers left are calling it less often (once a program a
-frame instead of once a stage a draw) or removing the last host consumer of the walk, which is
-stage 3.
+Nexus-shaped plan at 228 ns, of which the slot skip is worth 75. Split by zone on September 12,
+the fixed per-call work is 149 ns of the 1 500 and the rest is the cache misses the flat program
+takes on its own plan -- 40 to 60 lines of it an event, across 493 plans cycled a loop -- so the
+same evaluation runs in 188 ns out of L1 and 1 159 ns out of DRAM
+([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Where the evaluator's 1.5 us goes").
+Either way the cost does not follow the roots out of the host, so the levers left are calling it
+less often (once a program a frame instead of once a stage a draw, which also reuses a warm plan
+across the program's draws) or removing the last host consumer of the walk, which is stage 3.
 
 Two pieces, both foreseeable from the stats dump:
 

@@ -288,18 +288,133 @@ us** in this zone per stage event. Skipping 17.8 reads of 21.5 saves 75 ns of it
 The third row of the Tracy table says the same thing from the other end: `gd=false` evaluates every
 descriptor source and every slot and costs **1.44 us** an event; `gd=true` skips 6.9 of the 8.5
 descriptor dwords and costs **1.58 us**; adding the slot skip leaves it at **1.57 us**. The zone is
-insensitive to how much of the plan it evaluates, so its cost is the fixed per-call work --
-plan-shape validation, the scratch vectors, the snapshot the caller swaps out -- and not the SRT
-walk. That is the same reason stage 1 did not pay, and it is why the projection in "What stage 1
-needs to pay off" was wrong: the flattened reads are two thirds of the *reads*, not two thirds of
-the *cost*.
+insensitive to how much of the plan it evaluates. That was read here as fixed per-call work --
+plan-shape validation, the scratch vectors, the snapshot the caller swaps out -- and it is not:
+measured zone by zone below ("Where the evaluator's 1.5 us goes"), that work is 149 ns of the
+1 500, and the rest is the cache misses the flat program takes on its own plan, which the skipped
+roots share. That is the same reason stage 1 did not pay, and it is why the projection in "What
+stage 1 needs to pay off" was wrong: the flattened reads are two thirds of the *reads*, not two
+thirds of the *cost*.
 
 **What this leaves for item 2.** Nothing more to take out of the evaluation itself; the remaining
-26% of the render thread is a fixed cost paid 20,739 times a loop, so the lever is calling it less
-often (one evaluation a program a frame instead of one a stage a draw) or not at all (stage 3, which
-removes the image and sampler roots, the last thing the host still needs from the walk). The setting
+26% of the render thread is a per-event cost paid 20,739 times a loop, and most of it is cache
+misses on the 493 plans the loop cycles (see below), so the lever is calling it less often (one
+evaluation a program a frame instead of one a stage a draw, which also keeps the plan warm) or not
+at all (stage 3, which removes the image and sampler roots, the last thing the host still needs
+from the walk). The setting
 is kept default off: it is correct, it is 0.5 ms a loop of `RebindBuffers` and `FindBuffers`, and it
 costs nothing while off.
+
+#### Where the evaluator's 1.5 us goes, September 12, 2026
+
+Stage 1b left the zone itself unexplained: it costs 1.44 to 1.58 us an event whatever share of the
+plan it evaluates, while `srt_evaluator_bench` runs the whole of a Nexus-shaped plan in 228 ns.
+Two candidates, decided with numbers: **A**, fixed per-call overhead around the flat program (the
+scratch vectors, the plan-shape checks, the snapshot the caller swaps out); **B**, the memory
+latency of the data an evaluation touches, which does not shrink when fewer roots are evaluated.
+The answer is **B**, and the cold data is mostly the *plan*, not the guest table.
+
+**The call, split by zone.** `EvaluateRuntimeSourcesImpl` is now five zones: `SrtEval::Setup`
+(plan checks and `FlatPlanUsable`), `SrtEval::Prepare` (the register lease, the `FlatMachine`, the
+`active` vector and the control-flow walk), `SrtEval::Sources` and `SrtEval::Slots` (the flat
+program over the descriptor roots and over the flat-read roots), `SrtEval::Writeback` (the three
+swaps into the caller's vectors), plus `SrtEval::Walker` on the fallback path. Replay, nexus-6,
+`--gpu-descriptors false`, four captures (two at 30 loops, two at 60; `tracy-zones/`). Tracy's
+on-demand connect leaves one in-flight zone per capture holding the whole pre-connect interval, so
+each zone's single maximum is dropped before the mean; what is left agrees across the four runs,
+which is why these are per-call means and not a 30/60 difference:
+
+| part of the call | ns a call | share | spread over the four captures |
+| --- | --- | --- | --- |
+| `SrtEval::Setup` | 26.3 | 1.5% | 26.0 - 26.5 |
+| `SrtEval::Prepare` | 42.6 | 2.5% | 42.2 - 43.0 |
+| `SrtEval::Sources` | **573.5** | 33.1% | 531 - 671 |
+| `SrtEval::Slots` | **1 008.2** | 58.3% | 979 - 1 040 |
+| `SrtEval::Writeback` | 12.2 | 0.7% | 12.1 - 12.4 |
+| `EvaluateRuntimeSourcesImpl` self | 67.5 | 3.9% | 66.6 - 68.9 |
+| total | 1 730.3 | | |
+
+**A is 149 ns.** Setup, Prepare, Writeback and the parent's own self time together are 8.6% of the
+call; the flat program's execution is 1 582 ns, 91.4%. The instrumented total is 1 730 ns against
+1 440 ns uninstrumented because the five zones cost about 50 ns each while a Tracy client is
+attached; they cost nothing when none is (`tracy::ProfilerAvailable()` is false), and the replay
+bench confirms it: 40 loops x 2 of `gd=false` give 73.41 / 73.49 ms/loop gpu minimum against 73.06
+for the build before them, with the image unchanged at R 9.8 G 7.8 B 4.1 (`runs-zones/`). The IR
+walker is not involved: 61 of 20 739 calls a loop take it (0.3%), at 686 ns.
+
+**The chase, counted where it happens.** `KYTY_DEBUG_SRT_STATS=1` now also counts, per evaluation,
+the guest reads the flat program executes, their *dependent depth* (the longest chain of reads
+whose address depends on an earlier read of the same evaluation), and the distinct lines and pages
+they touch. Three loops, 33 frames, 62 034 events
+(`tracy-zones/srt-stats-20260912-044138.json`):
+
+| | |
+| --- | --- |
+| events / IR-walker fallbacks | 62 034 / **183** (0.3%) |
+| guest reads an event | **21.51** |
+| dependent depth an event | **1.14** - 0: 43.0%, 1: 0.4%, 2: 56.5%, 3: 0.1% |
+| distinct 64-byte lines an event | **4.03** |
+| distinct 4 KiB pages an event | 2.23 |
+| distinct pages over the whole run | **474** (1.9 MiB) |
+
+There is no deep pointer chase. A root is user data to one table read, or user data to a table to a
+second table: depth 2 at the 56.5% mode and never past 3. The 21.5 reads of an event land in 4
+cache lines, and the evaluator's entire guest working set for the frame is 474 pages, which fits in
+L2. The events also split in two:
+
+| | shaders | events | flat insts an event | reads an event |
+| --- | --- | --- | --- | --- |
+| programs that read nothing | 18 | 26 685 (43.0%) | 0.90 | 0 |
+| programs that read | 475 | 35 349 (57.0%) | 40.96 | 37.76 |
+
+So 43% of the events run a program of one instruction and must be nearly free, and the zone's
+1.5 us mean is carried by the other 57% at about 2.6 us each: 41 instructions, 37.8 reads over
+about 7 lines of guest memory, and roughly 50 lines of plan.
+
+**The bench, cold.** `srt_evaluator_bench --cold` builds N copies of a shape's plan, gives each its
+own page of one large guest image, and cycles them in a pseudo-random order so consecutive
+evaluations touch unrelated lines. `--copies` sets the cycle; the `coldplan`, `coldguest` and
+`coldboth` columns instead keep a 64-copy cycle and `clflush` the plan's own arrays, the guest
+table, or both before every timed evaluation, minus a baseline loop that performs the same flushes
+and no evaluation. `nexus-flat` is the dump's average program shape (21 reads in 44 instructions,
+no address arithmetic); `nexus-mix` is the older shape with one arithmetic op a slot. Per call, ns,
+from `srt-bench/cold-sweep.txt` and `srt-bench/cold-all-shapes.txt`:
+
+| cycle footprint | copies | `nexus-flat` | `nexus-mix` |
+| --- | --- | --- | --- |
+| 8 KiB (L1) | 1 | **188** | **249** |
+| 0.5 MiB (L2) | 64 | 206 | 273 |
+| 4 MiB (L3) | 512 | 246 | 314 |
+| 32 MiB (L3) | 4 096 | 323 | 501 |
+| 128 MiB (past the 96 MiB L3) | 16 384 | **997** | **1 186** |
+| 385 MiB (DRAM) | 49 152 | **1 159** | **1 433** |
+| plan lines flushed, guest table warm | 64 | 956 | 1 068 |
+| guest table flushed, plan warm | 64 | 296 | 378 |
+| both flushed | 64 | 1 038 | 1 147 |
+| L1, with the renderer's per-call vectors | 1 | 245 | 318 |
+
+The same evaluation costs 188 ns with everything in L1 and 1 159 ns out of DRAM, a factor of six,
+and the renderer's 1 582 ns of flat-program time sits at the cold end of that range. The flush
+columns say where the cold bytes are: the plan is 956 of the 1 038 ns penalty and the guest table
+296, because a program touches about 4 lines of guest memory against 40 to 60 lines of
+`flat.insts`, `schedule`, `flat_reads`, `srt_reads` and the roots. Handing the evaluator fresh
+result vectors every call, which is exactly what `MaterializeSnapshot` does, costs about 60 ns.
+
+**Verdict: B, with one correction to how it was stated.** The fixed per-call work is 149 ns, a
+twelfth of the call, so A cannot be it and there is nothing here worth pooling. The cost is memory
+latency, but not of a three-to-five-deep dependent chase through cold guest pages: the dependent
+depth is 1.14 and the guest working set is 1.9 MiB. What is cold is the *plan* -- 493 of them
+cycled across a loop with the whole rest of the render thread in between, 40 to 60 lines of it an
+event -- and none of that shrinks when roots are skipped. It is also why stage 1 and stage 1b moved
+the zone by less than 1%: skipping a root removes an instruction from a contiguous array whose
+lines are fetched anyway, and removes a read from a cache line the remaining roots still read. The
+lever is not making one evaluation cheaper; it is running it less often (one evaluation a program a
+frame instead of one a stage a draw), which reuses the same warm plan across a program's draws, or
+removing the host's last consumer of the walk in stage 3.
+
+Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/tracy-zones/` (four CSVs, their logs and the stats
+dump), `_Runtime/_Diagnostics/replay/nexus-6/srt-bench/` (bench tables),
+`_Runtime/_Diagnostics/replay/nexus-6/runs-zones/` (the 40-loop bench and its image).
 
 ### Stage 1 measured, September 11, 2026
 

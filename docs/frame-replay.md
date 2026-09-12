@@ -1005,6 +1005,66 @@ ones. Until then the honest rule stands: **the harness reproduces the render thr
 call counts and its BDA-scan timeline, but a change whose cost is the guest's fault and upload
 traffic around that scan must still be judged end to end.**
 
+### Writer imitation (item 2, step 0), September 12, 2026
+
+The spinners above do not touch memory, and that is the one thing the game's threads do that a
+replay does not. `--replay-writer <none|guest|render>` ([settings.md](settings.md)) puts it back:
+one host thread on the named CPU group, which, at every dirty mark the replay applies, walks the
+4 KiB tracker pages that mark dirties and performs one volatile load and one store of the same
+value per 64-byte line. The bytes do not change; the lines end up dirty in that core's cache, which
+is the state the hypothesis of [bda-sync-design.md](bda-sync-design.md) says the game's scan copies
+from. The handoff is synchronous -- the thread applying the mark waits for the writer before it goes
+on -- so the rewrite always precedes the scan the mark provokes, and the wait is timed and reported
+apart from `ms/loop` (`writer_wait_us`, `writer_bytes`, `writer_skipped_pages`).
+
+Two details of the implementation matter for reading the numbers. **The rewrite follows the mark
+rather than preceding it.** Before the mark the range's pages are still write-protected by the GPU
+tracker, so the writer's first store faults; the host fault handler resolves that through
+`BufferCache::InvalidateMemory`, which for a GPU-dirty range drains the device with
+`SendCommandSync` -- on the GPU thread, which is the thread spinning for the writer. That deadlocks,
+and it is what the first build of this did. Applying the mark first clears the GPU-dirty bits and
+leaves the range writable, and the rewrite still lands between the previous upload and the next one,
+which is what the experiment is about. **The rewritten range is the mark's tracker pages, not the
+recorded event's bytes.** A recorded mark is usually one byte wide, because the fault handler
+invalidates the faulting address rather than the guest's store; the mark it applies dirties the
+whole 4 KiB page, and that page is what the next scan copies. Widening is what makes the writer
+cover 15.8 MiB a loop, against the 15.1 MiB (462 scans, 33.5 KiB each) the scans read.
+
+nexus-6, `--gpu-descriptors true`, 40 loops, two repeats of each configuration interleaved
+(`_Build/replay-des.ps1 -Loops 40 -Repeats 2`), reports in
+`_Runtime/_Diagnostics/replay/nexus-6/runs-20260912-012758/`. Every configuration replays the same
+462 scans on the same 2.90 dirty ranges and 33.5 KiB, so only the cost moves:
+
+| writer | scans a loop | us a scan | `ms/loop gpu` | minus the writer wait | writer bytes a loop | report |
+| --- | --- | --- | --- | --- | --- | --- |
+| `none` | 462 | 3.98 / 4.06 | 78.69 / 77.50 | **78.10** | 0 | `gpudescriptors-true-replaywriter-none-run{1,2}.json` |
+| `guest` | 462 | 9.30 / 9.45 | 83.11 / 83.29 | **81.28** | 15.8 MiB | `gpudescriptors-true-replaywriter-guest-run{1,2}.json` |
+| `render` | 462 | 8.68 / 8.60 | 92.04 / 90.80 | **90.65** | 15.8 MiB | `gpudescriptors-true-replaywriter-render-run{1,2}.json` |
+| `guest` + `--replay-spin-threads 12` | 462 | 12.10 | 84.60 | **82.86** | 15.8 MiB | `runs-20260912-012958/gpudescriptors-true-replaywriter-guest-replayspinthreads-12-run1.json` |
+| the game | 399 a frame | **26.8** | 103.4 | -- | -- | `e2e-rebaseline/` |
+
+The wait subtracted is the in-frame one (1.92 ms a loop for `guest`, 0.77 ms for `render`, 1.74 ms
+with the spinners); the pre-event batch's wait, another 1.3 ms, is applied before the frame's clock
+starts and is already outside `ms/loop gpu`. `none` reproduces the phase E baseline of this capture
+(78.52 ms, 4.2 us a scan), so the flag off changes nothing.
+
+**The mechanism is real and it is not the whole of the 26.8 us.** Rewriting the bytes a scan is
+about to copy takes a replayed scan from 4.0 to 9.4 us, and the extra `ms/loop gpu` is exactly that
+difference times the scan count (462 x 5.4 us = 2.5 ms, against the 3.2 ms `guest` adds once its own
+wait is taken out), so the cost lands inside the scan and not in the harness around it. That closes
+a quarter of the 22.8 us between a replayed scan and the game's 26.8, where the 15 us mark step 0
+set would have been half of it, and 17.4 us is still unaccounted. Which core dirtied the lines
+barely matters: `render`, whose writer shares the render thread's L3, costs 8.6 us a scan against
+`guest`'s 9.4, so the cross-CCD part of the transfer is about 0.7 us of the 5.4 -- the fetch from
+*another core's* cache is what costs, not the die it is on. (`render` is nonetheless the slower loop
+by 8 ms, because its writer competes with the render and presentation threads for the same sixteen
+logical processors.) The
+spinners and the writer do stack, and more than additively: 12 spinning guest threads alone moved a
+scan by 0.6 us (above), and on top of the writer they move it by 2.7, to 12.1 us. That is consistent
+with the remaining gap being other traffic in the same memory system rather than a second
+mechanism -- but it is consistent with several other stories too, and this measurement does not
+choose between them.
+
 ### The multi-frame loop, and why K is 1 on this title
 
 `--frame-capture-frames K` and `--replay-frames M` work, and the six-frame nexus-4 is what measured

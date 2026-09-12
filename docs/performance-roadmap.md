@@ -506,7 +506,9 @@ So the three levers are **unmeasured end-to-end**, not refuted. What this run se
 game on the console session is not the 86 ms frame the replay bench and every projection in this
 document are calibrated against, and the pair has to be repeated over Remote Desktop -- or the
 console/Remote Desktop gap itself explained -- before `--gpu-indirect`, `--bda-async-protect` and
-`--gpu-submit-interval` can be turned on for Demon's Souls.
+`--gpu-submit-interval` can be turned on for Demon's Souls. (It was repeated the same day, see
+"Repeated on the unlocked console" below: the gap was the lock screen, and the repeat does price
+the three levers.)
 
 Artifacts: `_Runtime/_Diagnostics/replay/e2e-rebaseline/day-2026-09-12/` --
 `a-defaults.json` / `b-flags.json` (the samples), `*-console.log`, `*-phase.log` (the driven
@@ -514,6 +516,52 @@ protocol, timestamped), `*-after-nav.png` and `*-warm.png` (the scene), `replay-
 replay-bench sanity check). Scripts: `_Build/e2e-phase.ps1` drives one phase of a run against an
 already-running emulator, which is how these two were paced; the detached launcher of
 `_Build/scan-breakdown-run.ps1` does not survive the tool session that starts it.
+
+#### Repeated on the unlocked console, September 12, 2026
+
+The pair above was taken while the machine sat on its lock screen. Repeated a couple of hours later
+with the machine unlocked at the desk, same binary, same save, same protocol, same session type
+(`query session`: `console dudu 1 Active`, no Remote Desktop client attached), driven phase by
+phase with `_Build/e2e-phase.ps1`.
+
+**The factor of three was the lock screen, not the console session.** The opening cinematic ran at
+55 to 60 fps and reached the skip point in about 90 seconds, against 4 fps and thirteen minutes on
+the locked console; the parked Nexus then sampled at 11.73 fps, which is the 11.63 fps the
+September 11 re-baseline recorded over Remote Desktop. A locked console still advances the frame
+counter, so nothing in the protocol flagged it -- the frame rate itself is the only signal, and it
+is worth checking against the baseline before the warm-up rather than after the sample.
+
+| run | FPS | ms a frame | GPU busy | GPU power | CPU cores |
+| --- | --- | --- | --- | --- | --- |
+| A, defaults | **11.73** | 85.25 | 28.6% | 131.6 W | 12.60 |
+| B, `--gpu-indirect true --bda-async-protect true --gpu-submit-interval 16` | **11.91** | 83.93 | 33.8% | 134.9 W | 12.66 |
+
+**B wins 1.32 ms a frame, B/A = 1.016 on frame rate.** That is the right sign and about **17% of
+the 7.7 ms replay predicted** (3.2 indirect dispatch + 1.5 async protect + 3.2 periodic submits,
+86 ms down to 78). GPU busy rises 5 points and power 3 W in B with the frame only 1.3 ms shorter,
+which is the shape periodic submits are meant to produce: the same work reaching the device
+earlier and spread wider, rather than a shorter CPU frame.
+
+The flags were in effect and the runs were otherwise identical: B's console log lists the design P
+helper thread (`affinity: derived -> Thread_BdaProtect`) and A's does not, both runs warmed 300 s
+to a settled pipeline cache and closed through the window on
+`pipeline cache: saved ... (0 new pipelines)`, and the warm screenshots are the same parked Nexus
+at the archstone with no image difference.
+
+**This is one pair, not a band.** 1.32 ms is 1.6% of the frame, the replay bench's own run-to-run
+band on this scene is of that order, and neither run was repeated, so the honest reading is that
+the three levers together are worth something between nothing and about 3 ms a frame here -- far
+short of the 7.7 ms projection, and not yet enough on its own to justify turning them on by
+default for Demon's Souls. What it does settle is that the end-to-end protocol now reproduces the
+86 ms baseline the replay bench is calibrated against, so the next A/B of these levers is a
+repetition, not a re-derivation.
+
+Artifacts: `_Runtime/_Diagnostics/replay/e2e-rebaseline/day-2026-09-12-b/` --
+`a-defaults.json` / `b-flags.json` (the samples), `a-defaults.csv` / `b-flags.csv` and
+`sample-lines.txt` (the per-second raw lines), `*-console.log`, `*-phase.log` (the driven protocol,
+timestamped), `*-boot.png`, `*-after-nav.png` and `*-warm.png` (the scene). Scripts:
+`_Build/e2e-launch.ps1` starts the emulator detached and prints the pid, `_Build/e2e-phase.ps1`
+drives each phase against it.
 
 
 ### 2. Finish stage 1 of GPU-side descriptor fetch

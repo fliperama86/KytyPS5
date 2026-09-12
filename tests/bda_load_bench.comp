@@ -11,6 +11,13 @@
 //           offset and load through a PhysicalStorageBuffer pointer with an alignment of four.
 // VARIANT 2 additionally chases a three level descriptor chain through the same path before every
 //           block of loads, modelling an in-shader SRT walk.
+//
+// PATTERN 3 (chain-latency) replaces the block of independent loads with a single dependent one:
+//           the address of step i+1 is derived from the value step i loaded, so nothing overlaps
+//           and the dispatch time divided by the step count is the latency of one dependent guest
+//           read. Every lane of the group walks the same chain, which is the shape of a prologue's
+//           scalar SRT walk, and the addresses are scattered over the whole region so consecutive
+//           steps touch a different 64 byte line and a different 16 KB page.
 
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
@@ -19,7 +26,8 @@
 layout(local_size_x = 64) in;
 
 layout(constant_id = 0) const int VARIANT = 0; // 0 = bound SSBO, 1 = BDA, 2 = BDA + SRT prologue
-layout(constant_id = 1) const int PATTERN = 0; // 0 = uniform, 1 = strided, 2 = scattered
+layout(constant_id = 1) const int PATTERN = 0; // 0 = uniform, 1 = strided, 2 = scattered,
+                                               // 3 = chain-latency
 
 const uint     PAGE_BITS = 14u; // BufferCache::CACHING_PAGEBITS
 const uint64_t PAGE_MASK = (1ul << PAGE_BITS) - 1ul;
@@ -90,6 +98,8 @@ void main() {
 	uint mask    = pc.span_mask;
 	uint seed    = scatter(0x9e3779b9u, wg * 64u + lane);
 	uint acc     = 0u;
+	// chain-latency start: lane uniform, one independent chain per workgroup.
+	uint chain   = (scatter(0x12345678u, wg) << 2u) & mask;
 
 	for (uint i = 0u; i < pc.iterations; ++i) {
 		uint64_t data_base = pc.guest_base;
@@ -109,6 +119,19 @@ void main() {
 			uint d3 = load_bda_dword(vsharp + 12ul);
 			data_base = uint64_t(d0) | (uint64_t(d1 & 0xffffu) << 32);
 			acc += d2 + d3;
+		}
+
+		if (PATTERN == 3) {
+			// One load per step, and the next address depends on the value this one returns.
+			uint v;
+			if (VARIANT == 0) {
+				v = guest.dword[chain >> 2u];
+			} else {
+				v = load_bda_dword(data_base + uint64_t(chain));
+			}
+			acc  += v;
+			chain = (scatter(v, i) << 2u) & mask;
+			continue;
 		}
 
 		for (uint k = 0u; k < LOADS; ++k) {

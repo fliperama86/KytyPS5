@@ -635,6 +635,11 @@ the render thread in `EvaluateRuntimeSourcesImpl` follows the descriptor and rea
 host; the measurement above says it does not, so what is left of this item is the sync half's
 projected 5 ms a frame, and the per-event cost itself belongs to item 3.
 
+Decision state, September 12 evening: item 2 as "finish stage 1" is closed (both halves landed
+behind flags, neither pays); the frame is the 90 sync points of item 1b, and the path that removes
+them without artifacts is [sync-points-design.md](sync-points-design.md), "After the bench", built on
+the host-memory bench (docs/investigations/bda-host-memory-bench-2026-09-12.md). Awaiting a go.
+
 ### 3. Stages 2 and 3: vertex fetch in-shader, bindless images and samplers
 
 Status: designed, not started. [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Stage 2" and

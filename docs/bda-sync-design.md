@@ -170,7 +170,14 @@ milliseconds are the counts times the game's per-call cost:
 
 Then one end-to-end A/B on the same build closes the number.
 
-## Parked: A, no mirror for BDA-read pages
+## A, no mirror for BDA-read pages: benched September 12, viable for prologue reads
+
+Bench: docs/investigations/bda-host-memory-bench-2026-09-12.md. Imported host memory serves the
+prologue's descriptor and SRT reads for about 0.2 ms of GPU time a frame; it must not serve data
+reads (300 to 400x slower than the mirror). The design that follows from it, the page table
+following the tracker, is in [sync-points-design.md](sync-points-design.md), "After the bench".
+The paragraph below is the original note.
+
 
 The BDA page table points at guest memory imported with `VK_EXT_external_memory_host` instead of
 the mirror, for pages only read through BDA. No scan, no fault, no protection for those pages.

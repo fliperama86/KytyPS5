@@ -1,6 +1,7 @@
 # Removing the render thread's sync points (proposal)
 
-Status, September 12, 2026: proposal, not started. Awaiting a decision on the artifact policy.
+Status, September 12, 2026: proposal, not started. The host-memory bench (below) removes the need for
+an artifact policy; awaiting a go.
 Builds on [performance-roadmap.md](performance-roadmap.md) item 1b and
 [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md).
 
@@ -104,3 +105,41 @@ while moving is needed before shipping either as a default.
 The artifact policy: one frame of stale or previous data at first touch (A) and at binding
 transitions (B). Both are settings, default off, until a moving capture shows what they look
 like.
+
+## After the bench: the artifact-free variant
+
+`bda_load_bench` with the fixture imported from host memory
+(docs/investigations/bda-host-memory-bench-2026-09-12.md, `6274b72`): a dependent uniform load from
+imported guest memory costs about 700 ns against 280 ns from VRAM and is never cached across a
+barrier, but chains overlap almost perfectly across waves, so the prologue's reads for a whole
+frame (20,800 events, 1.14 dependent reads, 4 lines each) add about 0.2 ms of GPU time. Body
+reads (a shader streaming data) from the import are 300 to 400 times slower than from the mirror,
+so the import can serve the prologue only, never the data.
+
+That gives every mapped guest page a home the GPU can always read, and the miss policy above
+becomes unnecessary:
+
+- **The BDA page table follows the tracker.** Every mapped guest page has an entry by default
+  pointing at its imported host memory. A page the GPU owns (written through a registered
+  buffer, GPU-dirty) points at the VRAM mirror, which is where the GPU's writes are. A page the
+  CPU owns points at the import, which is where the CPU's writes are, with no upload at all. The
+  entry changes when the tracker's state changes, which is a page-table write, not a copy. The
+  400 scans a frame, the second uploads of design P and the staging traffic for BDA reads
+  disappear with the copies; buffers bound as data keep their mirror and its upload path.
+- **A shader read can never miss**, so compute programs with side effects evaluate their roots
+  in-shader with no skip policy and no one-frame-late output: a page nobody registered is simply
+  read from host memory, as the console would.
+- **The CPU stops reading GPU-written pages** for every root the shader evaluates, which is the
+  sync points of item 1b. What remains on the CPU is the image and sampler roots (piece B above,
+  now also miss-free: the shader verifies the memoed T# from memory it can always read), until
+  stage 3 makes those bindless.
+
+Needs, in order: imports at commit granularity with release before decommit
+(`Common::VirtualMemory::Commit` / `Decommit`), the default page-table entries and their
+maintenance from the tracker's state changes, the side-effect rule of stage 1 lifted, then piece
+B. Each step is measured in replay by faults a loop, wait ms a loop and the image; the first
+step alone can be judged by scans a loop going to zero with the image unchanged.
+
+Expected at the end: the 26 ms of drains gone and the BDA sync gone, replay 71 ms a loop to
+about 45, the game 86 to about 60. Effort: about a week of agent work in four measured steps.
+

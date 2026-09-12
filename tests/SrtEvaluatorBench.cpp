@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <memory>
 #include <span>
 #include <string>
@@ -81,18 +82,35 @@ struct BuiltPlan {
 	// One byte per flat slot, non-zero for a slot no descriptor source consumes.
 	std::vector<uint8_t>  body_mask;
 	std::vector<uint8_t>  all_mask;
+	// The guest table this copy chases through, wherever it lives.
+	uint32_t*             table        = nullptr;
+	size_t                table_dwords = 0;
 };
 
 // Builds a post-planning plan directly: srt_reads hold the raw loads, and descriptor dwords
 // reference them through ReadConst(GetSrtResource, slot) exactly as PlanBuilder rewrites them.
-BuiltPlan BuildPlan(const PlanShape& shape) {
+BuiltPlan BuildPlan(const PlanShape& shape, uint32_t* external = nullptr,
+                    size_t external_dwords = 0) {
 	const uint32_t descriptor_count = shape.buffers + shape.images + shape.samplers;
 	const uint32_t descriptor_dwords =
 	    shape.buffers * 4u + shape.images * 8u + shape.samplers * 4u;
 	const uint32_t dword_total = descriptor_dwords + shape.body_slots;
 
-	BuiltPlan built;
-	built.memory = std::make_unique<SrtMemory>(static_cast<size_t>(dword_total) * 4u + 64u);
+	BuiltPlan    built;
+	const size_t table_dwords = static_cast<size_t>(dword_total) * 4u + 64u;
+	// A cold run places every copy's table inside one large image; otherwise each plan owns its
+	// own small allocation, which is what the hot measurement wants.
+	if (external != nullptr) {
+		Check(external_dwords >= table_dwords, "external guest image slice is too small");
+		built.table = external;
+		for (size_t index = 0; index < table_dwords; index++) {
+			built.table[index] = static_cast<uint32_t>(0x1000u + index * 4u);
+		}
+	} else {
+		built.memory = std::make_unique<SrtMemory>(table_dwords);
+		built.table  = built.memory->words.data();
+	}
+	built.table_dwords = table_dwords;
 
 	Program program;
 	program.stage                     = Libs::Graphics::ShaderType::Pixel;
@@ -218,13 +236,13 @@ BuiltPlan BuildPlan(const PlanShape& shape) {
 		built.sources[index] = index;
 	}
 
-	const auto base = built.memory->Base();
+	const auto base = reinterpret_cast<uint64_t>(built.table);
 	built.user_data.assign(16, 0u);
 	built.user_data[0] = static_cast<uint32_t>(base);
 	built.user_data[1] = static_cast<uint32_t>(base >> 32u);
 	// Second-level tables point back into the same allocation.
-	built.memory->words[pointer_offset / 4u]      = static_cast<uint32_t>(base);
-	built.memory->words[pointer_offset / 4u + 1u] = static_cast<uint32_t>(base >> 32u);
+	built.table[pointer_offset / 4u]      = static_cast<uint32_t>(base);
+	built.table[pointer_offset / 4u + 1u] = static_cast<uint32_t>(base >> 32u);
 	return built;
 }
 
@@ -280,6 +298,153 @@ Result Measure(BuiltPlan& built, uint64_t iterations, bool use_flat,
 	return result;
 }
 
+// Cold-locality machinery (docs/gpu-descriptor-fetch.md, "Where the evaluator's 1.5 us goes").
+// The hot measurement above keeps one plan and one small table, so every line it touches is in L1
+// after the first iteration. The renderer never does: 493 plans and their guest tables are cycled
+// across a loop, with the whole rest of the render thread between two evaluations of the same
+// shader. These helpers reproduce the two halves of that separately -- plan data and guest table --
+// so the cost can be attributed instead of guessed.
+
+constexpr size_t CacheLine = 64;
+
+void FlushRange(const void* data, size_t bytes) {
+	if (data == nullptr || bytes == 0) {
+		return;
+	}
+	auto       address = reinterpret_cast<uintptr_t>(data) & ~uintptr_t {CacheLine - 1};
+	const auto end     = reinterpret_cast<uintptr_t>(data) + bytes;
+	for (; address < end; address += CacheLine) {
+		_mm_clflush(reinterpret_cast<const void*>(address));
+	}
+}
+
+// Everything an evaluation reads out of the plan: the compiled program, the roots it walks and the
+// plan fields the entry points check.
+void FlushPlan(const BuiltPlan& built) {
+	const auto& plan = built.plan;
+	const auto& flat = plan.flat;
+	FlushRange(&plan, sizeof(ResourcePlan));
+	FlushRange(&built, sizeof(BuiltPlan));
+	FlushRange(flat.insts.data(), flat.insts.size() * sizeof(SrtFlatInst));
+	FlushRange(flat.schedule.data(), flat.schedule.size() * sizeof(uint32_t));
+	FlushRange(flat.sources.data(), flat.sources.size() * sizeof(SrtFlatSourceRoot));
+	FlushRange(flat.flat_reads.data(), flat.flat_reads.size() * sizeof(SrtFlatValueRoot));
+	FlushRange(plan.srt_reads.data(), plan.srt_reads.size() * sizeof(SrtRead));
+	FlushRange(plan.clean_flat_slots.data(), plan.clean_flat_slots.size());
+	FlushRange(plan.descriptor_sources.data(),
+	           plan.descriptor_sources.size() * sizeof(DescriptorSource));
+	FlushRange(built.sources.data(), built.sources.size() * sizeof(uint32_t));
+	FlushRange(built.user_data.data(), built.user_data.size() * sizeof(uint32_t));
+}
+
+void FlushGuest(const BuiltPlan& built) {
+	FlushRange(built.table, built.table_dwords * sizeof(uint32_t));
+}
+
+enum FlushKind : uint32_t {
+	FlushNone  = 0,
+	FlushPlanOnly  = 1,
+	FlushGuestOnly = 2,
+	FlushBoth      = 3,
+};
+
+// Bytes of plan and guest table one evaluation can touch, for the footprint column.
+size_t PlanBytes(const BuiltPlan& built) {
+	const auto& flat = built.plan.flat;
+	return sizeof(ResourcePlan) + flat.insts.size() * sizeof(SrtFlatInst) +
+	       flat.schedule.size() * sizeof(uint32_t) +
+	       flat.sources.size() * sizeof(SrtFlatSourceRoot) +
+	       flat.flat_reads.size() * sizeof(SrtFlatValueRoot) +
+	       built.plan.srt_reads.size() * sizeof(SrtRead) +
+	       built.plan.descriptor_sources.size() * sizeof(DescriptorSource);
+}
+
+// One guest image, one plan copy per page-aligned slice of it.
+struct ColdSet {
+	std::vector<uint32_t>  image;
+	std::vector<BuiltPlan> plans;
+};
+
+ColdSet BuildColdSet(const PlanShape& shape, size_t copies, size_t stride_bytes) {
+	ColdSet      set;
+	const size_t stride = stride_bytes / sizeof(uint32_t);
+	set.image.assign(stride * copies + 1024u, 0u);
+	set.plans.reserve(copies);
+	for (size_t index = 0; index < copies; index++) {
+		set.plans.push_back(BuildPlan(shape, set.image.data() + index * stride, stride));
+	}
+	return set;
+}
+
+// Cycles the copies in a pseudo-random order so consecutive evaluations touch unrelated lines and
+// no prefetcher can follow. skip_eval runs the same cycle and the same flushes without the
+// evaluation, which is the baseline the flushed rows subtract.
+Result MeasureCycle(std::vector<BuiltPlan>& plans, uint64_t iterations, bool fresh_vectors,
+                    uint32_t flush, bool skip_eval = false) {
+	std::vector<DescriptorValue> results;
+	std::vector<uint32_t>        flat;
+	std::vector<uint8_t>         active;
+	uint64_t                     checksum = 0;
+	uint64_t                     state    = 0x243f6a8885a308d3ull;
+
+	const auto evaluate = [&](BuiltPlan& built, std::vector<DescriptorValue>& r,
+	                          std::vector<uint32_t>& f, std::vector<uint8_t>& a) {
+		const SrtRuntime runtime {
+		    .user_data   = built.user_data,
+		    .shader_base = 0,
+		    .read_memory = nullptr,
+		};
+		if (!EvaluateRuntimeSources(built.plan, built.sources, runtime, r, f,
+		                            built.plan.clean_flat_slots, a)) {
+			Check(false, "evaluation failed");
+		}
+		checksum += r.empty() ? 0u : r.front().dwords[0];
+		checksum += f.empty() ? 0u : f.back();
+	};
+	for (auto& built: plans) {
+		built.plan.flat.compiled = true;
+		evaluate(built, results, flat, active);
+	}
+
+	const auto start = std::chrono::steady_clock::now();
+	for (uint64_t index = 0; index < iterations; index++) {
+		state       = state * 6364136223846793005ull + 1442695040888963407ull;
+		auto& built = plans[(state >> 33u) % plans.size()];
+		if (flush != FlushNone) {
+			if ((flush & FlushPlanOnly) != 0u) {
+				FlushPlan(built);
+			}
+			if ((flush & FlushGuestOnly) != 0u) {
+				FlushGuest(built);
+			}
+			_mm_mfence();
+		}
+		if (skip_eval) {
+			checksum += built.user_data[0];
+			continue;
+		}
+		if (fresh_vectors) {
+			// What the renderer does: MaterializeSnapshot declares these three per call, so the
+			// evaluator's scratch is handed empty buffers and reallocates every time.
+			std::vector<DescriptorValue> local_results;
+			std::vector<uint32_t>        local_flat;
+			std::vector<uint8_t>         local_active;
+			evaluate(built, local_results, local_flat, local_active);
+		} else {
+			evaluate(built, results, flat, active);
+		}
+	}
+	const auto elapsed = std::chrono::steady_clock::now() - start;
+
+	Result result;
+	result.calls       = iterations;
+	result.ns_per_call = static_cast<double>(
+	                         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()) /
+	                     static_cast<double>(iterations);
+	result.checksum = checksum;
+	return result;
+}
+
 const PlanShape Shapes[] = {
     {.name = "small-vs", .buffers = 2, .images = 0, .samplers = 0, .arithmetic_ops = 1},
     {.name = "typical-ps",
@@ -318,6 +483,15 @@ const PlanShape Shapes[] = {
      .samplers       = 1,
      .arithmetic_ops = 1,
      .body_slots     = 13},
+    // The same mix with no address arithmetic, which is what the dump's flat programs actually
+    // are: 23.7 instructions an event of which 21.5 are reads, so the operands are a shared
+    // user-data pair and the reads hang straight off it.
+    {.name           = "nexus-flat",
+     .buffers        = 2,
+     .images         = 0,
+     .samplers       = 1,
+     .arithmetic_ops = 0,
+     .body_slots     = 9},
 };
 
 } // namespace
@@ -335,26 +509,84 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main(int argc, char** argv) {
+	uint64_t    checksum   = 0;
 	uint64_t    iterations = 200000;
 	std::string only;
-	bool        sweep = false;
+	bool        sweep  = false;
+	bool        cold   = false;
+	size_t      copies = 512;
 	for (int index = 1; index < argc; index++) {
 		const std::string arg = argv[index];
 		if (arg.rfind("--iterations=", 0) == 0) {
 			iterations = std::strtoull(arg.c_str() + 13, nullptr, 10);
 		} else if (arg.rfind("--only=", 0) == 0) {
 			only = arg.substr(7);
+		} else if (arg.rfind("--copies=", 0) == 0) {
+			copies = std::strtoull(arg.c_str() + 9, nullptr, 10);
 		} else if (arg == "--sweep") {
 			sweep = true;
+		} else if (arg == "--cold") {
+			cold = true;
 		} else {
-			std::fprintf(
-			    stderr,
-			    "usage: srt_evaluator_bench [--iterations=N] [--only=NAME] [--sweep]\n");
+			std::fprintf(stderr, "usage: srt_evaluator_bench [--iterations=N] [--only=NAME] "
+			                     "[--sweep] [--cold] [--copies=N]\n");
 			return 2;
 		}
 	}
 
-	uint64_t checksum = 0;
+	if (cold) {
+		// Where the per-call cost goes once the data is not in L1. Every row is the same
+		// evaluation; only the locality of the plan and of the guest table changes. The flushed
+		// columns subtract a baseline loop that performs the same flushes and no evaluation.
+		std::printf("%-12s %7s %6s %6s %9s %9s %9s %9s %9s %9s %9s %9s\n", "shape", "copies",
+		            "insts", "reads", "plan_KB", "cycle_MB", "hot_ns", "fresh_ns", "cycle_ns",
+		            "coldplan", "coldguest", "coldboth");
+		for (const auto& shape: Shapes) {
+			if (!only.empty() && only != shape.name) {
+				continue;
+			}
+			// One copy and one small table: everything stays in L1 between iterations.
+			auto       one   = BuildColdSet(shape, 1, 4096);
+			const auto hot   = MeasureCycle(one.plans, iterations, false, FlushNone);
+			const auto fresh = MeasureCycle(one.plans, iterations, true, FlushNone);
+			const auto insts = one.plans.front().plan.flat.insts.size();
+			uint32_t   reads = 0;
+			for (const auto& inst: one.plans.front().plan.flat.insts) {
+				if (inst.op == SrtFlatOp::ReadAddress || inst.op == SrtFlatOp::ReadBuffer) {
+					reads++;
+				}
+			}
+			const auto plan_bytes = PlanBytes(one.plans.front());
+
+			auto       many  = BuildColdSet(shape, copies, 4096);
+			const auto cycle = MeasureCycle(many.plans, iterations, false, FlushNone);
+			// A short cycle is enough once every line is flushed, and it keeps the flush cost
+			// predictable; the baseline pays the same flushes without evaluating.
+			auto       few        = BuildColdSet(shape, 64, 4096);
+			const auto base_plan  = MeasureCycle(few.plans, iterations, false, FlushPlanOnly, true);
+			const auto cold_plan  = MeasureCycle(few.plans, iterations, false, FlushPlanOnly);
+			const auto base_guest = MeasureCycle(few.plans, iterations, false, FlushGuestOnly, true);
+			const auto cold_guest = MeasureCycle(few.plans, iterations, false, FlushGuestOnly);
+			const auto base_both  = MeasureCycle(few.plans, iterations, false, FlushBoth, true);
+			const auto cold_both  = MeasureCycle(few.plans, iterations, false, FlushBoth);
+			checksum += hot.checksum + fresh.checksum + cycle.checksum + cold_plan.checksum +
+			            cold_guest.checksum + cold_both.checksum;
+			std::printf("%-12s %7zu %6zu %6u %9.2f %9.2f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f\n",
+			            shape.name, copies, insts, reads,
+			            static_cast<double>(plan_bytes) / 1024.0,
+			            static_cast<double>(copies) *
+			                (static_cast<double>(plan_bytes) + 4096.0) / (1024.0 * 1024.0),
+			            hot.ns_per_call, fresh.ns_per_call, cycle.ns_per_call,
+			            cold_plan.ns_per_call - base_plan.ns_per_call,
+			            cold_guest.ns_per_call - base_guest.ns_per_call,
+			            cold_both.ns_per_call - base_both.ns_per_call);
+			std::printf("%-12s flush-only baselines: plan %.1f ns, guest %.1f ns, both %.1f ns\n",
+			            "", base_plan.ns_per_call, base_guest.ns_per_call, base_both.ns_per_call);
+		}
+		std::printf("checksum %llu\n", static_cast<unsigned long long>(checksum));
+		return 0;
+	}
+
 	if (sweep) {
 		// Varying the per-slot instruction count separates the fixed per-slot cost (the guest read
 		// plus the memo and descriptor stores) from the marginal cost of one more IR instruction.

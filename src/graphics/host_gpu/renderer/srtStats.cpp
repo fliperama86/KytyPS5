@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
 #include <array>
@@ -235,6 +236,25 @@ void AppendHistogram(std::string& out, const char* name, const std::map<uint32_t
 	out += fmt::format("}}{}\n", suffix);
 }
 
+// The chase histograms are fixed-size arrays whose last bin is a catch-all; empty bins are
+// dropped so the JSON stays readable.
+void AppendChaseHistogram(std::string& out, const char* name,
+                          const std::array<uint64_t, ShaderRecompiler::IR::SrtChaseStats::Bins>&
+                              bins,
+                          const char* suffix) {
+	out += fmt::format("\t\t\t\"{}\": {{", name);
+	bool first = true;
+	for (size_t bin = 0; bin < bins.size(); bin++) {
+		if (bins[bin] == 0) {
+			continue;
+		}
+		out += fmt::format("{}\"{}{}\": {}", first ? "" : ", ",
+		                   bin + 1 == bins.size() ? ">=" : "", bin, bins[bin]);
+		first = false;
+	}
+	out += fmt::format("}}{}\n", suffix);
+}
+
 // One console line per WriteIntervalFrames frames with the GPU-side descriptor fetch counters:
 // the run so far, then the window since the previous line. Caller holds the collector mutex.
 void PrintGpuDescriptorsLocked(Collector& collector) {
@@ -345,6 +365,27 @@ void WriteLocked(Collector& collector) {
 	out += fmt::format("\t\t\"gpu_read_programs\": {},\n", gpu.read_programs);
 	out += fmt::format("\t\t\"gpu_read_slots_shader\": {},\n", gpu.read_slots_shader);
 	out += fmt::format("\t\t\"gpu_read_slots_cpu\": {},\n", gpu.read_slots_cpu);
+	const auto chase = ShaderRecompiler::IR::CollectSrtChaseStats();
+	if (chase.events != 0 || chase.walker_events != 0) {
+		const auto events = static_cast<double>(chase.events == 0 ? 1 : chase.events);
+		out += "\t\t\"srt_chase\": {\n";
+		out += fmt::format("\t\t\t\"events\": {},\n", chase.events);
+		out += fmt::format("\t\t\t\"walker_events\": {},\n", chase.walker_events);
+		out += fmt::format("\t\t\t\"reads\": {},\n", chase.reads);
+		out += fmt::format("\t\t\t\"reads_per_event\": {:.3f},\n",
+		                   static_cast<double>(chase.reads) / events);
+		out += fmt::format("\t\t\t\"depth_per_event\": {:.3f},\n",
+		                   static_cast<double>(chase.depth_sum) / events);
+		out += fmt::format("\t\t\t\"lines_per_event\": {:.3f},\n",
+		                   static_cast<double>(chase.lines_sum) / events);
+		out += fmt::format("\t\t\t\"pages_per_event\": {:.3f},\n",
+		                   static_cast<double>(chase.pages_sum) / events);
+		out += fmt::format("\t\t\t\"distinct_pages\": {},\n", chase.distinct_pages);
+		AppendChaseHistogram(out, "depth_histogram", chase.depth_histogram, ",");
+		AppendChaseHistogram(out, "reads_histogram", chase.reads_histogram, ",");
+		AppendChaseHistogram(out, "lines_histogram", chase.lines_histogram, "");
+		out += "\t\t},\n";
+	}
 	AppendHistogram(out, "sources_per_event_histogram", collector.sources_histogram, ",");
 	AppendHistogram(out, "distinct_buffer_layouts_histogram", buffer_layout_histogram, ",");
 	AppendHistogram(out, "distinct_vertex_layouts_histogram", vertex_layout_histogram, ",");
@@ -387,9 +428,19 @@ void WriteLocked(Collector& collector) {
 
 } // namespace
 
+namespace {
+// The evaluator's own chase counters live in the recompiler, which the collector cannot reach
+// from a header; turn them on with the rest of the collector.
+bool ReadEnabledAndArm() {
+	const bool on = ReadEnabled();
+	ShaderRecompiler::IR::EnableSrtChaseStats(on);
+	return on;
+}
+} // namespace
+
 namespace Detail {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-bool enabled = ReadEnabled();
+bool enabled = ReadEnabledAndArm();
 } // namespace Detail
 
 void BeginEvent(bool dispatch) {

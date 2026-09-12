@@ -128,6 +128,31 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
              std::vector<uint32_t>& flat);
 
+// Diagnostic counters for the guest-memory chase the runtime evaluation performs, collected only
+// while EnableSrtChaseStats(true) is in force (KYTY_DEBUG_SRT_STATS turns it on and folds the
+// result into the renderer's JSON dump). "Depth" is the longest chain of reads inside one
+// evaluation whose address depends on a previous read of the same evaluation, which is what a
+// memory-latency bound would be paid for; "lines" and "pages" count the distinct 64-byte lines and
+// 4 KiB pages the evaluation read.
+struct SrtChaseStats {
+	static constexpr size_t Bins = 33; // the last bin holds everything at or above Bins - 1
+
+	uint64_t events         = 0; // evaluations that ran the compiled flat program
+	uint64_t walker_events  = 0; // evaluations that fell back to the IR walker
+	uint64_t reads          = 0; // guest reads executed
+	uint64_t depth_sum      = 0; // dependent depth, summed over events
+	uint64_t lines_sum      = 0; // distinct lines read, summed over events
+	uint64_t pages_sum      = 0; // distinct pages read, summed over events
+	uint64_t distinct_pages = 0; // distinct pages over the whole run
+	std::array<uint64_t, Bins> depth_histogram {};
+	std::array<uint64_t, Bins> reads_histogram {};
+	std::array<uint64_t, Bins> lines_histogram {};
+};
+
+void                          EnableSrtChaseStats(bool enabled);
+[[nodiscard]] bool            SrtChaseStatsEnabled();
+[[nodiscard]] SrtChaseStats   CollectSrtChaseStats();
+
 // Lowers the plan's runtime values into ResourcePlan::flat. Call once the plan is final: every
 // descriptor source, SRT read, control-flow condition and uniform-fill value is compiled against
 // the plan's current shape, and evaluation falls back to the IR walker if that shape changes.

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cmath>
@@ -15,6 +16,7 @@
 #include <fmt/format.h>
 #include <initializer_list>
 #include <memory_resource>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -28,6 +30,85 @@ constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 SrtFailure& ThreadFailure() {
 	static thread_local SrtFailure failure;
 	return failure;
+}
+
+// KYTY_DEBUG_SRT_STATS: the guest-memory chase, counted where it happens. The flag is read once
+// per evaluation; everything below is inert while it is false, which is every shipping run.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> g_chase_enabled {false};
+
+struct ChaseCollector {
+	std::mutex                   mutex;
+	SrtChaseStats                stats;
+	std::unordered_set<uint64_t> pages;
+};
+
+ChaseCollector& Chase() {
+	static ChaseCollector collector;
+	return collector;
+}
+
+// One evaluation's worth of chase state. Small fixed arrays: an event reads about 21 dwords out of
+// two or three lines, and anything past the arrays is counted but not deduplicated.
+struct ChaseEvent {
+	static constexpr uint32_t MaxLines = 48;
+	static constexpr uint32_t MaxPages = 16;
+
+	uint32_t reads      = 0;
+	uint32_t depth      = 0;
+	uint32_t line_count = 0;
+	uint32_t page_count = 0;
+	std::array<uint64_t, MaxLines> lines {};
+	std::array<uint64_t, MaxPages> pages {};
+
+	static void AddUnique(uint64_t* values, uint32_t& count, uint32_t capacity, uint64_t value) {
+		for (uint32_t index = 0; index < count && index < capacity; index++) {
+			if (values[index] == value) {
+				return;
+			}
+		}
+		if (count < capacity) {
+			values[count] = value;
+		}
+		count++;
+	}
+
+	void Read(uint64_t address) {
+		reads++;
+		AddUnique(lines.data(), line_count, MaxLines, address >> 6u);
+		AddUnique(pages.data(), page_count, MaxPages, address >> 12u);
+	}
+
+	void Flush() {
+		auto& chase = Chase();
+		const std::lock_guard<std::mutex> lock(chase.mutex);
+		auto&                             stats = chase.stats;
+		constexpr uint32_t                last  = SrtChaseStats::Bins - 1;
+		stats.events++;
+		stats.reads += reads;
+		stats.depth_sum += depth;
+		stats.lines_sum += line_count;
+		stats.pages_sum += page_count;
+		stats.depth_histogram[std::min(depth, last)]++;
+		stats.reads_histogram[std::min(reads, last)]++;
+		stats.lines_histogram[std::min(line_count, last)]++;
+		for (uint32_t index = 0; index < page_count && index < MaxPages; index++) {
+			chase.pages.insert(pages[index]);
+		}
+	}
+};
+
+// Per thread rather than per machine: the counters are off in every shipping run, and a member
+// would put half a kilobyte of zero-initialised arrays on the stack of every evaluation.
+ChaseEvent& ThreadChase() {
+	static thread_local ChaseEvent event;
+	return event;
+}
+
+void RecordWalkerEvent() {
+	auto& chase = Chase();
+	const std::lock_guard<std::mutex> lock(chase.mutex);
+	chase.stats.walker_events++;
 }
 
 const char* SrtFlatOpName(SrtFlatOp op) {
@@ -1708,6 +1789,8 @@ private:
 struct FlatRegisters {
 	std::vector<uint64_t> values;
 	std::vector<uint64_t> stamps;
+	// Dependent-read depth per register, sized and written only while the chase stats are on.
+	std::vector<uint32_t> depths;
 	uint64_t              epoch  = 0;
 	bool                  in_use = false;
 
@@ -1730,6 +1813,22 @@ public:
 		m_epoch  = ++registers.epoch;
 		m_values = registers.values.data();
 		m_stamps = registers.stamps.data();
+		if (g_chase_enabled.load(std::memory_order_relaxed)) {
+			if (registers.depths.size() < count) {
+				registers.depths.resize(count);
+			}
+			m_depths = registers.depths.data();
+			m_chase  = &ThreadChase();
+			*m_chase = {};
+		}
+	}
+
+	// Folds this evaluation's chase into the collector. Called once per runtime evaluation, never
+	// from the uniform-value path, so one call is one stage event.
+	void FlushChase() {
+		if (m_chase != nullptr) {
+			m_chase->Flush();
+		}
 	}
 
 	[[nodiscard]] uint32_t Result(uint32_t reg) const { return static_cast<uint32_t>(m_values[reg]); }
@@ -1742,6 +1841,9 @@ public:
 			return false;
 		}
 		const auto* schedule = m_program.schedule.data() + root.first;
+		// Hoisted so the shipping configuration pays one predicted branch an instruction and no
+		// reload of the pointer.
+		ChaseEvent* const chase = m_chase;
 		for (uint32_t step = 0; step < root.count; step++) {
 			const auto index = schedule[step];
 			if (m_stamps[index] == m_epoch) {
@@ -1755,6 +1857,9 @@ public:
 			}
 			m_values[index] = result;
 			m_stamps[index] = m_epoch;
+			if (chase != nullptr) {
+				RecordChase(*chase, index);
+			}
 		}
 		return true;
 	}
@@ -1765,6 +1870,26 @@ private:
 	}
 
 	static uint64_t Float32Bits(float value) { return std::bit_cast<uint32_t>(value); }
+
+	// Dependent depth of one executed instruction: the deepest of its operands, plus one when the
+	// instruction is itself a read. Operands are always produced earlier in the same epoch, so their
+	// depth is already final. Only runs while the chase stats are on.
+	void RecordChase(ChaseEvent& chase, uint32_t index) {
+		const auto& inst  = m_program.insts[index];
+		uint32_t    depth = 0;
+		for (uint32_t arg = 0; arg < inst.arg_count && arg < SrtFlatInst::MaxArgs; arg++) {
+			const auto reg = inst.args[arg];
+			if (reg < m_program.insts.size() && m_stamps[reg] == m_epoch) {
+				depth = std::max(depth, m_depths[reg]);
+			}
+		}
+		if (m_address_valid) { // set by Read() alone
+			depth++;
+			chase.Read(m_address);
+		}
+		m_depths[index] = depth;
+		chase.depth     = std::max(chase.depth, depth);
+	}
 
 	bool Read(const SrtFlatInst& inst, uint64_t address, uint64_t& result) const {
 		// Kept for the failure record; overwritten on every read and never looked at on success.
@@ -2115,7 +2240,10 @@ private:
 	const SrtRuntime&     m_runtime;
 	uint64_t*             m_values = nullptr;
 	uint64_t*             m_stamps = nullptr;
+	uint32_t*             m_depths = nullptr;
 	uint64_t              m_epoch  = 0;
+	// Null unless the chase counters are on.
+	ChaseEvent*           m_chase  = nullptr;
 	// Address of the most recent read attempt, cleared before every instruction.
 	mutable uint64_t m_address       = 0;
 	mutable bool     m_address_valid = false;
@@ -2176,6 +2304,12 @@ bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> s
                         std::span<const uint8_t> clean_flat_slots,
                         std::span<const uint8_t> skip_sources,
                         std::span<const uint8_t> skip_flat_slots, SourceScratch& scratch) {
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_BLOCK("SrtEval::Walker");
+#endif
+	if (g_chase_enabled.load(std::memory_order_relaxed)) {
+		RecordWalkerEvent();
+	}
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
 	std::array<std::byte, 4096> evaluator_storage;
@@ -2272,6 +2406,11 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
                              std::span<const uint8_t> clean_flat_slots,
                              std::span<const uint8_t> skip_sources,
                              std::span<const uint8_t> skip_flat_slots, SourceScratch& scratch) {
+#if defined(TRACY_ENABLE)
+	// Split so the fixed per-call work is separable from the flat program's own execution
+	// (docs/gpu-descriptor-fetch.md, "Where the evaluator's 1.5 us goes").
+	KYTY_PROFILER_BLOCK("SrtEval::Prepare");
+#endif
 	const auto&        flat = program.flat;
 	FlatRegistersLease lease;
 	FlatMachine        machine(flat, runtime, lease.registers);
@@ -2313,52 +2452,66 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
 			}
 		}
 	}
-	auto& evaluated = scratch.evaluated;
-	evaluated.clear();
-	evaluated.reserve(sources.size());
-	for (const auto source_index: sources) {
-		const auto* source = Source(program, source_index);
-		if (source == nullptr) {
-			return false;
-		}
-		DescriptorValue value;
-		value.dword_count = source->dword_count;
-		// A source the shader evaluates itself (gpu_fetch) is left zeroed.
-		const bool skipped =
-		    source_index < skip_sources.size() && skip_sources[source_index] != 0u;
-		if (!skipped && (!evaluate_flat || active[source_index])) {
-			const auto& root = flat.sources[source_index];
-			if (!machine.Run(root)) {
-				TagFailure("source", source_index, true);
+#if defined(TRACY_ENABLE)
+	KYTY_PROFILER_END_BLOCK;
+#endif
+	{
+#if defined(TRACY_ENABLE)
+		KYTY_PROFILER_BLOCK("SrtEval::Sources");
+#endif
+		auto& evaluated = scratch.evaluated;
+		evaluated.clear();
+		evaluated.reserve(sources.size());
+		for (const auto source_index: sources) {
+			const auto* source = Source(program, source_index);
+			if (source == nullptr) {
 				return false;
 			}
-			for (uint32_t index = 0; index < source->dword_count; index++) {
-				value.dwords[index] = machine.Result(root.results[index]);
+			DescriptorValue value;
+			value.dword_count = source->dword_count;
+			// A source the shader evaluates itself (gpu_fetch) is left zeroed.
+			const bool skipped =
+			    source_index < skip_sources.size() && skip_sources[source_index] != 0u;
+			if (!skipped && (!evaluate_flat || active[source_index])) {
+				const auto& root = flat.sources[source_index];
+				if (!machine.Run(root)) {
+					TagFailure("source", source_index, true);
+					return false;
+				}
+				for (uint32_t index = 0; index < source->dword_count; index++) {
+					value.dwords[index] = machine.Result(root.results[index]);
+				}
 			}
-		}
-		evaluated.push_back(value);
-	}
-	auto& flattened = scratch.flattened;
-	flattened.clear();
-	if (evaluate_flat) {
-		flattened.resize(program.srt_reads.size());
-		for (size_t index = 0; index < program.srt_reads.size(); index++) {
-			const auto& read = program.srt_reads[index];
-			// A slot the shader evaluates itself is left zeroed; nothing on the host reads it.
-			if (read.flat_offset < skip_flat_slots.size() &&
-			    skip_flat_slots[read.flat_offset] != 0u) {
-				continue;
-			}
-			const bool  clean = read.flat_offset < clean_flat_slots.size() &&
-			                   clean_flat_slots[read.flat_offset] != 0u;
-			const auto& root = clean ? flat.clean_flat_reads[index] : flat.flat_reads[index];
-			if (read.flat_offset >= flattened.size() || !machine.Run(root)) {
-				TagFailure("flat-read", static_cast<uint32_t>(index), true);
-				return false;
-			}
-			flattened[read.flat_offset] = machine.Result(root.result);
+			evaluated.push_back(value);
 		}
 	}
+	{
+#if defined(TRACY_ENABLE)
+		KYTY_PROFILER_BLOCK("SrtEval::Slots");
+#endif
+		auto& flattened = scratch.flattened;
+		flattened.clear();
+		if (evaluate_flat) {
+			flattened.resize(program.srt_reads.size());
+			for (size_t index = 0; index < program.srt_reads.size(); index++) {
+				const auto& read = program.srt_reads[index];
+				// A slot the shader evaluates itself is left zeroed; nothing on the host reads it.
+				if (read.flat_offset < skip_flat_slots.size() &&
+				    skip_flat_slots[read.flat_offset] != 0u) {
+					continue;
+				}
+				const bool  clean = read.flat_offset < clean_flat_slots.size() &&
+				                   clean_flat_slots[read.flat_offset] != 0u;
+				const auto& root = clean ? flat.clean_flat_reads[index] : flat.flat_reads[index];
+				if (read.flat_offset >= flattened.size() || !machine.Run(root)) {
+					TagFailure("flat-read", static_cast<uint32_t>(index), true);
+					return false;
+				}
+				flattened[read.flat_offset] = machine.Result(root.result);
+			}
+		}
+	}
+	machine.FlushChase();
 	return true;
 }
 
@@ -2372,41 +2525,52 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 #if defined(TRACY_ENABLE)
 	KYTY_PROFILER_BLOCK("EvaluateRuntimeSourcesImpl");
 #endif
-	if (!program.srt_plan_complete) {
-		TagFailure("plan-incomplete", UINT32_MAX, false);
-		return false;
-	}
-	if (runtime.read_specialization_memory == nullptr &&
-	    std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; })) {
-		TagFailure("no-clean-reader", UINT32_MAX, false);
-		return false;
-	}
 	// Nested use cannot happen today (materialization calls this sequentially), but fall back to
 	// local buffers rather than aliasing the scratch if that ever changes.
 	static thread_local SourceScratch thread_scratch;
 	SourceScratch                     local_scratch;
 	const bool     reuse   = !thread_scratch.in_use;
 	SourceScratch& scratch = reuse ? thread_scratch : local_scratch;
-	scratch.in_use         = true;
+	bool           usable  = false;
+	{
+#if defined(TRACY_ENABLE)
+		KYTY_PROFILER_BLOCK("SrtEval::Setup");
+#endif
+		if (!program.srt_plan_complete) {
+			TagFailure("plan-incomplete", UINT32_MAX, false);
+			return false;
+		}
+		if (runtime.read_specialization_memory == nullptr &&
+		    std::ranges::any_of(clean_flat_slots, [](uint8_t clean) { return clean != 0u; })) {
+			TagFailure("no-clean-reader", UINT32_MAX, false);
+			return false;
+		}
+		scratch.in_use = true;
+		usable         = FlatPlanUsable(program, clean_flat_slots);
+	}
 	const struct ScratchGuard {
 		SourceScratch& owned;
 		~ScratchGuard() { owned.in_use = false; }
 	} guard {scratch};
 
 	const bool evaluated =
-	    FlatPlanUsable(program, clean_flat_slots)
-	        ? EvaluateWithFlatProgram(program, sources, runtime, evaluate_flat, clean_flat_slots,
-                                  skip_sources, skip_flat_slots, scratch)
-	        : EvaluateWithWalker(program, sources, runtime, evaluate_flat, clean_flat_slots,
-                             skip_sources, skip_flat_slots, scratch);
+	    usable ? EvaluateWithFlatProgram(program, sources, runtime, evaluate_flat, clean_flat_slots,
+                                     skip_sources, skip_flat_slots, scratch)
+	           : EvaluateWithWalker(program, sources, runtime, evaluate_flat, clean_flat_slots,
+                                skip_sources, skip_flat_slots, scratch);
 	if (!evaluated) {
 		return false;
 	}
-	// Swapping rather than moving keeps the caller's old buffers alive in the scratch for reuse.
-	results.swap(scratch.evaluated);
-	active_sources.swap(scratch.active);
-	if (evaluate_flat) {
-		flat.swap(scratch.flattened);
+	{
+#if defined(TRACY_ENABLE)
+		KYTY_PROFILER_BLOCK("SrtEval::Writeback");
+#endif
+		// Swapping rather than moving keeps the caller's old buffers alive in the scratch for reuse.
+		results.swap(scratch.evaluated);
+		active_sources.swap(scratch.active);
+		if (evaluate_flat) {
+			flat.swap(scratch.flattened);
+		}
 	}
 	return true;
 }
@@ -2427,6 +2591,22 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 
 const SrtFailure& LastSrtFailure() {
 	return ThreadFailure();
+}
+
+void EnableSrtChaseStats(bool enabled) {
+	g_chase_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool SrtChaseStatsEnabled() {
+	return g_chase_enabled.load(std::memory_order_relaxed);
+}
+
+SrtChaseStats CollectSrtChaseStats() {
+	auto&                             chase = Chase();
+	const std::lock_guard<std::mutex> lock(chase.mutex);
+	SrtChaseStats                     stats = chase.stats;
+	stats.distinct_pages                    = chase.pages.size();
+	return stats;
 }
 
 std::string FormatSrtFailure(const SrtFailure& failure) {

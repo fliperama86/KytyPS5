@@ -413,6 +413,16 @@ virtual vblank, so at the default 60 Hz every `ms/loop` is quantised to 16.7 ms)
 the last presented frame of the first repeat of each configuration next to the reports),
 `-OutputRoot`, `-Exe`.
 
+`-ExtraArgs` appends flags to **every** run, whatever the configuration, so a knob that must not
+differ between the sides of a comparison is set once: `-ExtraArgs '--replay-timeout
+3600000'` is the usual one, because the warm-up loop compiles every pipeline the frame touches and
+the watchdog that calls the GPU thread hung is 600 s by default.
+
+A replay has no title, so the driver pipeline cache used to be disabled in it and every run
+recompiled every pipeline from scratch. It is now keyed on the capture directory
+(`_Runtime/_PipelineCache/replay-<capture>.bin`), so the first run of a build pays the compiles and
+the ones after it start warm. Only the warm-up loop is affected, and the statistics exclude it.
+
 `_Build/replay-image-compare.py` turns a `--replay-image` dump into a PNG and diffs it against a
 reference screenshot: it decodes every format the presenter can produce, including the packed
 10-bit ones, crops the window grab's title bar off the reference, prints the mean absolute

@@ -1,9 +1,14 @@
 # Removing the render thread's sync points (proposal)
 
-Status, September 12, 2026: step 1 of the artifact-free variant is landed and measured behind
-`--gpu-prologue-table` (below, "Step 1"): neither BDA page table misses any more, the image is
-unchanged, and it costs 2.4 ms a loop against the 1 ms it was allowed, so the rest of the path
-awaits a decision. The host-memory bench removed the need for an artifact policy.
+Status, September 12, 2026: steps 1 and 2 are landed behind `--gpu-prologue-table` and
+`--gpu-fetch-side-effects`, both default off (below, "Step 1" and "Step 2"). Step 1 does what it
+was for and cost 2.4 ms a loop when it was measured; step 2's shared prologue lowering takes 4 ms
+off that configuration, so the 2.4 needs re-measuring against a table-off run on the same binary. Step 2
+removes the read faults it was aimed at (89 a loop to 22, the flat reads gone entirely) and its
+hard stop fired: the loop is 19 ms slower, its safety net fires 160 to 2,090 times a loop instead
+of never, and one run in two died on a descriptor a producer left behind. The host-memory bench
+removed the need for an artifact policy; what step 2 shows is that per-wave prologue evaluation is
+the wrong shape for compute, not that the CPU has to keep reading those pages.
 Builds on [performance-roadmap.md](performance-roadmap.md) item 1b and
 [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md).
 
@@ -289,3 +294,174 @@ Earlier shapes, for the numbers above: `runs-prologue/` and `runs-prologue-ab/` 
 entries, separate bindings), `runs-prologue-mirrorfirst/` (mirror-first, separate bindings),
 `runs-prologue-v3/` (mirror-first, folded bindings, two functions), `runs-prologue-v4/` (soft
 fault), `runs-prologue-diag2/` (the prologue lookup reading the data half).
+
+## Step 2: compute roots in-shader (landed, `--gpu-fetch-side-effects`, default off)
+
+Landed and measured September 12, 2026. **The hard stop fired.** The faults go where they were
+meant to -- 89 a loop to **22**, with the flat reads gone entirely -- but the loop is **19 ms
+slower**, the safety net fires **160 to 2,090 times a loop** instead of never, and one of the two
+40-loop runs died with a texture descriptor the host could not decode. The setting stays off and
+the path needs the design change below before it is worth another run.
+
+### What was built
+
+`--gpu-fetch-side-effects` (effective only with `--gpu-descriptors true` and
+`--gpu-prologue-table true`) lifts the side-effect rule of stage 1 for **compute** programs.
+
+- **Marking.** `MarkGpuFetchBuffers` no longer returns early for a compute program with a written
+  or atomic buffer or image, or with `uses_dma`. Its read-only buffer roots and its flattened SRT
+  slots are marked exactly as any other program's; the written and atomic resources keep their host
+  binding, because stage 1 covers read-only resources only. On nexus-6 that is **286 compute
+  programs of 358**, carrying **29,308 lowered read slots** on top of stage 1b's 6,926.
+- **The safety net.** `EmitGpuFetchDescriptors` collects the validity of every root and slot it
+  lowers, votes it across the subgroup (`OpGroupNonUniformAny`; the roots read user data and memory
+  at addresses derived from it, so the value is uniform by construction and the vote only keeps a
+  divergence, if one were possible, on the conservative side), and on any invalid root returns from
+  the entry point **before the body** -- before the program's first side effect -- after setting the
+  program's `DescriptorFeedback` bit and counting itself in the dword behind the prologue table's
+  miss counter. The renderer's existing policy does the rest: `ProgramCache::Get` sees `cpu_next`
+  and materializes the next dispatch on the CPU, and eight mismatches pin the program to the CPU
+  path for the session. A skipped dispatch is the documented one-frame-late policy applied to a
+  producer: nothing is written, and its consumers read what the page held before.
+- **One emitter for a whole prologue.** Necessary, not an optimisation. Every root was lowered on
+  an emitter of its own, so a 250-root prologue re-emitted the SRT chain 250 times: **a quarter of
+  a million SPIR-V words**, and the driver took 1 to 13 seconds over each such module. Sharing one
+  `RootEmitter` across a prologue's roots (`EmitSrtFlatRoots`) reuses a step another root already
+  produced, exactly as `FlatMachine` does within one run. It takes **36%** off the modules, and it
+  is worth about **4 ms a loop** to step 1's own configuration: `--gpu-descriptors true
+  --gpu-srt-reads true --gpu-prologue-table true` measures 76.6 to 78.3 ms here against the 80.8 to
+  82.5 step 1 measured, and the replay's warm-up loop falls from 133 s to 23 s. The table-off side
+  was not re-run on this binary, so step 1's 2.4 ms is not yet re-priced.
+- **Compute clear recognizers.** `TryConsumeComputeMetaClear`, `ResolveComputeBufferFill` and
+  `ResolveComputePatternFill` rejected every `gpu_descriptors` shader. They now reject a shader that
+  fetches a descriptor **of its own**, which is the condition that matters: a program that lowered
+  only its flattened reads still has every descriptor in the snapshot. The four clears a loop
+  nexus-6 consumes survive the setting either way (title-2's two likewise); 1,244 dispatches a loop
+  are refused at the gate that were never consumed before.
+- **Counters.** `gpu_fetch_side_effect_skips_per_loop` and `_loop1`, `compute_clears_per_loop` and
+  `compute_clears_refused_per_loop` in the replay report and in `replay-des.ps1`'s table; one
+  console line per marked program with its fetched buffers, lowered slots and module size, and one
+  per compute pipeline the driver took over 250 ms to compile.
+
+### Measured, nexus-6, 40 loops x 2 repeats, `-Image`
+
+`_Runtime/_Diagnostics/replay/nexus-6/runs-step2/`. The driver pipeline cache was warm (it is new,
+see [frame-replay.md](frame-replay.md)); every configuration ran on the same binary.
+
+| `ms/loop gpu` | min run 1 / 2 | median run 1 / 2 |
+| --- | --- | --- |
+| `--gpu-descriptors false` (setting on, inert) | 72.37 / 71.53 | 73.68 / 73.06 |
+| `--gpu-descriptors true --gpu-srt-reads true --gpu-prologue-table true`, setting **off** | 76.58 / 75.50 | 78.34 / 78.27 |
+| the same, setting **on** | **EXIT** / 94.55 | **EXIT** / 97.33 |
+
+| per loop, `--gpu-descriptors true --gpu-srt-reads true --gpu-prologue-table true` | setting off | setting **on** |
+| --- | --- | --- |
+| read faults / device wait in them | 89 / 36.3 to 37.6 ms | **22** / **62.8 ms** |
+| safety-net skips | 0 | **160** (2,090 a loop over 4 loops, before the programs pin themselves) |
+| prologue-table misses | 0 (0 in loop 1) | 0 (0 in loop 1) |
+| data-table fault pages | 0 (1,162 to 1,176 in loop 1) | 95 (2,393 in loop 1) |
+| prologue entries written | 2 to 3 | 98 |
+| submissions | 190 | 123 |
+| compute clears consumed / refused | 4 / 0 | 4 / 1,244 |
+| image against `reference.png` | R 9.8 G 7.8 B 4.1 | R 9.8 G 7.8 B 4.1 |
+
+The image number is the mean absolute difference of the presented frame; it does not move, which is
+worth knowing but is not a clean bill of health -- 160 skipped dispatches a loop and the EXIT below
+say otherwise. `--gpu-descriptors false` is unchanged by the setting in every number, as it must be.
+
+`KYTY_DEBUG_SRT_STATS=1`, 6 loops, setting on: **80 feedback bits**, **68 dispatches** routed to the
+CPU path by one, and **0 programs pinned** -- the readback coalesces a program's bits into one, so
+eight mismatches are never reached and a program that skips goes CPU, GPU, skip, CPU, for as long
+as the capture runs. 466 programs lower reads, 43,862 slots in the shader against 380 left on the
+host. (That run's `ms/loop` is not comparable: the stats collector costs render-thread time.)
+
+**The EXIT.** Run 1 of the setting-on configuration died in `descriptors.cpp:618`:
+
+```
+unsupported texture mip view: base=3 last=11 levels=1 max=0 type=9 tile=9 class=1 numeric=1
+dimension=3 mip_mode=0 read=1 written=0 dwords=11af1000,cb500000,81ffc1ff,909b3fac,0,0,0,0
+```
+
+A T# walked out of guest memory that no consistent texture describes. Run 2 of the same
+configuration, and the 20-loop diagnostics run, did not hit it. It is the failure mode the
+side-effect rule existed to prevent, one level removed: a producer that skipped, or that read a
+page the data table does not map, leaves a descriptor block that a later draw walks on the CPU.
+
+### The remaining faults, and where they are
+
+`--gpu-readback-diagnostics true`, 20 loops, setting on
+(`runs-step2/readback-faults-se-true.json`):
+
+| root kind | faults a loop | ms a loop |
+| --- | --- | --- |
+| descriptor source | 16.1 | 12.1 |
+| outside any evaluation | 6.0 | 6.7 |
+| **flat read (`srt_reads`)** | **0** | **0** |
+
+| shader | stage | faults a loop | ms a loop |
+| --- | --- | --- | --- |
+| (no evaluation) | - | 6.0 | 6.7 |
+| `0xb035b18a7b371e8f` | ps | 4.0 | 3.1 |
+| `0x0bc3409287149ce2` | cs | 1.0 | 2.8 |
+| `0x560c7a298b6a497b` | ps | 1.0 | 2.3 |
+| `0xd669aa446e6b6137` | vs | 2.0 | 2.0 |
+| `0x9feda52abefba1d5` | ps | 2.0 | 1.0 |
+
+Item 1b's 79.9 flat-read faults a loop are **gone**, and `0x74e4490fe7af0970`, which was 48 of
+them, no longer appears at all. What is left is what the design said would be left: the image and
+sampler roots of pixel and vertex shaders (piece B, stage 3) and the reads outside any evaluation.
+This is the number step 3 should be sized from.
+
+### Why it is not worth switching on, and what has to change
+
+- **The safety net fires, and nothing converges.** It should have been 0 in this capture and it is
+  160 to 2,090 a loop, with 0 programs pinned: the feedback readback coalesces a program's bits, so
+  the eight-mismatch pin never trips and the program alternates between the two paths forever.
+  The prologue page table misses **nothing** (0 a loop), so these are not unmapped pages: they are
+  the flat program's own validity conditions -- a `ReadBuffer` whose byte offset is outside its V#'s
+  `num_records`, or an address past the page table's 40-bit space. The host does not fail on those,
+  because `MaterializeSnapshot` evaluates only the sources the plan's resource control flow marks
+  **active** for that dispatch, while the prologue evaluates every marked root unconditionally. One
+  garbage root the dispatch would never have used aborts the whole dispatch. **That is the design
+  error to fix first**: the validity that guards a side effect has to be the validity of the roots
+  the dispatch actually uses, not of every root the prologue evaluated.
+- **The loop is 19 ms slower** (78.3 to 97.3 median), and the device wait inside the remaining
+  faults *rises* from 36 to 63 ms: four times fewer drains, each waiting on a queue of much heavier
+  dispatches. The prologue of a marked program evaluates up to 287 SRT chains, per wave, where the
+  host evaluated them once per dispatch. The reads themselves are cheap (the host-memory bench) but
+  the multiplication by wave count is not, and that is what stage 1b's per-slot lowering becomes
+  when the programs are compute.
+- **The modules are large and the driver is slow over them.** 286 pipelines, a median of 61k SPIR-V
+  words after sharing, 300 to 400 s of cold driver compile for one capture. Replay never had a
+  driver cache (no title); it has one now, keyed on the capture, so a bench pays this once. The game
+  would pay it once per shader per driver-cache generation, on the render thread, as first-encounter
+  stutter.
+- **Data-table faults are up** from 0 to 95 a loop (2,393 in loop 1): a `gpu_fetch` resource is
+  never `ObtainBuffer`ed, so its pages are registered by the fault path rather than by the bind, and
+  a body read of an unregistered page still reads zero. For a consumer that is one frame late; for a
+  producer it is a wrong value stored, and it is a second candidate for the EXIT above.
+
+The shape that would answer all four is not this one: evaluate a dispatch's SRT **once**, on the
+GPU, into the buffer the shader already reads (`FlattenedSrt`), instead of once per wave in every
+prologue -- a small compute pass per submission that fills the flattened reads for the events in
+it. The host stops reading the pages either way, the work stays O(1) per dispatch instead of
+O(waves), and a root's validity can be decided where the host decides it, against the plan's
+active-source control flow.
+
+### Commands
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\_Build\replay-des.ps1' `
+    -Capture '_Runtime\_Diagnostics\replay\nexus-6' -Loops 40 -Repeats 2 -Image `
+    -ExtraArgs '--replay-timeout 900000' `
+    -Configs '--gpu-descriptors true --gpu-srt-reads true --gpu-prologue-table true --gpu-fetch-side-effects false', `
+             '--gpu-descriptors true --gpu-srt-reads true --gpu-prologue-table true --gpu-fetch-side-effects true', `
+             '--gpu-descriptors false --gpu-fetch-side-effects true'"
+```
+
+`--replay-timeout` is needed: a measured loop is allowed 2 s by default and the first loops of the
+setting-on configuration are far past that. Artifacts:
+`_Runtime/_Diagnostics/replay/nexus-6/runs-step2/` (the bench, the images, the diagnostics run and
+`readback-faults-se-true.json`) and `_Runtime/_Diagnostics/replay/title-2/runs-step2/`, where the
+setting is neutral (median 28.5 / 28.2 off against 27.8 / 28.1 on, 6 faults a loop either way, no
+skips, no crash).

@@ -644,7 +644,15 @@ neither page table misses any more, in loop 1 as well as in the steady state, th
 unchanged and the bookkeeping is free -- and it costs 2.4 ms a loop against the 1 ms it was
 allowed, all of it in the prologue page-table lookup every root and flattened read makes, so it
 stays off and the path waits on that decision
-([sync-points-design.md](sync-points-design.md), "Step 1").
+([sync-points-design.md](sync-points-design.md), "Step 1"). Step 2, the side-effect rule lifted for
+compute programs behind `--gpu-fetch-side-effects`, is landed and measured the same evening: it
+takes the read faults from 89 a loop to **22** and removes item 1b's flat-read faults entirely,
+which is what it was for, and its hard stop fired -- the loop goes from 78.3 to 97.3 ms because
+every wave of a marked dispatch re-evaluates up to 287 SRT chains, its safety net fires 160 to
+2,090 times a loop instead of never, and one 40-loop run in two died on a texture descriptor a
+producer left behind. It stays off. The remaining 22 faults a loop are image and sampler roots of
+pixel and vertex shaders plus 6 outside any evaluation, which is the number stage 3 should be
+sized from ([sync-points-design.md](sync-points-design.md), "Step 2").
 
 ### 3. Stages 2 and 3: vertex fetch in-shader, bindless images and samplers
 
@@ -701,6 +709,13 @@ place once the dispatch download no longer cleans the argument pages, and a Vulk
 which this machine cannot do because `VK_LAYER_KHRONOS_validation` is not installed. Nothing in
 this roadmap is pushed to the fork beyond 0db0ff6. Commits 5df1f8c and earlier on `main` hold
 stage 1 and its diagnostics.
+
+Step 2 of the sync-points path is landed and parked the same evening (above, item 2's status):
+the read faults fall from 89 a loop to 22 and item 1b's flat-read faults go to zero, and the hard
+stop fired anyway -- 19 ms a loop slower, a safety net that fires thousands of times a loop, and a
+producer-written descriptor that killed one run in two. What the measurement leaves is a sized
+target for stage 3 (22 faults a loop, image and sampler roots) and a clear statement of what the
+next shape has to be: the SRT evaluated once per dispatch on the GPU, not once per wave.
 
 Item 1b, added the same day, changes what the biggest remaining number means. The 26% of the render
 thread in `SrtWalker.cpp` is not evaluation work at all: it is about ninety synchronous device

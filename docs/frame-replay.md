@@ -217,7 +217,8 @@ replay: <capture dir>
   loops          <n> (<n> measured, loop 1 excluded), <n> flips presented
   ms/loop        min <a>  median <b>  max <c>  jitter <d>%
   ms/loop gpu    min <a>  median <b>  max <c>  jitter <d>%
-  frame <i> <n>  gpu median <a>  min <b>  max <c> | loop median <d> | events <n> (<n> late) | progress <n> of <n>
+  drains         <n> a loop of <m> GPU-range syncs (readbacks on the render thread)
+  frame <i> <n>  gpu median <a>  min <b>  max <c> | loop median <d> | drains <n> of <m> syncs | events <n> (<n> late) | progress <n> of <n>
   frame <i>      prepares <n> (<n> recorded), scans <n> (<n> recorded), <a> dirty ranges and <b> buffers a scan (recorded <c> and <d>)
   dirty events   <n> late of <n> timed (<p>%)
   total          <n> s
@@ -232,7 +233,10 @@ replay: <capture dir>
 carries `frame_gpu_ms`, `frame_loop_ms`, `frame_gpu_summary`, `frame_summary`,
 `frame_dirty_events_timed`, `frame_dirty_events_late`, `frame_progress_captured`,
 `frame_progress_replayed`, and -- the phase E numbers -- `frame_prepares`, `frame_scans`,
-`frame_scan_dirty_ranges`, `frame_scan_synchronized` with a `_recorded` counterpart for each.
+`frame_scan_dirty_ranges`, `frame_scan_synchronized` with a `_recorded` counterpart for each. Item
+1 added `drains_per_loop`, `syncs_per_loop` and the per-frame `frame_drains`: how many times a loop
+the render thread downloaded a GPU-written range (`SyncGpuCleanBacking` reaching
+`BufferCache::ReadMemory`, which waits for the device) and how many GPU-range syncs it made in all.
 
 ### Emulator state outside guest memory, and what version 2 records
 
@@ -564,6 +568,10 @@ Tracy names it. Differencing the per-zone totals of a 10-loop and a 40-loop capt
 from about 0.2 ms to 1.2 ms each. That zone is `SyncGpuCleanBacking` → `BufferCache::ReadMemory` →
 `DownloadBufferMemory` → `Scheduler::WaitPriorityOperations`: the CPU reading GPU-written indirect
 dispatch arguments back, which drains the device.
+
+**Both halves of this paragraph were corrected on September 12, 2026; see *Item 1* below.** The
+245 calls are not 245 drains -- only 14 of them download anything -- and the plateau no longer
+reproduces on a build whose loop waits for its own flips.
 
 So the stall is real and it is roadmap item 1; what is a replay artifact is the *fast* phase. A
 fresh replay starts with an idle GPU, so the early drains return at once; once a few loops of work
@@ -1018,6 +1026,44 @@ of a capture, and a multi-frame capture is a diagnostic instrument rather than a
 K > 1 replayable means recording, per frame, the values of the labels that frame's waits read, and
 writing them back before the frame -- the same shape of mechanism as `RestoreRange`, and worth doing
 only for a title whose frames actually differ.
+
+## Item 1, indirect arguments, September 12, 2026
+
+What the harness measured for [performance-roadmap.md](performance-roadmap.md) item 1, and two
+corrections to what is written above.
+
+The report now prints `drains N a loop of M GPU-range syncs` and writes `drains_per_loop`,
+`syncs_per_loop` and `frame_drains` into `replay-report.json`; `replay-des.ps1` shows both as
+columns. A drain is a `SyncGpuCleanBacking` that actually reached `BufferCache::ReadMemory`.
+
+**Correction 1: 245 syncs, 14 drains.** *The sawtooth* above and the handoff both read
+`CpOpDispatchIndirect::SyncArguments` (245 calls a loop, 3.65 ms) as 245 device drains. The counter
+says the parked Nexus drains on **14** of them; the other 231 find nothing GPU-dirty and cost
+almost nothing. The zone is fourteen quarter-millisecond waits, not 245 small ones. Same picture
+on title-2: 58 GPU-range syncs a loop, 6 drains.
+
+**Correction 2: the plateau no longer reproduces.** On the build of September 12 title-2 has no
+28 ms plateau to remove. Flag-off, 40 loops at 60 Hz vblank, the loop reads 33.1, 23.9, 14.3 and
+then sits at 11.1 ms for the rest of the run
+(`title-2/runs-sawtooth-v60/gpuindirect-false-run1.json`); the same shape at 360 Hz and 60 loops.
+What changed since phase C is that a loop now waits for the flips it queued to be presented before
+it ends, so the CPU can no longer get several loops ahead of the device, which is the state the
+plateau needed. What is left of the effect is the first two or three loops, and they get shorter
+with the flag on (24.8, 23.6, then 9.6). Read item 1's numbers from nexus-6, not from the sawtooth.
+
+Results, nexus-6, 60 loops, three repeats, `runs-20260912-003652/`: `ms/loop gpu` median 71.80 with
+both flags off, 68.57 with `--gpu-indirect true`, 71.77 with `--gpu-indirect-draws true` as well;
+drains 14, 3, 0 and GPU-range syncs 10 248, 9 961, 986. The dispatch half is worth 3.2 ms; the draw
+half gives it back, trading the per-draw sync for a per-draw `ObtainBuffer` of the argument block.
+
+**The image noise floor, for future A/Bs.** Two identical flag-off runs in one bench session differ
+in 2 619 pixels of 8.29M with a maximum channel delta of 1; two flag-off runs in *different*
+sessions differ in 22 468 with a maximum of 26. So a cross-session difference of a few tens of
+thousands of pixels at that amplitude is noise, and only the mean absolute difference against
+`reference.png` (R=9.8 G=7.8 B=4.1 for every configuration measured here) is stable enough to gate
+on. `--replay-image` also needs an **absolute** path: the emulator runs with `_Runtime` as its
+working directory, so a relative `-OutputRoot` makes the dump land nowhere and the script does not
+notice.
 
 ## Phases
 

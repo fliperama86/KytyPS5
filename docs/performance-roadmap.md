@@ -103,40 +103,72 @@ Measure each item before starting the next; the protocol is at the bottom.
 
 ### 1. Indirect draws and dispatches consumed by the GPU
 
-Status: not started. Studied here and in
-[performance-handoff-2026-09-10.md](performance-handoff-2026-09-10.md) ("What is left", item 1).
-Phase C of the replay harness added direct evidence that these readbacks serialize the CPU on the
-device: on the title-screen capture, where the render thread is faster than the GPU, the loop time
-steps from 11 ms to 28 ms as soon as a few loops of work are queued ahead, and every one of those
-16 ms lands in `CpOpDispatchIndirect::SyncArguments`
-([frame-replay.md](frame-replay.md), "The sawtooth").
+Status, September 12, 2026: **the dispatch half is done and measured; the draw half is written,
+measured neutral, and parked behind its own flag.** Two settings, both default off
+([settings.md](settings.md)):
 
-The game is GPU-driven: its compute shaders write the draw and dispatch arguments, and 8,794 of
-the 9,306 draws per frame are `DRAW_INDIRECT` packets. The emulator reads every argument block
-back on the CPU and re-issues the work directly:
+| Config on nexus-6, 60 loops, 3 repeats | ms/loop gpu | ms/loop | drains a loop | GPU-range syncs |
+| --- | --- | --- | --- | --- |
+| `--gpu-indirect false` | **71.80** | 73.74 | 14 | 10 248 |
+| `--gpu-indirect true` | **68.57** | 70.35 | 3 | 9 961 |
+| `--gpu-indirect true --gpu-indirect-draws true` | **71.77** | 73.66 | 0 | 986 |
 
-- `CommandProcessor::DrawIndirect` and `DrawIndirectMulti` (src/graphics/guest_gpu/graphicsRun.cpp)
-  call `SyncGpuCleanBacking` (src/kernel/memory.cpp), which downloads the range when it is GPU-dirty
-  (`BufferCache::ReadMemory` → `DownloadBufferMemory` → `Scheduler::WaitPriorityOperations`, a
-  wait for the GPU), then `memcpy` the arguments and call `DrawIndex`/`DrawIndexAuto`.
-- `CpOpDispatchIndirect` (pm4Handlers.cpp) and `CommandProcessor::DispatchIndirect` do the same
-  and call `DispatchDirect`. The handoff measured about 245 GPU drains per frame on this path
-  (`CpOpDispatchIndirect::SyncArguments`, 3.4% of the thread in `real3-self.csv`).
-- The host renderer has one native indirect call, `dispatchIndirect` in
-  src/graphics/host_gpu/renderer/renderCompute.cpp, reached only when `indirect_args` is set.
-  There is no `drawIndexedIndirect` anywhere in src/graphics/host_gpu.
+Medians of the per-run medians, loop 1 excluded; reports in
+`_Runtime/_Diagnostics/replay/nexus-6/runs-20260912-003652/`. The presented image is the same in
+all three: mean absolute difference against `reference.png` R=9.8 G=7.8 B=4.1, and the pixel
+difference between two configurations (5.9k to 24k pixels of 8.3M, maximum channel delta 26) sits
+inside the run-to-run band two identical flag-off runs already show (22.5k, maximum 26). No `EXIT`,
+no warning beyond the pre-existing wave64 line.
 
-Work: obtain the argument buffer from the buffer cache, add the indirect-read barrier, record
-`drawIndexedIndirect`/`drawIndirect`/`dispatchIndirect`, and stop reading the arguments on the
-CPU. The CPU still binds resources per draw, so this removes the readback and the waits, not the
-per-draw cost. Per-draw state that today comes from the arguments (`m_num_instances`, the
-`IndirectArgs` offset source) has to come from the packet or from the shader instead; check
-`DrawIndexAuto` and `DrawIndex` for every use of the copied `args`.
+**The dispatch half pays.** `CpOpDispatchIndirect` and `CommandProcessor::DispatchIndirect` hand
+the guest argument address to `RenderExecutor::DispatchDirect`, which already recorded
+`vkCmdDispatchIndirect`; the `DISPATCH_INITIATOR` thread-dimensions form keeps the readback, since
+the host divides those counts by the shader's group size. **3.2 ms a loop, 4.5%.** On title-2 the
+steady state goes from 11.3 to 10.0 ms and the drains from 6 to 0.
 
-Expected: unknown in FPS. It removes CPU-to-GPU serialization points, so the GPU should stop
-idling between waits and CPU and GPU should overlap. The capture has no GPU timestamps, so
-how much of the 72% GPU idle time the waits cause is not measured. Cheap enough to do and
-measure first. Gate: a runtime setting (see [settings.md](settings.md)).
+**The draw half does not, in replay.** `CommandProcessor::DrawIndirect` passes the address through
+and `RenderExecutor` records one `vkCmdDrawIndexedIndirect`/`vkCmdDrawIndirect`, binding the index
+buffer over its whole `INDEX_BUFFER_SIZE` range so the device's `firstIndex` indexes into it. That
+removes the last 9 262 argument syncs and the last 3 drains and gives **3.2 ms straight back**: it
+trades one per-draw buffer-cache walk (`SyncGpuCleanBacking`) for another (`ObtainBuffer` of the
+argument block, 8 794 times a loop) and widens the per-draw index binding from the draw's slice to
+the whole declared buffer. Hence the separate flag. The case for finishing it is not visible here:
+in replay the draw-argument syncs never drain (14 drains a loop for 245 dispatch syncs and 8 794
+draw syncs), so the replay cannot show the thing step 3 exists to prevent — the game's draw syncs
+draining once the dispatch download no longer cleans the pages for them. Settling that needs the
+end-to-end protocol.
+
+What stays on the readback path, decided in `CommandProcessor::IndirectDrawUsesGpuArgs`
+(src/graphics/guest_gpu/graphicsRun.cpp): `DRAW_INDIRECT_MULTI` in both forms (zero calls in
+`real3-self.csv`, and the count form needs `drawIndirectCount` and `multiDrawIndirect`, neither
+enabled at device creation); `kQuadListLegacy` and `kRectListLegacy`, which fan out or substitute
+the vertex count per index on the CPU; 8-bit indices, widened to 16 index by index; NGG/mesh
+assembly (`SHADER_STAGES` bit 5), where the index count becomes a mesh workgroup count; a custom
+primitive-reset index, which makes the host scan the index buffer before it can pick the pipeline;
+and a device without `VkPhysicalDeviceFeatures::drawIndirectFirstInstance`, which is now requested
+when the device has it because a guest argument block may carry a non-zero
+`start_instance_location`. One deviation to know about: on the native path `m_num_instances` is not
+updated, because the CPU never learns the draw's instance count, so a later short-form draw that
+leaves `instance_count` at 0 uses the last `IT_NUM_INSTANCES` packet's value instead of the
+previous indirect draw's.
+
+Where the barrier is: a per-draw `eIndirectCommandRead` buffer barrier cannot be recorded, because
+`vkCmdPipelineBarrier` inside a dynamic-rendering pass may only name framebuffer-space stages and
+`eDrawIndirect` is not one, and ending the pass per draw would cost more than the change saves.
+The global `ShaderAccessBarrier` every dispatch already emits covers it (`eShaderWrite` to
+`eMemoryRead` over `eAllCommands`); `MakeShaderWriteDependency` gained `eIndirectCommandRead` so a
+graphics shader that writes another draw's arguments is covered too.
+
+Diagnostics added: `SyncGpuCleanBacking` counts the ranges it actually downloads and the GPU-range
+calls it makes, and the replay report prints both per loop (`drains N a loop of M GPU-range syncs`,
+`drains_per_loop` / `syncs_per_loop` / `frame_drains` in `replay-report.json`, two more columns in
+`replay-des.ps1`). That is what corrected the handoff's number: the parked Nexus makes 245
+`CpOpDispatchIndirect::SyncArguments` calls a loop but only **14** of them download anything, so
+the zone's 3.65 ms is 0.26 ms in each of fourteen drains, not 15 us in each of 245 syncs.
+
+Not measured: Vulkan validation. `VK_LAYER_KHRONOS_validation` is not installed on this machine
+(`no validation layer: VK_LAYER_KHRONOS_validation` with `--printf-direction Console`), so
+`--vulkan-validation true` silently runs without it. A validation pass is still owed.
 
 ### 2. Finish stage 1 of GPU-side descriptor fetch
 
@@ -209,9 +241,14 @@ fallback) is the larger version of the same idea.
 
 ## Decision state
 
-As of September 11, 2026 the user has not chosen between continuing item 2 or stopping; item 1
-was recommended as the cheapest next measurement. Nothing in this roadmap is pushed to the fork
-beyond 0db0ff6. Commits 5df1f8c and earlier on `main` hold stage 1 and its diagnostics.
+As of September 12, 2026 item 1's dispatch half is done and worth 3.2 ms of the parked Nexus's
+71.8 ms loop, its draw half is written and parked behind `--gpu-indirect-draws` because it gives
+that back in replay, and the choice between continuing item 2 or stopping is still open. Two things
+item 1 leaves owed: an end-to-end run, which is the only way to see whether the draw half earns its
+place once the dispatch download no longer cleans the argument pages, and a Vulkan validation pass,
+which this machine cannot do because `VK_LAYER_KHRONOS_validation` is not installed. Nothing in
+this roadmap is pushed to the fork beyond 0db0ff6. Commits 5df1f8c and earlier on `main` hold
+stage 1 and its diagnostics.
 
 ## Measurement protocol, corrections
 

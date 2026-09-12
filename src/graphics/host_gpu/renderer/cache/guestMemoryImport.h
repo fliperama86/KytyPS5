@@ -163,6 +163,8 @@ public:
 	[[nodiscard]] uint64_t SkippedBytes() const noexcept { return m_skipped_bytes; }
 	[[nodiscard]] uint64_t Views() const noexcept { return m_views; }
 	[[nodiscard]] uint64_t AliasBytes() const noexcept { return m_alias_size; }
+	[[nodiscard]] vk::DeviceAddress AliasDeviceBase() const noexcept { return m_alias_base; }
+	[[nodiscard]] vk::Buffer AliasBuffer() const noexcept { return m_alias_buffer; }
 
 private:
 	struct Entry {

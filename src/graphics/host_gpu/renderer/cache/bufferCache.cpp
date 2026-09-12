@@ -16,6 +16,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cinttypes>
 #include <cstring>
@@ -25,6 +26,11 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+BufferCache* g_diag_buffer_cache = nullptr;
+}
+
 
 namespace {
 
@@ -331,6 +337,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	}
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+	g_diag_buffer_cache = this;
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
 	// Step 1 of docs/sync-points-design.md: the guest-memory imports the prologue half of the
@@ -1000,9 +1007,148 @@ BufferCache::AddressProbe BufferCache::ProbeAddress(uint64_t address) {
 // GPU's writes are. Only the prologue reads through it: the host-memory bench says data reads from
 // an import cost 300 to 400 times a mirror read.
 
+void BufferCache::DiagnosePage(uint64_t vaddr, uint64_t* entry, bool* registered,
+                               bool* gpu_modified, uint32_t* import_value,
+                               bool* import_readable, uint32_t* mirror_value,
+                               bool* mirror_readable, bool* cpu_modified) {
+	auto* cache      = g_diag_buffer_cache;
+	*import_value    = 0;
+	*import_readable = false;
+	*mirror_value    = 0;
+	*mirror_readable = false;
+	*cpu_modified    = false;
+	if (cache == nullptr) {
+		*entry        = 0;
+		*registered   = false;
+		*gpu_modified = false;
+		return;
+	}
+	// The bytes the GPU would read through the import: the alias's host mapping at the same
+	// offset the device address has from the alias's device base.
+	{
+		uint64_t   alias_host = 0;
+		uint64_t   alias_size = 0;
+		const auto device     = cache->m_guest_import->AddressOf(vaddr & ~uint64_t {3});
+		const auto device_base = cache->m_guest_import->AliasDeviceBase();
+		if (device != 0 && device_base != 0 && device >= device_base &&
+		    Libs::LibKernel::Memory::GetGuestBackingAlias(&alias_host, &alias_size) &&
+		    device - device_base + 4 <= alias_size) {
+			std::memcpy(import_value,
+			            reinterpret_cast<const void*>(alias_host + (device - device_base)), 4);
+			*import_readable = true;
+			// And the same dword as the GPU sees it through the import: a device copy from the
+			// alias buffer into the download ring.
+			auto& download = cache->m_download_buffer;
+			const auto [mapped, offset] = download.Map(64, 64);
+			if (mapped != nullptr && cache->m_guest_import->AliasBuffer()) {
+				auto native = cache->m_scheduler.Current().Handle();
+				vk::MemoryBarrier before {};
+				before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+				before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+				native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+				                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {},
+				                       1, &before, 0, nullptr, 0, nullptr);
+				const vk::BufferCopy region {device - device_base, offset, 4};
+				native.copyBuffer(cache->m_guest_import->AliasBuffer(), download.Handle(), 1, &region);
+				vk::MemoryBarrier after {};
+				after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+				after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+				native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+				                       vk::PipelineStageFlagBits::eHost, vk::DependencyFlags {}, 1,
+				                       &after, 0, nullptr, 0, nullptr);
+				download.Commit();
+				const auto tick = cache->m_scheduler.CurrentTick();
+				cache->m_scheduler.Finish();
+				cache->m_scheduler.WaitPriorityOperations(tick);
+				download.Invalidate(offset, 4);
+				uint32_t gpu_value = 0;
+				std::memcpy(&gpu_value, mapped, 4);
+				std::printf("dump-import-gpu: addr=0x%llx host=0x%08x gpu=0x%08x\n",
+				            static_cast<unsigned long long>(vaddr), *import_value, gpu_value);
+			}
+		}
+	}
+	const auto page   = vaddr >> CACHING_PAGEBITS;
+	*entry            = cache->PrologueEntryForPage(page);
+	const auto* owner = cache->m_page_table.Find(page);
+	{
+		// The entry the GPU actually reads, from the page-table buffer's prologue half, against
+		// what the current owner says. A difference is a stale entry.
+		uint64_t   current = 0;
+		if (owner != nullptr && *owner) {
+			const auto& b = cache->m_slot_buffers[*owner];
+			if (!b.is_deleted && b.IsInBounds(page << CACHING_PAGEBITS, CACHING_PAGESIZE)) {
+				current = b.BufferDeviceAddress() + ((page << CACHING_PAGEBITS) - b.CpuAddress());
+			}
+		}
+		const auto pending = cache->m_prologue_pending.find(page);
+		// The entry as stored in the page-table buffer's prologue half, read back.
+		uint64_t stored = 0;
+		{
+			auto&      download        = cache->m_download_buffer;
+			const auto [mapped, offset] = download.Map(64, 64);
+			if (mapped != nullptr) {
+				download.CopyFrom(cache->m_scheduler.Current(), cache->m_bda_pagetable_buffer,
+				                  PrologueEntryOffset(page), offset, 8,
+				                  vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+				                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+				                  vk::AccessFlagBits::eHostRead);
+				download.Commit();
+				const auto tick = cache->m_scheduler.CurrentTick();
+				cache->m_scheduler.Finish();
+				cache->m_scheduler.WaitPriorityOperations(tick);
+				download.Invalidate(offset, 8);
+				std::memcpy(&stored, mapped, 8);
+			}
+		}
+		std::printf("dump-entry: page=0x%llx stored=0x%llx computed=0x%llx owner_now=0x%llx pending=%d:0x%llx\n",
+		            static_cast<unsigned long long>(page), static_cast<unsigned long long>(stored),
+		            static_cast<unsigned long long>(*entry),
+		            static_cast<unsigned long long>(current),
+		            pending != cache->m_prologue_pending.end() ? 1 : 0,
+		            pending != cache->m_prologue_pending.end()
+		                ? static_cast<unsigned long long>(pending->second)
+		                : 0ull);
+	}
+	*registered       = owner != nullptr && static_cast<bool>(*owner);
+	*gpu_modified     = cache->IsRegionGpuModified(vaddr & ~uint64_t {3}, 4);
+	*cpu_modified     = cache->m_memory_tracker.IsRegionCpuModified(vaddr & ~uint64_t {3}, 4);
+	// The dword as the mirror holds it right now: one 4-byte copy into the download ring and a
+	// wait. Diagnostic only; it drains the queue.
+	if (*registered) {
+		auto& buffer = cache->m_slot_buffers[*owner];
+		if (!buffer.is_deleted && buffer.IsInBounds(vaddr & ~uint64_t {3}, 4)) {
+			auto&      download        = cache->m_download_buffer;
+			const auto [mapped, offset] = download.Map(64, 64);
+			if (mapped != nullptr) {
+				download.CopyFrom(cache->m_scheduler.Current(), buffer,
+				                  buffer.Offset(vaddr & ~uint64_t {3}), offset, 4,
+				                  vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+				                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+				                  vk::AccessFlagBits::eHostRead);
+				download.Commit();
+				const auto tick = cache->m_scheduler.CurrentTick();
+				cache->m_scheduler.Finish();
+				cache->m_scheduler.WaitPriorityOperations(tick);
+				download.Invalidate(offset, 4);
+				std::memcpy(mirror_value, mapped, 4);
+				*mirror_readable = true;
+			}
+		}
+	}
+}
+
 uint64_t BufferCache::PrologueEntryForPage(uint64_t page) {
 	const auto  vaddr = page << CACHING_PAGEBITS;
 	const auto* owner = m_page_table.Find(page);
+	// Experiment (docs/sync-points-design.md, step 2 fact check): KYTY_PROLOGUE_IMPORT_FIRST=1
+	// points every page the GPU has not written at the import, so a stale mirror cannot be read.
+	static const bool import_first = std::getenv("KYTY_PROLOGUE_IMPORT_FIRST") != nullptr;
+	if (import_first && !IsRegionGpuModified(vaddr, CACHING_PAGESIZE)) {
+		if (const auto imported = m_guest_import->AddressOf(vaddr); imported != 0) {
+			return imported;
+		}
+	}
 	if (owner != nullptr && *owner) {
 		const auto& buffer = m_slot_buffers[*owner];
 		if (!buffer.is_deleted && buffer.IsInBounds(vaddr, CACHING_PAGESIZE)) {

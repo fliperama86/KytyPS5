@@ -19,7 +19,9 @@
 // Nothing here is wired into production shader emission yet; only the unit tests call it.
 
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include <cstdio>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -109,7 +111,14 @@ public:
 		m_conditions.assign(program.insts.size(), 0u);
 		m_written.assign(program.insts.size(), 0u);
 		m_true = ConstantBool(m_state, true);
+		m_fail_address = WideConstant(m_state, 0);
+		m_fail_reason  = ConstantU32(m_state, 0);
 	}
+
+	// Diagnostic: the first guest read whose validity failed on this emitter, and why
+	// (1 = its operands or bounds, 2 = no page-table entry, 3 = beyond the 40-bit space).
+	[[nodiscard]] uint32_t FailAddress() const { return m_fail_address; }
+	[[nodiscard]] uint32_t FailReason() const { return m_fail_reason; }
 
 	bool Run(const IR::SrtFlatRoot& root) {
 		if (!root.valid || root.first + root.count > m_program.schedule.size()) {
@@ -221,6 +230,84 @@ private:
 		read.present = state.builder.AllocateId();
 		state.builder.AddFunction({OpPhi, TypeBool(state), read.present, mapped, then_exit,
 		                           ConstantBool(state, false), else_label});
+		// Diagnostic record (docs/sync-points-design.md, step 2 fact check), for one program
+		// named by KYTY_GPU_FETCH_DUMP_HASH only: the first failing read of the prologue claims
+		// the record's reason dword with a compare-exchange and stores its address beside it.
+		static const uint64_t dump_hash = [] {
+			const char* v = std::getenv("KYTY_GPU_FETCH_DUMP_HASH");
+			return v != nullptr ? std::strtoull(v, nullptr, 16) : uint64_t {0};
+		}();
+		if (dump_hash != 0 && state.program.shader_hash == dump_hash &&
+		    state.program.info.gpu_fetch_side_effects && state.fault_buffer_variable != 0u) {
+			const auto u32     = TypeU32(state);
+			const auto boolean = TypeBool(state);
+			// Also: the last read that was present but returned zero -- its guest address and
+			// the device address the page table gave it (record dwords 11 to 14).
+			{
+				constexpr uint32_t ZeroRecordIndex =
+				    static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u) + 11u;
+				const auto zero = And(read.present, Binary(state, OpIEqual, boolean, read.value,
+				                                           ConstantU32(state, 0)));
+				EmitIfCondition(state, zero, [&]() {
+					// A second lookup here: the first one's id lives in the then-branch above and
+					// does not dominate this block.
+					const auto     bda2     = EmitBdaPointer(m_ctx, address);
+					const uint32_t values[] = {
+					    Narrow(state, address),
+					    Narrow(state, Binary(state, OpShiftRightLogical, TypeScalarU64(state),
+					                         address, WideConstant(state, 32))),
+					    Narrow(state, bda2),
+					    Narrow(state, Binary(state, OpShiftRightLogical, TypeScalarU64(state), bda2,
+					                         WideConstant(state, 32)))};
+					for (uint32_t i = 0; i < 4; i++) {
+						const auto pointer = state.builder.AllocateId();
+						state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+						                           pointer, state.fault_buffer_variable,
+						                           ConstantU32(state, 0),
+						                           ConstantU32(state, ZeroRecordIndex + i)});
+						state.builder.AddFunction({OpStore, pointer, values[i]});
+					}
+				});
+			}
+			const auto cond_false = NotBool(state, condition);
+			const auto out_range  = And(condition, NotBool(state, in_range));
+			const auto unmapped   = And(reachable, NotBool(state, read.present));
+			const auto reason     = Select(
+			        state, u32, cond_false, ConstantU32(state, 1),
+			        Select(state, u32, out_range, ConstantU32(state, 3),
+			               Select(state, u32, unmapped, ConstantU32(state, 2), ConstantU32(state, 0))));
+			constexpr uint32_t RecordIndex =
+			    static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u) + 2u;
+			EmitIfCondition(state, Binary(state, OpINotEqual, boolean, reason, ConstantU32(state, 0)),
+			                [&]() {
+				const auto reason_pointer = state.builder.AllocateId();
+				state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+				                           reason_pointer, state.fault_buffer_variable,
+				                           ConstantU32(state, 0), ConstantU32(state, RecordIndex + 4u)});
+				const auto previous = state.builder.AllocateId();
+				state.builder.AddFunction({OpAtomicCompareExchange, u32, previous, reason_pointer,
+				                           ConstantU32(state, ScopeDevice),
+				                           ConstantU32(state, MemorySemanticsNone),
+				                           ConstantU32(state, MemorySemanticsNone), reason,
+				                           ConstantU32(state, 0)});
+				EmitIfCondition(state, Binary(state, OpIEqual, boolean, previous, ConstantU32(state, 0)),
+				                [&]() {
+					const auto low  = Narrow(state, address);
+					const auto high = Narrow(state, Binary(state, OpShiftRightLogical,
+					                                       TypeScalarU64(state), address,
+					                                       WideConstant(state, 32)));
+					const uint32_t values[] = {low, high};
+					for (uint32_t i = 0; i < 2; i++) {
+						const auto pointer = state.builder.AllocateId();
+						state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+						                           pointer, state.fault_buffer_variable,
+						                           ConstantU32(state, 0),
+						                           ConstantU32(state, RecordIndex + 2u + i)});
+						state.builder.AddFunction({OpStore, pointer, values[i]});
+					}
+				});
+			});
+		}
 		return read;
 	}
 
@@ -331,6 +418,30 @@ private:
 					return false;
 				}
 				result = Widen(state, EmitShaderDataDwordLoad(state, dword));
+				// Diagnostic (KYTY_GPU_FETCH_DUMP_HASH): the first user-data register the named
+				// program's prologue reads, its value stored in record dword 15, its index printed.
+				{
+					static const uint64_t dump_hash = [] {
+						const char* v = std::getenv("KYTY_GPU_FETCH_DUMP_HASH");
+						return v != nullptr ? std::strtoull(v, nullptr, 16) : uint64_t {0};
+					}();
+					if (dump_hash != 0 && state.program.shader_hash == dump_hash &&
+					    state.program.info.gpu_fetch_side_effects &&
+					    state.fault_buffer_variable != 0u && !m_ud_recorded) {
+						m_ud_recorded = true;
+						std::printf("dump-ud-emit: user_data imm=%llu dword=%u user_data_base=%u\n",
+						            static_cast<unsigned long long>(inst.imm), dword,
+						            state.program.user_data_base);
+						constexpr uint32_t UdRecordIndex =
+						    static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u) + 15u;
+						const auto pointer = state.builder.AllocateId();
+						state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+						                           pointer, state.fault_buffer_variable,
+						                           ConstantU32(state, 0),
+						                           ConstantU32(state, UdRecordIndex)});
+						state.builder.AddFunction({OpStore, pointer, Narrow(state, result)});
+					}
+				}
 				return true;
 			}
 			case IR::SrtFlatOp::ShaderBase:
@@ -390,6 +501,33 @@ private:
 				           Binary(state, OpBitwiseAnd, wide, base, WideConstant(state, ~uint64_t {3})),
 				           byte_offset),
 				    WideConstant(state, ~uint64_t {3}));
+				// Diagnostic (KYTY_GPU_FETCH_DUMP_HASH): the V# dwords and offset this ReadBuffer saw
+				// when its bounds check failed, four dwords past the address record.
+				{
+					static const uint64_t dump_hash = [] {
+						const char* v = std::getenv("KYTY_GPU_FETCH_DUMP_HASH");
+						return v != nullptr ? std::strtoull(v, nullptr, 16) : uint64_t {0};
+					}();
+					if (dump_hash != 0 && state.program.shader_hash == dump_hash &&
+					    state.program.info.gpu_fetch_side_effects &&
+					    state.fault_buffer_variable != 0u) {
+						constexpr uint32_t RecordIndex =
+						    static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u) + 2u;
+						EmitIfCondition(state, NotBool(state, ok), [&]() {
+							const uint32_t values[] = {ArgLow(inst, 0), ArgLow(inst, 1),
+							                           ArgLow(inst, 2), Narrow(state, byte_offset)};
+							for (uint32_t i = 0; i < 4; i++) {
+								const auto pointer = state.builder.AllocateId();
+								state.builder.AddFunction({OpAccessChain,
+								                           TypeStorageBufferElementPointer(state),
+								                           pointer, state.fault_buffer_variable,
+								                           ConstantU32(state, 0),
+								                           ConstantU32(state, RecordIndex + 5u + i)});
+								state.builder.AddFunction({OpStore, pointer, values[i]});
+							}
+						});
+					}
+				}
 				const auto read = ReadGuestDword(address, And(condition, ok));
 				condition       = And(And(condition, ok), read.present);
 				result          = Widen(state, read.value);
@@ -608,6 +746,9 @@ private:
 	std::vector<uint32_t>     m_conditions;
 	std::vector<uint8_t>      m_written;
 	uint32_t                  m_true = 0;
+	uint32_t                  m_fail_address = 0;
+	uint32_t                  m_fail_reason  = 0;
+	bool                      m_ud_recorded  = false;
 };
 
 // One root on an emitter that may already hold the steps of the roots before it.
@@ -651,6 +792,10 @@ void EmitSrtFlatRoots(ValueEmitContext& ctx, const IR::SrtFlatProgram& program,
 			continue;
 		}
 		lowered[index] = RunRoot(emitter, ctx, *request.root, request.results);
+	}
+	for (auto& root: lowered) {
+		root.fail_address = emitter.FailAddress();
+		root.fail_reason  = emitter.FailReason();
 	}
 }
 

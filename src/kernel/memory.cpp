@@ -12,6 +12,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <fmt/format.h>
 #include <atomic>
@@ -1012,6 +1013,20 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
+	// Diagnostic (docs/sync-points-design.md, step 2 fact check): KYTY_WATCH_ADDR names a guest
+	// address; every backing write that covers it is printed with the dword it writes there.
+	static const uint64_t watch = [] {
+		const char* v = std::getenv("KYTY_WATCH_ADDR");
+		return v != nullptr ? std::strtoull(v, nullptr, 16) : uint64_t {0};
+	}();
+	if (watch != 0 && vaddr <= watch && watch + 4 <= vaddr + size) {
+		uint32_t value = 0;
+		std::memcpy(&value, static_cast<const uint8_t*>(data) + (watch - vaddr), 4);
+		std::printf("watch-write: addr=0x%llx value=0x%08x from range 0x%llx+0x%llx\n",
+		            static_cast<unsigned long long>(watch), value,
+		            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+		std::fflush(stdout);
+	}
 	if (!TryWriteBacking(vaddr, data, size)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",

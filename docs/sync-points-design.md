@@ -499,3 +499,53 @@ wrong in the way the report said (validity of every root instead of the active o
 "one frame late" story is wrong in replay because a skipped producer's consumers run in the same
 frame. The 19 ms is unexplained until a build without skips exists.
 
+### Step 2 fact check, part two: what the safety net actually rejects (checked by hand)
+
+Instrumented by hand on September 12 (env-gated diagnostics, kept: `KYTY_GPU_FETCH_SKIP_DIAG`,
+`KYTY_GPU_FETCH_DUMP_HASH` / `_TARGET` / `_PEEK`, `KYTY_WATCH_ADDR`, `KYTY_PROLOGUE_IMPORT_FIRST`;
+runs under `_Runtime/_Diagnostics/replay/nexus-6/fc-*`). Corrections to part one first: the
+"corrupted PM4 stream" and "access violation" crashes were artifacts of the replay's 2 s watchdog
+cutting frames on dirty builds whose pipelines were recompiling, not corruption; only the garbage
+T# crash (`unsupported texture mip view`, descriptors.cpp:618) is real. The 95 misses a loop are
+new pages every loop (3,112 misses after loop 1, 3,102 distinct, none seen before), which fits
+garbage pointers but was not traced to a cause.
+
+The skips themselves, traced to one program (`0xbd67e1fc11a54e84`, cs, 176 reads, 136 lowered):
+
+- The shader's first failing read was a `ReadBuffer` whose V# read as zero (dwords 0,0,0, offset
+  0x34, address 0x20). Its page-table entries were correct (stored equals computed, both tables),
+  the import's bytes matched guest memory both from the host and through a GPU copy, and the
+  mirror's bytes matched too. No page-table, import or mirror fault.
+- The program is dispatched 25 times a loop with 9 different SRT roots. For 4 of them (user data
+  `0x01b06578`, `0x01b06620`, `0x01b06e50`, `0x01b06ef8`) the V# table lives on page
+  `0x20fa7d000`, and there the CPU's own evaluation of the same flat read fails as well
+  (`flat-read[56] ... ReadBuffer arg0=r85(0x0)`), for the same reason: the V# is zero in guest
+  memory at record time. A watch on that dword (`KYTY_WATCH_ADDR=20fa7d1d0`) shows it written by
+  fault downloads of the GPU range `0x20fa7cfe0+0x6c0`, alternately with the valid V#
+  (`0x0f97b520`) and with zero: the GPU clears that table and refills it within the frame.
+- So the read is a speculative one: the recompiler flattens every `ReadConst` the shader might
+  execute, and in those 4 dispatches the shader never executes this one (its table slot is
+  legitimately empty at that point of the frame). The CPU path only survives because it evaluates
+  the read eagerly against a stale guest copy made by an earlier download, which happens to hold
+  the previous fill. Materialization failure is fatal on the CPU path (pipelineCache.cpp:202), so
+  this is a latent fragility there too, masked by luck.
+
+Conclusion: the safety net is wrong by construction. It makes an unexecuted, speculative read
+fatal, skips the dispatch, and every consumer of that dispatch then reads tables that were never
+written: the cascade (6,272 skipped invocations a run, all in the first GPU-path loop), the garbage
+pointers, the T# crash. The "inactive roots under control flow" diagnosis of part one was wrong
+(these programs have no control flow); the truth is coarser: the prologue must not decide a
+dispatch's fate on reads the shader may never execute.
+
+What follows for the design:
+
+1. No skip for flat reads. An invalid read yields zero, exactly as stage 1b already does for
+   consumers; the console reads garbage there too and the game does not use it.
+2. Buffer roots: the same, for the same reason. What the crash investigation of September 11
+   actually showed is a *CPU-side* decoder dying on a garbage descriptor that the GPU wrote
+   (`unsupported texture mip view` is the same failure). GPU-driven games leave garbage in unused
+   table slots; the host decoders (T# and V#) must treat a descriptor they cannot decode as an
+   absent resource and skip the draw or bind nothing, never `EXIT`. That is the safety net, on the
+   CPU side, where it belongs.
+3. With the skips gone, the per-wave cost of the prologue (the "19 ms") becomes measurable for
+   the first time, and the 95 misses either vanish with the cascade or get their own trace.

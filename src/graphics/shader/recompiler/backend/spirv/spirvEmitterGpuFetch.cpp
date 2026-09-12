@@ -20,6 +20,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include <array>
+#include <string>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
@@ -161,7 +163,8 @@ void CountSideEffectSkip(EmitterState& state) {
 // in every invocation and the branch is uniform by construction; the subgroup vote makes that
 // explicit and keeps a divergence, if one were ever possible, on the conservative side (the whole
 // subgroup skips rather than half of it storing).
-void EmitSideEffectGuard(EmitterState& state, uint32_t invalid) {
+void EmitSideEffectGuard(EmitterState& state, uint32_t invalid, uint32_t first_invalid,
+                         uint32_t fail_address, uint32_t fail_reason) {
 	const auto voted = state.builder.AllocateId();
 	state.builder.AddFunction({OpGroupNonUniformAny, TypeBool(state), voted,
 	                           ConstantU32(state, ScopeSubgroup), invalid});
@@ -174,6 +177,40 @@ void EmitSideEffectGuard(EmitterState& state, uint32_t invalid) {
 		SetFeedbackBit(state);
 	}
 	CountSideEffectSkip(state);
+	// Diagnostic record (docs/sync-points-design.md, step 2 fact check): the first target the
+	// prologue found invalid and this program's feedback slot, two dwords past the skip counter.
+	if (state.fault_buffer_variable != 0u && first_invalid != 0u) {
+		constexpr uint32_t RecordIndex =
+		    static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u) + 2u;
+		const auto target_pointer = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+		                           target_pointer, state.fault_buffer_variable,
+		                           ConstantU32(state, 0), ConstantU32(state, RecordIndex)});
+		state.builder.AddFunction({OpStore, target_pointer, first_invalid});
+		if (CanRecordFeedback(state)) {
+			const auto slot =
+			    EmitShaderDataDwordLoad(state, state.program.bindings.feedback_slot_dword);
+			const auto slot_pointer = state.builder.AllocateId();
+			state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+			                           slot_pointer, state.fault_buffer_variable,
+			                           ConstantU32(state, 0), ConstantU32(state, RecordIndex + 1u)});
+			state.builder.AddFunction({OpStore, slot_pointer, slot});
+		}
+		if (false && fail_address != 0u && fail_reason != 0u) {
+			const auto low  = Narrow(state, fail_address);
+			const auto high = Narrow(state, Binary(state, OpShiftRightLogical, TypeScalarU64(state),
+			                                       fail_address, WideConstant(state, 32)));
+			const uint32_t values[] = {low, high, fail_reason};
+			for (uint32_t i = 0; i < 3; i++) {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+				                           pointer, state.fault_buffer_variable,
+				                           ConstantU32(state, 0),
+				                           ConstantU32(state, RecordIndex + 2u + i)});
+				state.builder.AddFunction({OpStore, pointer, values[i]});
+			}
+		}
+	}
 	state.builder.AddFunction({OpReturn});
 	EmitLabel(state, merge_label);
 }
@@ -191,10 +228,40 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 	// evaluates, and skips the whole dispatch rather than deriving anything from a zero.
 	const bool guarded = state.program.info.gpu_fetch_side_effects;
 	uint32_t   invalid = 0;
-	const auto note_invalid = [&](uint32_t valid) {
-		if (guarded) {
-			invalid = AnyOf(state, invalid, NotBool(state, valid));
+	uint32_t   first_invalid = guarded ? ConstantU32(state, UINT32_MAX) : 0u;
+	// Diagnostic bisection (KYTY_GUARD_SELECT): "reads", "buffers", "lt<N>" or "ge<N>" restrict
+	// which prologue targets feed the safety net, by target kind or by target index.
+	static const std::string guard_select = [] {
+		const char* value = std::getenv("KYTY_GUARD_SELECT");
+		return std::string(value != nullptr ? value : "");
+	}();
+	const auto note_invalid = [&](uint32_t valid, uint32_t target_index, bool is_read) {
+		if (!guarded) {
+			return;
 		}
+		if (!guard_select.empty()) {
+			if (guard_select == "reads" && !is_read) {
+				return;
+			}
+			if (guard_select == "buffers" && is_read) {
+				return;
+			}
+			if (guard_select.rfind("lt", 0) == 0 &&
+			    !(target_index < static_cast<uint32_t>(std::atoi(guard_select.c_str() + 2)))) {
+				return;
+			}
+			if (guard_select.rfind("ge", 0) == 0 &&
+			    !(target_index >= static_cast<uint32_t>(std::atoi(guard_select.c_str() + 2)))) {
+				return;
+			}
+		}
+		invalid = AnyOf(state, invalid, NotBool(state, valid));
+		first_invalid =
+		    Select(state, TypeU32(state),
+		           AllOf(state, NotBool(state, valid),
+		                 Binary(state, OpIEqual, TypeBool(state), first_invalid,
+		                        ConstantU32(state, UINT32_MAX))),
+		           ConstantU32(state, target_index), first_invalid);
 	};
 	// Every root of the prologue is lowered in one pass on one emitter: the roots of a program
 	// walk the same SRT chain and differ only in their last steps, so a step another root already
@@ -264,7 +331,7 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 			// A root the shader could not walk reads as zero, exactly as an invalid descriptor
 			// root does; the unmapped page it failed on already set its fault bit. A guarded
 			// program never reaches the use: the prologue returns first.
-			note_invalid(lowered.valid);
+			note_invalid(lowered.valid, static_cast<uint32_t>(index), true);
 			state.gpu_read_values[slot] =
 			    Select(state, TypeU32(state), lowered.valid, Narrow(state, lowered.results[0]),
 			           ConstantU32(state, 0));
@@ -276,7 +343,7 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, resource,
 			                             "shader-fetched descriptor root has no SPIR-V lowering");
 		}
-		note_invalid(lowered.valid);
+		note_invalid(lowered.valid, static_cast<uint32_t>(index), false);
 		std::array<uint32_t, 4> dword {};
 		for (uint32_t index = 0; index < dword.size(); index++) {
 			dword[index] = Narrow(state, lowered.results[index]);
@@ -342,7 +409,9 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 		mismatch = AnyOf(state, mismatch, AllOf(state, lowered.valid, differs));
 	}
 	if (guarded && invalid != 0u) {
-		EmitSideEffectGuard(state, invalid);
+		EmitSideEffectGuard(state, invalid, first_invalid,
+		                    lowered_roots.empty() ? 0u : lowered_roots[0].fail_address,
+		                    lowered_roots.empty() ? 0u : lowered_roots[0].fail_reason);
 	}
 	RecordFeedback(state, mismatch);
 }

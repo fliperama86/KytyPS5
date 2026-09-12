@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
@@ -27,7 +28,7 @@ constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 // no entry since the last pass (docs/sync-points-design.md, step 1), and how many dispatches of a
 // side-effect program the prologue's safety net skipped (step 2).
 constexpr size_t PrologueCounterSize  = 64;
-constexpr size_t PrologueCounterBytes = 2 * sizeof(uint32_t);
+constexpr size_t PrologueCounterBytes = 16 * sizeof(uint32_t);
 constexpr size_t DownloadAreaSize    = PageFaultAreaSize + PrologueCounterSize;
 
 } // namespace
@@ -179,6 +180,14 @@ void FaultManager::ProcessFaultBuffer() {
 			if (counters[1] != 0) {
 				NoteGpuFetchSkips(counters[1]);
 				m_buffer_cache.NoteGpuFetchSkips(counters[1]);
+				static const bool skip_diag = std::getenv("KYTY_GPU_FETCH_SKIP_DIAG") != nullptr;
+				if (skip_diag) {
+					std::printf("skip-last: skips=%u slot=%u target=%u fail_addr=0x%08x%08x reason=%u vsharp=%08x,%08x,%08x offset=0x%x zero_read=0x%08x%08x via=0x%08x%08x ud=0x%08x\n", counters[1],
+					            counters[3], counters[2], counters[5], counters[4], counters[6],
+					            counters[7], counters[8], counters[9], counters[10], counters[12],
+					            counters[11], counters[14], counters[13], counters[15]);
+					std::fflush(stdout);
+				}
 			}
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {

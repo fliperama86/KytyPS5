@@ -825,6 +825,9 @@ struct SrtLoweredRoot {
 	uint32_t                count = 0;
 	// Bool id, false exactly where FlatMachine::Run would have returned false.
 	uint32_t                valid = 0;
+	// Diagnostic ids from the shared emitter: first failing guest read (u64) and its reason (u32).
+	uint32_t                fail_address = 0;
+	uint32_t                fail_reason  = 0;
 	// False when the root contains a step with no shader-side lowering at all.
 	bool                    supported = true;
 };

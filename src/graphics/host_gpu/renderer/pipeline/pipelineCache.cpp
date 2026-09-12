@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/descriptorFeedback.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -558,6 +559,14 @@ struct PipelineCache::ProgramCache {
 		auto& source    = *feedback_slots[slot];
 		source.cpu_next = true;
 		source.mismatches++;
+		{
+			static const bool skip_diag = std::getenv("KYTY_GPU_FETCH_SKIP_DIAG") != nullptr;
+			if (skip_diag) {
+				std::printf("feedback: slot=%u hash=0x%016" PRIx64 "\n", slot,
+				            source.resource_plan.shader_hash);
+				std::fflush(stdout);
+			}
+		}
 		if (SrtStats::Enabled()) {
 			SrtStats::RecordGpuDescriptor(SrtStats::GpuDescriptorEvent::FeedbackBit);
 		}
@@ -664,6 +673,217 @@ struct PipelineCache::ProgramCache {
 					source.cpu_next = true;
 				}
 				ReportMaterialization(label, stage, params.hash, report, ok);
+			}
+			if (gpu_capable && (source.cpu_next || !gpu_path || true)) {
+				// Diagnostic (KYTY_GPU_FETCH_SKIP_DIAG): the shader's safety net sent this program
+				// back to the CPU path. Evaluate every descriptor source, active or not, the way the
+				// prologue does, and say which one fails and whether the plan's control flow would
+				// have left it inactive.
+				static const bool skip_diag = std::getenv("KYTY_GPU_FETCH_SKIP_DIAG") != nullptr;
+				if (skip_diag && (source.cpu_next || !gpu_path)) {
+					const auto& plan = source.resource_plan;
+					std::vector<uint32_t> all(plan.descriptor_sources.size());
+					for (uint32_t i = 0; i < all.size(); i++) {
+						all[i] = i;
+					}
+					std::vector<ShaderRecompiler::IR::DescriptorValue> values;
+					const bool all_ok =
+					    ShaderRecompiler::IR::EvaluateDescriptorSources(plan, all, runtime, values);
+					std::string detail;
+					bool        gated = false;
+					if (!all_ok) {
+						const auto& failure = ShaderRecompiler::IR::LastSrtFailure();
+						detail              = ShaderRecompiler::IR::FormatSrtFailure(failure);
+						for (const auto& block: plan.control_flow) {
+							for (const auto src: block.sources) {
+								if (src == failure.index) {
+									gated = true;
+								}
+							}
+						}
+					}
+					// KYTY_GPU_FETCH_DUMP_HASH / _TARGET: replay one prologue target's root on the
+					// CPU with every guest read logged, to compare with what the shader rejected.
+					static const uint64_t dump_hash = [] {
+						const char* v = std::getenv("KYTY_GPU_FETCH_DUMP_HASH");
+						return v != nullptr ? std::strtoull(v, nullptr, 16) : uint64_t {0};
+					}();
+					static const long dump_target = [] {
+						const char* v = std::getenv("KYTY_GPU_FETCH_DUMP_TARGET");
+						return v != nullptr ? std::atol(v) : -1L;
+					}();
+					if (false && dump_hash == params.hash && dump_target >= 0) {
+						uint32_t slot = UINT32_MAX;
+						long     seen = -1;
+						for (uint32_t i = 0; i < source.gpu_read_slots.size(); i++) {
+							if (source.gpu_read_slots[i] != 0u && ++seen == dump_target) {
+								slot = i;
+								break;
+							}
+						}
+						if (slot != UINT32_MAX && slot < plan.srt_reads.size()) {
+							std::vector<uint8_t> skip_flat(plan.srt_reads.size(), 1u);
+							const auto           offset = plan.srt_reads[slot].flat_offset;
+							if (offset < skip_flat.size()) {
+								skip_flat[offset] = 0u;
+							}
+							auto dump_runtime        = runtime;
+							dump_runtime.read_memory = [](void*, uint64_t address,
+							                              uint32_t* value) {
+								std::memcpy(value, reinterpret_cast<const void*>(address),
+								            sizeof(*value));
+								std::printf("dump-read: addr=0x%016llx value=0x%08x\n",
+								            static_cast<unsigned long long>(address), *value);
+								return true;
+							};
+							std::vector<ShaderRecompiler::IR::DescriptorValue> r2;
+							std::vector<uint32_t>                              flat2;
+							std::vector<uint8_t>                               active2;
+							const bool ok2 = ShaderRecompiler::IR::EvaluateRuntimeSources(
+							    plan, {}, dump_runtime, r2, flat2, plan.clean_flat_slots, active2,
+							    {}, skip_flat);
+							std::printf("dump-root: target=%ld slot=%u flat_offset=%u ok=%d value=0x%08x\n",
+							            dump_target, slot, offset, ok2 ? 1 : 0,
+							            ok2 && offset < flat2.size() ? flat2[offset] : 0u);
+							std::fflush(stdout);
+						}
+					}
+					std::printf("skip-diag: %s 0x%016" PRIx64 " sources=%zu reads=%zu blocks=%zu "
+					            "all-sources=%s gated=%d %s\n",
+					            stage_name, params.hash, plan.descriptor_sources.size(),
+					            plan.srt_reads.size(), plan.control_flow.size(),
+					            all_ok ? "ok" : "FAIL", gated ? 1 : 0, detail.c_str());
+					std::fflush(stdout);
+				}
+			}
+			{
+				static const uint64_t dump_hash2 = [] {
+					const char* v = std::getenv("KYTY_GPU_FETCH_DUMP_HASH");
+					return v != nullptr ? std::strtoull(v, nullptr, 16) : uint64_t {0};
+				}();
+				static const long dump_target2 = [] {
+					const char* v = std::getenv("KYTY_GPU_FETCH_DUMP_TARGET");
+					return v != nullptr ? std::atol(v) : -1L;
+				}();
+				static int dump_count = 0;
+				static const uint64_t peek_addr = [] {
+					const char* v = std::getenv("KYTY_GPU_FETCH_PEEK");
+					return v != nullptr ? std::strtoull(v, nullptr, 16) : uint64_t {0};
+				}();
+				static int eval_count = 0;
+				if (dump_hash2 == params.hash && eval_count < 80) {
+					eval_count++;
+					// Every dispatch of the named program: its first user-data register and whether
+					// the CPU can evaluate every flat read and every source, with the failure.
+					const auto& plan = source.resource_plan;
+					std::vector<ShaderRecompiler::IR::DescriptorValue> r3;
+					std::vector<uint32_t>                              flat3;
+					std::vector<uint8_t>                               active3;
+					const bool ok3 = ShaderRecompiler::IR::EvaluateRuntimeSources(
+					    plan, plan.materialization_sources, runtime, r3, flat3, plan.clean_flat_slots,
+					    active3, {}, {});
+					std::string detail;
+					if (!ok3) {
+						detail = ShaderRecompiler::IR::FormatSrtFailure(ShaderRecompiler::IR::LastSrtFailure());
+					}
+					// For this program's SRT shape: root table at (ud0 | 2<<32), pointer at +0x10,
+					// V# at pointer + 0x10. Print both so a watch can follow who writes the V#.
+					uint64_t ptr = 0, vsharp_addr = 0; uint32_t vsharp0 = 0;
+					if (!params.user_data.empty()) {
+						const uint64_t root = (uint64_t {params.user_data[1]} << 32) | params.user_data[0];
+						uint32_t lo = 0, hi = 0;
+						std::memcpy(&lo, reinterpret_cast<const void*>(root + 0x10), 4);
+						std::memcpy(&hi, reinterpret_cast<const void*>(root + 0x14), 4);
+						ptr = (uint64_t {hi} << 32) | lo;
+						vsharp_addr = ptr + 0x10;
+						if (ptr != 0) std::memcpy(&vsharp0, reinterpret_cast<const void*>(vsharp_addr), 4);
+					}
+					std::printf("dump-chain: ud0=0x%08x ptr=0x%llx vsharp_addr=0x%llx vsharp0=0x%08x\n",
+					            params.user_data.empty() ? 0u : params.user_data[0],
+					            static_cast<unsigned long long>(ptr),
+					            static_cast<unsigned long long>(vsharp_addr), vsharp0);
+					std::printf("dump-eval: gpu_path=%d ud0=0x%08x ok=%d %s\n", gpu_path ? 1 : 0,
+					            params.user_data.empty() ? 0u : params.user_data[0], ok3 ? 1 : 0,
+					            detail.c_str());
+					std::fflush(stdout);
+				}
+				if (dump_hash2 == params.hash && dump_count < 3) {
+					std::string ud;
+					for (size_t i = 0; i < params.user_data.size() && i < 24; i++) {
+						char buffer[16];
+						std::snprintf(buffer, sizeof(buffer), "%08x ", params.user_data[i]);
+						ud += buffer;
+					}
+					std::printf("dump-ud-cpu: base=%u count=%zu %s\n", source.resource_plan.user_data_base,
+					            params.user_data.size(), ud.c_str());
+					std::fflush(stdout);
+				}
+				if (dump_hash2 == params.hash && peek_addr != 0 && dump_count < 3) {
+					uint32_t host_value = 0;
+					std::memcpy(&host_value, reinterpret_cast<const void*>(peek_addr & ~uint64_t {3}), 4);
+					uint64_t entry = 0; bool registered = false, gpu_modified = false, import_readable = false,
+					         mirror_readable = false, cpu_modified = false;
+					uint32_t import_value = 0, mirror_value = 0;
+					BufferCache::DiagnosePage(peek_addr, &entry, &registered, &gpu_modified, &import_value,
+					                          &import_readable, &mirror_value, &mirror_readable, &cpu_modified);
+					std::printf("peek: addr=0x%llx host=0x%08x registered=%d gpu_mod=%d cpu_mod=%d mirror=%d:0x%08x import=%d:0x%08x\n",
+					            static_cast<unsigned long long>(peek_addr), host_value, registered ? 1 : 0,
+					            gpu_modified ? 1 : 0, cpu_modified ? 1 : 0, mirror_readable ? 1 : 0, mirror_value,
+					            import_readable ? 1 : 0, import_value);
+					std::fflush(stdout);
+				}
+				if (dump_hash2 == params.hash && dump_target2 >= 0 && dump_count < 3) {
+					const auto& plan = source.resource_plan;
+					uint32_t slot = UINT32_MAX;
+					long     seen = -1;
+					for (uint32_t i = 0; i < source.gpu_read_slots.size(); i++) {
+						if (source.gpu_read_slots[i] != 0u && ++seen == dump_target2) {
+							slot = i;
+							break;
+						}
+					}
+					if (slot != UINT32_MAX && slot < plan.srt_reads.size()) {
+						dump_count++;
+						std::vector<uint8_t> skip_flat(plan.srt_reads.size(), 1u);
+						const auto           offset = plan.srt_reads[slot].flat_offset;
+						if (offset < skip_flat.size()) {
+							skip_flat[offset] = 0u;
+						}
+						auto dump_runtime        = runtime;
+						dump_runtime.read_memory = [](void*, uint64_t address, uint32_t* value) {
+							std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+							uint64_t entry        = 0;
+							bool     registered   = false;
+							bool     gpu_modified = false;
+							uint32_t import_value    = 0;
+							bool     import_readable = false;
+							uint32_t mirror_value    = 0;
+							bool     mirror_readable = false;
+							bool     cpu_modified    = false;
+							BufferCache::DiagnosePage(address, &entry, &registered, &gpu_modified,
+							                          &import_value, &import_readable, &mirror_value,
+							                          &mirror_readable, &cpu_modified);
+							std::printf("dump-page: addr=0x%016llx entry=0x%016llx registered=%d gpu_modified=%d cpu_modified=%d mirror=%d:0x%08x import=%d:0x%08x\n",
+							            static_cast<unsigned long long>(address),
+							            static_cast<unsigned long long>(entry), registered ? 1 : 0,
+							            gpu_modified ? 1 : 0, cpu_modified ? 1 : 0, mirror_readable ? 1 : 0,
+							            mirror_value, import_readable ? 1 : 0, import_value);
+							std::printf("dump-read: addr=0x%016llx value=0x%08x\n",
+							            static_cast<unsigned long long>(address), *value);
+							return true;
+						};
+						std::vector<ShaderRecompiler::IR::DescriptorValue> r2;
+						std::vector<uint32_t>                              flat2;
+						std::vector<uint8_t>                               active2;
+						const bool ok2 = ShaderRecompiler::IR::EvaluateRuntimeSources(
+						    plan, {}, dump_runtime, r2, flat2, plan.clean_flat_slots, active2, {},
+						    skip_flat);
+						std::printf("dump-root: gpu_path=%d target=%ld slot=%u flat_offset=%u ok=%d value=0x%08x\n",
+						            gpu_path ? 1 : 0, dump_target2, slot, offset, ok2 ? 1 : 0,
+						            ok2 && offset < flat2.size() ? flat2[offset] : 0u);
+						std::fflush(stdout);
+					}
+				}
 			}
 			if (gpu_capable && !gpu_path) {
 				if (SrtStats::Enabled()) {

@@ -59,6 +59,11 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// Diagnostic (docs/sync-points-design.md, step 2 fact check): what the prologue table and the
+	// tracker say about the page holding vaddr. Reads the last constructed cache.
+	static void DiagnosePage(uint64_t vaddr, uint64_t* entry, bool* registered, bool* gpu_modified,
+	                         uint32_t* import_value, bool* import_readable, uint32_t* mirror_value,
+	                         bool* mirror_readable, bool* cpu_modified);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,

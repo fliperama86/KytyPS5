@@ -465,3 +465,37 @@ setting-on configuration are far past that. Artifacts:
 `readback-faults-se-true.json`) and `_Runtime/_Diagnostics/replay/title-2/runs-step2/`, where the
 setting is neutral (median 28.5 / 28.2 off against 27.8 / 28.1 on, 6 faults a loop either way, no
 skips, no crash).
+
+## Step 2 fact check, September 12 (checked by hand against the logs and reports)
+
+Three claims from the step 2 report, and what the raw data says. Runs under
+`_Runtime/_Diagnostics/replay/nexus-6/{runs-step2,fc-misses,fc-on,fc-exclude}/`.
+
+1. **"The 19 ms is the prologue re-evaluated per wave": not isolated, and not measurable on this
+   build.** Every run with `--gpu-fetch-side-effects true` is corrupt from loop 2 on: the safety
+   net skips 160 dispatches a loop (0 in loop 1, where first encounters take the CPU path), their
+   consumers run in the same frame on tables that were never written, and the runs die three
+   different ways: the host decoding a garbage T# (`unsupported texture mip view`,
+   descriptors.cpp:618, `runs-step2` run 1 and `fc-on` run 2), a corrupted PM4 stream
+   (`Not implemented (cmd_id != 0xc0005900)`, pm4Handlers.cpp:1428, `fc-misses`), and an access
+   violation on the render thread (`fc-exclude` run 1); the replay watchdog also cuts frames at
+   2 s. The one loop count that survived (96.7 ms min, 22 faults, 59.6 ms of wait) includes whatever
+   garbage dispatches cost. The per-wave mechanism remains plausible (342 marked programs, the
+   largest lowering 226 to 287 reads in 490k to 690k SPIR-V words) but nothing prices it until the
+   skips are gone. A bisection that kept 174 large non-faulting programs on the CPU path
+   (`KYTY_GPU_FETCH_EXCLUDE`, a temporary switch, not committed) crashed in both runs.
+2. **"1,244 clears no longer recognized": a misreading, no cost.** `NoteComputeClear(false)` counts
+   dispatches the recognizers declined to examine because the program fetches its own descriptors
+   (renderCompute.cpp, `HasFetchedDescriptors`); it does not count lost clears. Consumed clears are
+   4 a loop with the setting off and on.
+3. **The 95 data-table misses a loop: garbage reads, not a leak.** With console logging
+   (`fc-misses`), 4,005 missed pages over under two loops are 3,927 distinct addresses across 126
+   different 16 MiB regions of the mapped guest space. The same frame replayed cannot touch new
+   legitimate pages every loop; these are pointers read from tables the skipped producers never
+   wrote. Same cause as the crashes.
+
+Net: the mechanism holds (faults 89 to 22 a loop, the compute class), the safety-net design is
+wrong in the way the report said (validity of every root instead of the active ones), and the
+"one frame late" story is wrong in replay because a skipped producer's consumers run in the same
+frame. The 19 ms is unexplained until a build without skips exists.
+

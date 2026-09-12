@@ -23,22 +23,23 @@ namespace {
 
 constexpr size_t MaxPageFaults    = 1024;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+// One dword, padded so each download area stays 64-byte aligned: how many prologue reads found no
+// entry since the last pass (docs/sync-points-design.md, step 1).
+constexpr size_t PrologueCounterSize = 64;
+constexpr size_t DownloadAreaSize    = PageFaultAreaSize + PrologueCounterSize;
 
 } // namespace
 
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
-                           BufferCache& buffer_cache, Role role)
-    : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache), m_role(role),
+                           BufferCache& buffer_cache, bool with_prologue_counter)
+    : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
+      m_prologue_counter(with_prologue_counter),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+                     BufferCache::CACHING_NUMPAGES / 8 +
+                         (with_prologue_counter ? PrologueCounterSize : 0)),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * PageFaultAreaSize) {
-	if (m_role == Role::Prologue) {
-		SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(),
-		                     "Prologue Fault Buffer");
-	} else {
-		SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
-	}
+                        MaxPendingFaults * DownloadAreaSize) {
+	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
@@ -94,27 +95,33 @@ void FaultManager::ProcessFaultBuffer() {
 		m_scheduler.PopPendingOperations();
 	}
 
-	const auto offset = m_current_area * PageFaultAreaSize;
-	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, PageFaultAreaSize);
-	m_download_buffer.Flush(offset, PageFaultAreaSize);
+	constexpr uint64_t BitmapBytes = BufferCache::CACHING_NUMPAGES / 8;
+	const auto         offset      = m_current_area * DownloadAreaSize;
+	auto*              mapped      = m_download_buffer.Mapped().data() + offset;
+	std::memset(mapped, 0, DownloadAreaSize);
+	m_download_buffer.Flush(offset, DownloadAreaSize);
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
-	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader |
+	                           vk::PipelineStageFlagBits2::eTransfer;
+	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+	                            vk::AccessFlagBits2::eTransferRead |
+	                            vk::AccessFlagBits2::eTransferWrite;
 	pre_barrier.buffer        = m_fault_buffer.Handle();
 	pre_barrier.offset        = 0;
 	pre_barrier.size           = m_fault_buffer.Size();
 	auto post_barrier         = pre_barrier;
-	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader |
+	                            vk::PipelineStageFlagBits2::eTransfer;
+	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite |
+	                             vk::AccessFlagBits2::eTransferWrite;
 	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
-	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
+	    {m_fault_buffer.Handle(), 0, BitmapBytes},
 	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
@@ -139,12 +146,18 @@ void FaultManager::ProcessFaultBuffer() {
 	const auto num_workgroups = (num_threads + 63) / 64;
 	m_graphics.RecordShaderCheckpoint(command, 0xffff000000000001ull);
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	if (m_prologue_counter) {
+		// Step 1: the prologue's miss counter, taken and cleared beside the bitmap it shares.
+		const vk::BufferCopy copy {BitmapBytes, offset + PageFaultAreaSize, sizeof(uint32_t)};
+		command.copyBuffer(m_fault_buffer.Handle(), m_download_buffer.Handle(), 1, &copy);
+		command.fillBuffer(m_fault_buffer.Handle(), BitmapBytes, sizeof(uint32_t), 0u);
+	}
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, area] {
-		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
+		m_download_buffer.Invalidate(offset, DownloadAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
@@ -153,9 +166,12 @@ void FaultManager::ProcessFaultBuffer() {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
 		}
-		if (m_role == Role::Prologue) {
-			for (uint32_t index = 1; index <= count; ++index) {
-				m_buffer_cache.NotePrologueFaultPage(faults[index]);
+		if (m_prologue_counter) {
+			const auto misses =
+			    *std::bit_cast<const uint32_t*>(mapped + PageFaultAreaSize);
+			if (misses != 0) {
+				NoteBdaFaultPages(misses, true);
+				m_buffer_cache.NotePrologueMisses(misses);
 			}
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
@@ -176,7 +192,7 @@ void FaultManager::RecordFaults(std::span<const uint64_t> pages) {
 	m_window_passes++;
 	m_fault_pages += pages.size();
 	m_window_pages += pages.size();
-	NoteBdaFaultPages(pages.size(), m_role == Role::Prologue);
+	NoteBdaFaultPages(pages.size(), false);
 	for (const auto address: pages) {
 		const auto page = address & ~(BufferCache::CACHING_PAGESIZE - 1);
 		m_fault_ring[m_fault_ring_next % FaultRingSize] = {page, m_fault_passes};
@@ -193,7 +209,7 @@ void FaultManager::RecordFaults(std::span<const uint64_t> pages) {
 	}
 	// Stage 1 bring-up: how much of the guest memory a shader touches is one or more frames late.
 	if (Config::GpuDescriptorsEnabled() && (m_fault_passes % 60) == 0) {
-		const char* label = m_role == Role::Prologue ? "gpu-prologue-table" : "gpu-descriptors";
+		const char* label = "gpu-descriptors";
 		std::printf("%s: fault pages %" PRIu64 " in the last %" PRIu64
 		            " processing passes (total %" PRIu64 " over %" PRIu64 ")\n",
 		            label, m_window_pages, m_window_passes, m_fault_pages, m_fault_passes);

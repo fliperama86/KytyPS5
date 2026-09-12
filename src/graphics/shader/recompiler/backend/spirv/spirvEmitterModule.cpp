@@ -206,15 +206,6 @@ void DefineDescriptorVariables(EmitterState& state) {
 		state.descriptor_feedback_variable = state.builder.DefineGlobalVariable(
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::BdaPrologueTable) != nullptr) {
-		state.bda_prologue_table_variable = state.builder.DefineGlobalVariable(
-		    TypePointer(state, StorageClassStorageBuffer, BdaPagetableType(state)),
-		    StorageClassStorageBuffer);
-	}
-	if (DescriptorBinding(state, IR::DescriptorBindingKind::PrologueFaultBuffer) != nullptr) {
-		state.prologue_fault_buffer_variable = state.builder.DefineGlobalVariable(
-		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
-	}
 	if (state.program.bindings.UsesPushData() || state.stage == ShaderType::Mesh) {
 		const auto pointer_type =
 		    TypePointer(state, StorageClassPushConstant, PushConstantBlockType(state));
@@ -619,14 +610,6 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	if (state.descriptor_feedback_variable != 0) {
 		Decorate(state.descriptor_feedback_variable, "descriptor_feedback",
 		         IR::DescriptorBindingKind::DescriptorFeedback);
-	}
-	if (state.bda_prologue_table_variable != 0) {
-		Decorate(state.bda_prologue_table_variable, "bda_prologue_table",
-		         IR::DescriptorBindingKind::BdaPrologueTable);
-	}
-	if (state.prologue_fault_buffer_variable != 0) {
-		Decorate(state.prologue_fault_buffer_variable, "prologue_fault_buffer",
-		         IR::DescriptorBindingKind::PrologueFaultBuffer);
 	}
 	for (const auto& binding: state.program.bindings.descriptors) {
 		if (IR::ImageBindingResourceClass(binding.kind) == IR::ImageResourceClass::None) {

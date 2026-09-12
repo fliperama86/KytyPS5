@@ -39,13 +39,13 @@ public:
 		uint64_t pages_known = 0;
 	};
 
-	// Step 1 of docs/sync-points-design.md gives the prologue its own fault buffer so a miss of
-	// the prologue page table is counted apart from a miss of the data one. Both register the
-	// faulted page the same way.
-	enum class Role { Data, Prologue };
-
+	// Step 1 of docs/sync-points-design.md: with --gpu-prologue-table the fault buffer carries one
+	// counter dword past the bitmap, which a prologue read that found no entry adds to. The bit
+	// it sets is the same bit a data read sets, so the page is registered exactly as it always
+	// was and the compaction shader still scans one bitmap; only the counter is new, and reading
+	// it back is a four-byte copy.
 	FaultManager(GraphicContext& graphics, CommandScheduler& scheduler, BufferCache& buffer_cache,
-	             Role role = Role::Data);
+	             bool with_prologue_counter = false);
 	~FaultManager();
 	KYTY_CLASS_NO_COPY(FaultManager);
 
@@ -59,7 +59,7 @@ private:
 	GraphicContext&                            m_graphics;
 	CommandScheduler&                          m_scheduler;
 	BufferCache&                               m_buffer_cache;
-	Role                                       m_role = Role::Data;
+	bool                                       m_prologue_counter = false;
 	Buffer                                     m_fault_buffer;
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};

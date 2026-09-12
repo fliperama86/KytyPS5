@@ -99,9 +99,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
-	if (m_bda_prologue_buffer != nullptr) {
-		// The prologue entry of a page the GPU owns is this buffer's mirror; of every other
-		// mapped page, the page itself inside the import. A retirement puts them all back.
+	if (m_prologue_enabled) {
+		// The prologue entry of a page this buffer covers is its mirror, the same address the
+		// data table just took; a retirement puts those pages back to the import.
 		QueuePrologueEntries(buffer.CpuAddress(), buffer.Size());
 	}
 	if constexpr (insert) {
@@ -299,22 +299,18 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies,
 	for (const auto& copy: copies) {
 		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
 	}
-	if (m_bda_prologue_buffer != nullptr) {
-		// The bytes are back in guest memory, so the prologue reads the import again for
-		// every page the GPU no longer owns any of.
-		for (const auto& copy: copies) {
-			PrologueReleasePages(copy.address, copy.size);
-		}
-	}
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
-    : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
+    : m_graphics(graphics), m_scheduler(scheduler),
+      m_fault_manager(graphics, scheduler, *this, Config::GpuPrologueTableEnabled()),
       m_descriptor_feedback(graphics, scheduler),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+                             BDA_PAGETABLE_SIZE *
+                                 (Config::GpuPrologueTableEnabled() ? 2 : 1)),
+      m_prologue_enabled(Config::GpuPrologueTableEnabled()),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -337,16 +333,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
-	// Step 1 of docs/sync-points-design.md: the prologue page table, its own fault buffer and the
-	// guest-memory imports its default entries point at. Nothing of this exists with the setting
-	// off, so main pays no VRAM and no code for it.
-	if (Config::GpuPrologueTableEnabled()) {
-		m_bda_prologue_buffer = std::make_unique<Buffer>(
-		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, BDA_PAGETABLE_SIZE);
-		SetVulkanObjectNameF(m_graphics.device, m_bda_prologue_buffer->Handle(),
-		                     "BDA Prologue Page Table Buffer");
-		m_prologue_fault_manager = std::make_unique<FaultManager>(m_graphics, m_scheduler, *this,
-		                                                          FaultManager::Role::Prologue);
+	// Step 1 of docs/sync-points-design.md: the guest-memory imports the prologue half of the
+	// page table points at for a page no buffer covers. With the setting off the buffer is the
+	// size it always was and nothing here exists.
+	if (m_prologue_enabled) {
 		m_guest_import = std::make_unique<GuestMemoryImport>(m_graphics, m_scheduler);
 	}
 	const auto null_id =
@@ -696,11 +686,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(*buffer);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		if (m_bda_prologue_buffer != nullptr) {
-			// The tracker is about to hand these bytes to the GPU, so the prologue must read
-			// the mirror for them until they are downloaded again.
-			PrologueClaimPages(vaddr, size);
-		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 		// Item 1b, periodic submits: this draw or dispatch is a producer, so --gpu-submit-after-
 		// writes submits the open buffer once it has been recorded.
@@ -1016,26 +1001,24 @@ BufferCache::AddressProbe BufferCache::ProbeAddress(uint64_t address) {
 // an import cost 300 to 400 times a mirror read.
 
 uint64_t BufferCache::PrologueEntryForPage(uint64_t page) {
-	const auto vaddr = page << CACHING_PAGEBITS;
-	if (!m_prologue_gpu_pages.Intersects(vaddr, CACHING_PAGESIZE)) {
-		if (const auto imported = m_guest_import->AddressOf(vaddr); imported != 0) {
-			return imported;
-		}
-	}
+	const auto  vaddr = page << CACHING_PAGEBITS;
 	const auto* owner = m_page_table.Find(page);
 	if (owner != nullptr && *owner) {
 		const auto& buffer = m_slot_buffers[*owner];
 		if (!buffer.is_deleted && buffer.IsInBounds(vaddr, CACHING_PAGESIZE)) {
+			// What the data table says. The BDA scan keeps this mirror up to date before every
+			// draw that reads it, which is the guarantee the prologue has relied on since stage
+			// 1 -- and it is a VRAM read, where the import is one over PCIe.
 			return buffer.BufferDeviceAddress() + (vaddr - buffer.CpuAddress());
 		}
 	}
-	// Nothing imported the page and no buffer covers it: zero, which faults and reads zero, the
-	// behaviour the data table has had all along.
+	// No buffer covers the page, so the data table would fault here and read zero. The import is
+	// what makes that impossible; without one the entry stays zero and behaves as it always has.
 	return m_guest_import->AddressOf(vaddr);
 }
 
 void BufferCache::QueuePrologueEntries(uint64_t vaddr, uint64_t size) {
-	if (m_bda_prologue_buffer == nullptr || size == 0) {
+	if (!m_prologue_enabled || size == 0) {
 		return;
 	}
 	const auto first = vaddr >> CACHING_PAGEBITS;
@@ -1047,67 +1030,6 @@ void BufferCache::QueuePrologueEntries(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-// Any byte of a page handed to the GPU makes the whole page read the mirror: the mirror holds the
-// GPU's writes and the uploads of everything the CPU wrote before them, so it is the safe answer
-// for a page whose ownership is split.
-void BufferCache::PrologueClaimPages(uint64_t vaddr, uint64_t size) {
-	if (size == 0) {
-		return;
-	}
-	const auto begin = vaddr & ~(CACHING_PAGESIZE - 1);
-	const auto end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-	if (m_prologue_gpu_pages.Contains(begin, end - begin)) {
-		return;
-	}
-	std::vector<RangeSet::Range> fresh;
-	auto                         cursor = begin;
-	m_prologue_gpu_pages.ForEachIntersection(begin, end - begin, [&](RangeSet::Range range) {
-		if (range.address > cursor) {
-			fresh.push_back({cursor, range.address - cursor});
-		}
-		cursor = std::max(cursor, range.address + range.size);
-	});
-	if (cursor < end) {
-		fresh.push_back({cursor, end - cursor});
-	}
-	// The set decides what an entry is, so it has to carry the claim before the entries are read.
-	m_prologue_gpu_pages.Add(begin, end - begin);
-	for (const auto& range: fresh) {
-		QueuePrologueEntries(range.address, range.size);
-	}
-}
-
-// The reverse: a page goes back to the import only once no GPU-owned byte is left on it.
-void BufferCache::PrologueReleasePages(uint64_t vaddr, uint64_t size) {
-	if (size == 0) {
-		return;
-	}
-	const auto begin = vaddr & ~(CACHING_PAGESIZE - 1);
-	const auto end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-	std::vector<RangeSet::Range> owned;
-	m_prologue_gpu_pages.ForEachIntersection(begin, end - begin,
-	                                         [&](RangeSet::Range range) { owned.push_back(range); });
-	for (const auto& run: owned) {
-		auto cursor = run.address;
-		m_gpu_modified_ranges.ForEachIntersection(
-		    run.address, run.size, [&](RangeSet::Range dirty) {
-			    const auto dirty_begin = dirty.address & ~(CACHING_PAGESIZE - 1);
-			    const auto dirty_end =
-			        (dirty.address + dirty.size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-			    if (dirty_begin > cursor) {
-				    m_prologue_gpu_pages.Subtract(cursor, dirty_begin - cursor);
-				    QueuePrologueEntries(cursor, dirty_begin - cursor);
-			    }
-			    cursor = std::max(cursor, dirty_end);
-		    });
-		const auto run_end = run.address + run.size;
-		if (cursor < run_end) {
-			m_prologue_gpu_pages.Subtract(cursor, run_end - cursor);
-			QueuePrologueEntries(cursor, run_end - cursor);
-		}
-	}
-}
-
 void BufferCache::FlushPrologueTableImpl() {
 	std::vector<vk::DeviceAddress> values;
 	uint64_t                       run_first = 0;
@@ -1116,8 +1038,8 @@ void BufferCache::FlushPrologueTableImpl() {
         if (values.empty()) {
             return;
         }
-        WriteDataBuffer(*m_bda_prologue_buffer, run_first * sizeof(vk::DeviceAddress),
-                        values.data(), values.size() * sizeof(vk::DeviceAddress));
+        WriteDataBuffer(m_bda_pagetable_buffer, PrologueEntryOffset(run_first), values.data(),
+                        values.size() * sizeof(vk::DeviceAddress));
         values.clear();
 	};
 	for (const auto& [page, value]: m_prologue_pending) {
@@ -1133,8 +1055,46 @@ void BufferCache::FlushPrologueTableImpl() {
 	m_prologue_pending.clear();
 }
 
+bool BufferCache::ImportBackingAlias(uint64_t base, uint64_t size) {
+	if (!m_prologue_enabled || !m_guest_import->Available()) {
+		return false;
+	}
+	return m_guest_import->ImportBackingAlias(base, size);
+}
+
+void BufferCache::MapBackingView(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
+	if (!m_prologue_enabled || !m_guest_import->BackingAliasImported() || size == 0) {
+		return;
+	}
+	if ((vaddr & (CACHING_PAGESIZE - 1)) != 0 || (size & (CACHING_PAGESIZE - 1)) != 0) {
+		return;
+	}
+	m_guest_import->AddBackingView(vaddr, size, backing_offset,
+	                               [this](const GuestMemoryImport::Range& range) {
+		                               WritePrologueImportRun(range);
+	                               });
+}
+
+// The entries of a freshly covered run, straight into the command buffer: no buffer is registered
+// over a range the guest has only just mapped, and anything the pending set still holds for those
+// pages is older than this map.
+void BufferCache::WritePrologueImportRun(const GuestMemoryImport::Range& range) {
+	const auto first = range.address >> CACHING_PAGEBITS;
+	const auto last  = (range.address + range.size) >> CACHING_PAGEBITS;
+	m_prologue_pending.erase(m_prologue_pending.lower_bound(first),
+	                         m_prologue_pending.lower_bound(last));
+	std::vector<vk::DeviceAddress> values;
+	values.reserve(static_cast<size_t>(last - first));
+	for (auto page = first; page < last; ++page) {
+		values.push_back(range.base + ((page - first) << CACHING_PAGEBITS));
+	}
+	WriteDataBuffer(m_bda_pagetable_buffer, PrologueEntryOffset(first), values.data(),
+	                values.size() * sizeof(vk::DeviceAddress));
+	NoteBdaPrologueEntryWrites(values.size());
+}
+
 void BufferCache::ImportGuestRange(uint64_t vaddr, uint64_t size) {
-	if (m_bda_prologue_buffer == nullptr || !m_guest_import->Available() || size == 0) {
+	if (!m_prologue_enabled || !m_guest_import->Available() || size == 0) {
 		return;
 	}
 	if ((vaddr & (CACHING_PAGESIZE - 1)) != 0 || (size & (CACHING_PAGESIZE - 1)) != 0) {
@@ -1159,63 +1119,19 @@ std::string BufferCache::DescribeGuestImports() const {
 	    static_cast<double>(m_guest_import->SkippedBytes()) / (1024.0 * 1024.0));
 }
 
-void BufferCache::NotePrologueFaultPage(uint64_t address) {
-	if (m_guest_import == nullptr) {
-		return;
-	}
-	const auto page     = address & ~(CACHING_PAGESIZE - 1);
-	const bool imported = m_guest_import->AddressOf(page) != 0;
-	m_prologue_fault_diag[imported ? 1 : 0]++;
-	if (m_prologue_fault_diag[0] + m_prologue_fault_diag[1] <= 16) {
-		std::printf("gpu-prologue-table: miss at 0x%016llx, import %s, buffer %s\n",
-		            static_cast<unsigned long long>(page), imported ? "yes" : "no",
-		            (m_page_table.Find(page >> CACHING_PAGEBITS) != nullptr &&
-		             *m_page_table.Find(page >> CACHING_PAGEBITS))
-		                ? "yes"
-		                : "no");
+void BufferCache::NotePrologueMisses(uint32_t misses) {
+	m_prologue_fault_diag[0] += misses;
+	if (m_prologue_fault_diag[1]++ < 4) {
+		std::printf("gpu-prologue-table: %" PRIu32 " prologue reads found no entry (%" PRIu64
+		            " in this run); those read zero and the page is registered for the next "
+		            "frame\n",
+		            misses, m_prologue_fault_diag[0]);
 		std::fflush(stdout);
 	}
 }
 
-bool BufferCache::ImportBackingAlias(uint64_t base, uint64_t size) {
-	if (m_bda_prologue_buffer == nullptr || !m_guest_import->Available()) {
-		return false;
-	}
-	return m_guest_import->ImportBackingAlias(base, size);
-}
-
-void BufferCache::MapBackingView(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
-	if (m_bda_prologue_buffer == nullptr || !m_guest_import->BackingAliasImported() || size == 0) {
-		return;
-	}
-	if ((vaddr & (CACHING_PAGESIZE - 1)) != 0 || (size & (CACHING_PAGESIZE - 1)) != 0) {
-		return;
-	}
-	m_guest_import->AddBackingView(vaddr, size, backing_offset,
-	                               [this](const GuestMemoryImport::Range& range) {
-		                               WritePrologueImportRun(range);
-	                               });
-}
-
-// The entries of a freshly covered run, straight into the command buffer: nothing on it can be
-// GPU-owned yet, and anything the pending set still holds for those pages is older than this map.
-void BufferCache::WritePrologueImportRun(const GuestMemoryImport::Range& range) {
-	const auto first = range.address >> CACHING_PAGEBITS;
-	const auto last  = (range.address + range.size) >> CACHING_PAGEBITS;
-	m_prologue_pending.erase(m_prologue_pending.lower_bound(first),
-	                         m_prologue_pending.lower_bound(last));
-	std::vector<vk::DeviceAddress> values;
-	values.reserve(static_cast<size_t>(last - first));
-	for (auto page = first; page < last; ++page) {
-		values.push_back(range.base + ((page - first) << CACHING_PAGEBITS));
-	}
-	WriteDataBuffer(*m_bda_prologue_buffer, first * sizeof(vk::DeviceAddress), values.data(),
-	                values.size() * sizeof(vk::DeviceAddress));
-	NoteBdaPrologueEntryWrites(values.size());
-}
-
 void BufferCache::ReleaseGuestRange(uint64_t vaddr, uint64_t size) {
-	if (m_bda_prologue_buffer == nullptr || !m_guest_import->Available() || size == 0) {
+	if (!m_prologue_enabled || !m_guest_import->Available() || size == 0) {
 		return;
 	}
 	m_guest_import->Release(vaddr, size, [this](const GuestMemoryImport::Range& range) {
@@ -1227,9 +1143,6 @@ void BufferCache::ReleaseGuestRange(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
-	if (m_prologue_fault_manager != nullptr) {
-		m_prologue_fault_manager->ProcessFaultBuffer();
-	}
 }
 
 void BufferCache::ProcessDescriptorFeedback() {

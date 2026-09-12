@@ -74,18 +74,12 @@ public:
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
-	// Step 1 of docs/sync-points-design.md, --gpu-prologue-table. The prologue table has one
-	// entry per 16 KiB page like the data table, but its default is the page inside imported
-	// guest memory, so a descriptor or SRT read in a shader prologue can never miss. Null when
-	// the setting is off; then nothing binds it and no shader reads it.
-	[[nodiscard]] bool    PrologueTableEnabled() const noexcept {
-		return m_bda_prologue_buffer != nullptr;
-	}
-	[[nodiscard]] Buffer* GetBdaPrologueTableBuffer() noexcept { return m_bda_prologue_buffer.get(); }
-	[[nodiscard]] Buffer* GetPrologueFaultBuffer() noexcept {
-		return m_prologue_fault_manager != nullptr ? m_prologue_fault_manager->GetFaultBuffer()
-		                                           : nullptr;
-	}
+	// Step 1 of docs/sync-points-design.md, --gpu-prologue-table. The prologue table is the upper
+	// half of the same buffer as the data table, one entry per 16 KiB page: for a page a
+	// registered buffer covers it holds that buffer's mirror, exactly as the data table does, and
+	// for every other mapped page the page itself inside imported guest memory, so a descriptor
+	// or SRT read in a shader prologue can never miss. One buffer and one descriptor either way.
+	[[nodiscard]] bool PrologueTableEnabled() const noexcept { return m_prologue_enabled; }
 	// Imports the committed guest range and fills its prologue entries; releases them again
 	// before the guest decommits. Both are GPU-thread only and need a recording command buffer.
 	void ImportGuestRange(uint64_t vaddr, uint64_t size);
@@ -98,9 +92,9 @@ public:
 	}
 	// One line about what the driver took and refused, for the import pass to print.
 	[[nodiscard]] std::string DescribeGuestImports() const;
-	// A page the prologue table could not resolve. Says whether an import covered it, which
-	// separates "the driver refused the range" from "the entry was not there yet".
-	void NotePrologueFaultPage(uint64_t address);
+	// Prologue reads that found no entry since the last fault-processing pass. Zero is the whole
+	// point of step 1, so the first few are reported loudly.
+	void NotePrologueMisses(uint32_t misses);
 	void ReleaseGuestRange(uint64_t vaddr, uint64_t size);
 	// Records the prologue entries that changed since the last call, so they are in the command
 	// buffer before the draws that read them. One predictable branch when nothing changed.
@@ -234,14 +228,16 @@ private:
 	// second time. Runs on the helper thread.
 	void OnAsyncProtectLanded(const GuestRange* landed, size_t count);
 
-	// The prologue page table follows the tracker: a page the GPU owns reads the mirror, every
-	// other mapped page reads the import. A page nothing imported keeps today's answer, the
-	// mirror when a buffer covers it and zero (a fault, read as 0) when none does.
+	// A page a registered buffer covers reads that buffer's mirror, which is what the data table
+	// says and what the BDA scan keeps up to date; every other mapped page reads the import. A
+	// page that is neither keeps today's answer, zero, which faults and reads zero.
 	[[nodiscard]] uint64_t PrologueEntryForPage(uint64_t page);
 	void                   QueuePrologueEntries(uint64_t vaddr, uint64_t size);
-	void                   PrologueClaimPages(uint64_t vaddr, uint64_t size);
-	void                   PrologueReleasePages(uint64_t vaddr, uint64_t size);
 	void                   FlushPrologueTableImpl();
+	// Byte offset of a page's entry in the prologue half of the page-table buffer.
+	[[nodiscard]] static constexpr uint64_t PrologueEntryOffset(uint64_t page) noexcept {
+		return BDA_PAGETABLE_SIZE + page * sizeof(vk::DeviceAddress);
+	}
 	void                   WritePrologueImportRun(const GuestMemoryImport::Range& range);
 
 	void BumpBdaGeneration() noexcept {
@@ -255,11 +251,8 @@ private:
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
 	// --gpu-prologue-table only (docs/sync-points-design.md, step 1).
-	std::unique_ptr<Buffer>                           m_bda_prologue_buffer;
+	bool                                              m_prologue_enabled = false;
 	std::unique_ptr<GuestMemoryImport>                m_guest_import;
-	std::unique_ptr<FaultManager>                     m_prologue_fault_manager;
-	// Pages whose prologue entry currently points at a mirror because the GPU owns part of them.
-	RangeSet                                          m_prologue_gpu_pages;
 	// Entries changed since the last flush, page to device address, coalesced by page.
 	std::map<uint64_t, uint64_t>                      m_prologue_pending;
 	std::array<uint64_t, 2>                           m_prologue_fault_diag {};

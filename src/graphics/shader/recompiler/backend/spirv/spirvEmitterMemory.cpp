@@ -151,47 +151,62 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 	                                          static_cast<uint64_t>(static_cast<int64_t>(immediate))));
 }
 
-uint32_t FaultElementPointer(EmitterState& state, uint32_t fault_variable, uint32_t index) {
+uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-	                           fault_variable, ConstantU32(state, 0), index});
+	                           state.fault_buffer_variable, ConstantU32(state, 0), index});
 	return pointer;
 }
 
-void RecordBdaFault(EmitterState& state, uint32_t fault_variable, uint32_t page) {
+// The page's bit, so the host registers it exactly as it always has, plus one add on the dword
+// past the bitmap when `counter_index` is not the constant zero: that dword counts the prologue's
+// own misses (docs/sync-points-design.md, step 1), so one buffer, one descriptor and one scan
+// serve both tables and the host reads the count with a four-byte copy.
+void RecordBdaFault(EmitterState& state, uint32_t counter_index, uint32_t page) {
 	const auto word = Binary(state, OpShiftRightLogical, TypeU32(state), page,
 	                         ConstantU32(state, 5));
 	const auto bit = Binary(
 	    state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	    Binary(state, OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
-	const auto pointer = FaultElementPointer(state, fault_variable, word);
+	const auto pointer = FaultElementPointer(state, word);
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
 	state.builder.AddFunction(
 	    {OpStore, pointer, Binary(state, OpBitwiseOr, TypeU32(state), value, bit)});
+	// counter_index is zero for the data table, where the add lands on the bitmap's first word
+	// and would be a phantom fault, so it is skipped there and not selected away.
+	EmitIfCondition(
+	    state,
+	    Binary(state, OpINotEqual, TypeBool(state), counter_index, ConstantU32(state, 0)), [&]() {
+		    const auto counter  = FaultElementPointer(state, counter_index);
+		    const auto previous = state.builder.AllocateId();
+		    state.builder.AddFunction({OpAtomicIAdd, TypeU32(state), previous, counter,
+		                               ConstantU32(state, ScopeDevice),
+		                               ConstantU32(state, MemorySemanticsNone),
+		                               ConstantU32(state, 1)});
+	    });
+}
+
+// half is 0 for the data page table and 1 for the prologue one, which is the upper half of the
+// same binding (docs/sync-points-design.md, step 1). One function for both: a second one costs
+// more than the read it saves, measured.
+uint32_t CallBdaPointer(ValueEmitContext& ctx, uint32_t address, uint32_t half) {
+	auto&      state  = ctx.state;
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpFunctionCall, TypeDeviceAddress(state), result,
+	                           state.bda_pointer_function, address, ConstantU32(state, half)});
+	return result;
 }
 
 uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
-	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpFunctionCall, TypeDeviceAddress(state), result, state.bda_pointer_function, address});
-	return result;
+	return CallBdaPointer(ctx, address, 0u);
 }
 
 // Step 1 of docs/sync-points-design.md: the same lookup on the prologue page table, whose default
 // entry is the guest page itself inside imported host memory. A program the setting did not mark
-// has no such table and falls back to the data one, so a run with --gpu-prologue-table off emits
-// exactly the module it emitted before.
+// reads the data half, so a run with --gpu-prologue-table off emits the module it emitted before.
 uint32_t GetBdaProloguePointer(ValueEmitContext& ctx, uint32_t address) {
-	auto& state = ctx.state;
-	if (state.bda_prologue_pointer_function == 0) {
-		return GetBdaPointer(ctx, address);
-	}
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpFunctionCall, TypeDeviceAddress(state), result,
-	                           state.bda_prologue_pointer_function, address});
-	return result;
+	return CallBdaPointer(ctx, address, ctx.state.program.info.gpu_prologue_table ? 1u : 0u);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
@@ -1043,25 +1058,35 @@ uint32_t EmitBdaPointer(ValueEmitContext& ctx, uint32_t address) {
 	return GetBdaProloguePointer(ctx, address);
 }
 
-// One page-table lookup: an address in, a device address out, zero and a fault bit on a miss.
-void DefineBdaPointerFunction(EmitterState& state, uint32_t function, uint32_t table_variable,
-                              uint32_t fault_variable, const char* name) {
+// One page-table lookup for both tables: an address and a half in, a device address out, zero and
+// a fault bit on a miss. The half scales the offset into the BdaPagetable binding -- the
+// prologue's page table is the upper one -- and the dword a prologue miss counts itself in, so
+// neither the second table nor its counter needs a binding, and the module gains one argument
+// rather than a second function.
+void DefineBdaPointerFunction(EmitterState& state, uint32_t function, const char* name) {
 	const auto type          = TypeDeviceAddress(state);
-	const auto function_type = state.builder.Type(OpTypeFunction, {type, type});
+	const auto u32           = TypeU32(state);
+	const auto function_type = state.builder.Type(OpTypeFunction, {type, type, u32});
 	const auto address       = state.builder.AllocateId();
+	const auto half          = state.builder.AllocateId();
 	const auto entry_label   = state.builder.AllocateId();
 	state.builder.AddName(function, name);
 	state.builder.AddFunction({OpFunction, type, function, FunctionControlNone, function_type});
 	state.builder.AddFunction({OpFunctionParameter, type, address});
+	state.builder.AddFunction({OpFunctionParameter, u32, half});
 	EmitLabel(state, entry_label);
 
 	const auto page64 = Binary(
 	    state, OpShiftRightLogical, type, address,
 	    ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
 	const auto page = Unary(state, OpUConvert, TypeU32(state), page64);
+	const auto slot = Binary(
+	    state, OpIAdd, TypeU32(state), page,
+	    Binary(state, OpIMul, TypeU32(state), half,
+	           ConstantU32(state, static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES))));
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, TypeDeviceAddressStoragePointer(state), entry_pointer,
-	                           table_variable, ConstantU32(state, 0), page});
+	                           state.bda_pagetable_variable, ConstantU32(state, 0), slot});
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, type, base, entry_pointer});
 	const auto missing =
@@ -1074,7 +1099,14 @@ void DefineBdaPointerFunction(EmitterState& state, uint32_t function, uint32_t t
 	    {OpBranchConditional, missing, fault_label, available_label});
 
 	EmitLabel(state, fault_label);
-	RecordBdaFault(state, fault_variable, page);
+	RecordBdaFault(state,
+	               Binary(state, OpIMul, TypeU32(state), half,
+	                      ConstantU32(state,
+	                                  static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u))),
+	               page);
+	// The counter's own selection leaves its merge block current, so that block, not fault_label,
+	// is the edge the phi below sees.
+	const auto fault_exit = state.current_label;
 	state.builder.AddFunction({OpBranch, merge_label});
 
 	EmitLabel(state, available_label);
@@ -1086,7 +1118,7 @@ void DefineBdaPointerFunction(EmitterState& state, uint32_t function, uint32_t t
 
 	EmitLabel(state, merge_label);
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpPhi, type, result, ConstantDeviceAddress(state, 0), fault_label,
+	state.builder.AddFunction({OpPhi, type, result, ConstantDeviceAddress(state, 0), fault_exit,
 	                           available, available_label});
 	state.builder.AddFunction({OpReturnValue, result});
 	state.builder.AddFunction({OpFunctionEnd});
@@ -1097,18 +1129,11 @@ void DefineGetBdaPointer(EmitterState& state) {
 		return;
 	}
 	state.bda_pointer_function = state.builder.AllocateId();
-	DefineBdaPointerFunction(state, state.bda_pointer_function, state.bda_pagetable_variable,
-	                         state.fault_buffer_variable, "get_bda_pointer");
+	DefineBdaPointerFunction(state, state.bda_pointer_function, "get_bda_pointer");
 }
 
-void DefineGetBdaProloguePointer(EmitterState& state) {
-	if (state.bda_prologue_table_variable == 0 || state.prologue_fault_buffer_variable == 0) {
-		return;
-	}
-	state.bda_prologue_pointer_function = state.builder.AllocateId();
-	DefineBdaPointerFunction(state, state.bda_prologue_pointer_function,
-	                         state.bda_prologue_table_variable,
-	                         state.prologue_fault_buffer_variable, "get_bda_prologue_pointer");
+void DefineGetBdaProloguePointer(EmitterState& /*state*/) {
+	// Nothing of its own: the prologue calls the one lookup with half 1.
 }
 
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {

@@ -235,6 +235,59 @@ Projected from the profile: 26% + 10% of the thread down to a few percent, about
 scene. Bring-up diagnostics (permutation log, CPU retry, fault ring, stub) are in the tree behind
 the setting and are cheap to keep until the stage is settled.
 
+#### Scan breakdown, September 12, 2026
+
+Step 0b of [bda-sync-design.md](bda-sync-design.md): `SynchronizeBuffer` was split into Tracy zones
+(`SynchronizeBuffer::Track` for the tracker walk, `::Stage` for the staging reservation, `::Copy`
+for the `memcpy` out of guest memory, `::Record` for the barriers and the `copyBuffer`), with
+`MemoryTracker::Lock` around the region lock and `PageManager::Protect` around the re-protection
+the tracker makes when it clears CPU-dirty state, `PageManager::ProtectCall` around the kernel call
+inside it. One warm run of the parked Nexus with `--gpu-descriptors true`, same protocol as the
+re-baseline (five-minute warm-up to `0 new pipelines`, 30 s sample, then a 15 s Tracy capture),
+**10.03 FPS**, 28.7% GPU, 12.57 CPU cores, Remote Desktop session. Artifacts in
+`_Runtime/_Diagnostics/replay/e2e-rebaseline/scan-breakdown/`, script `_Build/scan-breakdown-run.ps1`.
+The zones themselves cost about 1.3 µs of the scan (26 of them per scan at the usual tens of
+nanoseconds), which is the difference between the 28.55 µs below and the re-baseline's 26.8 µs.
+
+These zones are all called from outside the BDA scan as well (`SynchronizeBuffer` runs for every
+bind, the page manager re-protects on every guest write fault), so the aggregate CSV is not the
+answer. The numbers below are the events that fall inside a
+`GpuResourceManager::SynchronizeBdaBuffers` interval on the render thread, from the unwrapped
+export (`gd-true-attribute.py`, output in `gd-true-scan-attribution.txt`); the capture holds 148
+`Presenter::Present` and 53 211 scans.
+
+| zone | ms a frame | calls a frame | µs a call | µs a scan |
+| --- | --- | --- | --- | --- |
+| `GpuResourceManager::SynchronizeBdaBuffers` | 10.27 | 359.5 | 28.55 | 28.55 |
+| → `SynchronizeBuffer::Track` | 8.52 | 1342.7 | 6.35 | 23.70 |
+| → → `PageManager::Protect` | **7.38** | 1342.5 | 5.50 | **20.53** |
+| → → → `PageManager::ProtectCall` | 7.26 | 1342.5 | 5.41 | 20.20 |
+| → → `MemoryTracker::Lock` | 0.35 | 1181.5 | 0.30 | 0.97 |
+| → → `SynchronizeBuffer::Copy` | 0.43 | 1340.6 | 0.32 | 1.19 |
+| → → `SynchronizeBuffer::Stage` | 0.02 | 1334.8 | 0.02 | 0.06 |
+| → → `Track` itself (the bitmap walk) | 0.34 | — | — | 0.95 |
+| → `SynchronizeBuffer::Record` | 1.08 | 1340.6 | 0.80 | 2.99 |
+| → the scan itself (dirty set, intersection, buffer lookup) | 0.67 | — | — | 1.86 |
+| `EvaluateRuntimeSourcesImpl` | 30.43 | 20 788.8 | 1.46 | — |
+| `CpOpDispatchIndirect::SyncArguments` | 3.83 | 245.0 | 15.62 | — |
+
+Tails: `PageManager::Protect` reaches 162.7 µs inside a scan and 350.1 µs anywhere in the process,
+`MemoryTracker::Lock` 89.9 µs, a whole scan 2.42 ms. Across the whole process the re-protection is
+5 268 calls and 18.5 ms of CPU a frame, 51% of it on the render thread; three quarters of that
+render-thread share is inside these scans and guest write faults are the rest.
+
+**The re-protection carries the scan.** A scan makes 3.7 `NtProtectVirtualMemory` calls at 5.4 µs
+each, 20.5 µs of its 28.6 µs, and 98% of that is the syscall rather than the bitmap walk around it.
+The `memcpy` the design document's hypothesis pointed at is 1.2 µs of a scan, 4%; the staging
+reservation is 0.06 µs, the region lock 1.0 µs (no contention worth naming), the barriers and the
+`copyBuffer` 3.0 µs, and the scan's own walk of the dirty set 1.9 µs. So the gap between the game's
+26.8 µs and the replay's 4.1 µs is not freshly written guest memory: it is the cost of changing page
+protection while the game's guest threads are running, which is a TLB shootdown to every core they
+are on, against a replay where nothing else runs and the same call is nearly free. Design E (move the `memcpy` to a
+helper thread) would therefore buy about 1.2 µs of the 28.6; what the scan needs is to stop
+re-protecting pages it is about to see dirty again, or to batch the re-protection of a whole scan
+into one call instead of 3.7.
+
 ### Stage 2: vertex fetch in-shader
 
 The vertex shader reads vertex data through BDA using the V#s from its own roots, fetch-shader

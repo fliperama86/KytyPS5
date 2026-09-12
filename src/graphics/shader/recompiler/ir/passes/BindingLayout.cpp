@@ -149,6 +149,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (program.info.gpu_descriptors) {
 		AddBinding(next, DescriptorBindingKind::DescriptorFeedback);
 	}
+	if (program.info.gpu_prologue_table) {
+		AddBinding(next, DescriptorBindingKind::BdaPrologueTable);
+		AddBinding(next, DescriptorBindingKind::PrologueFaultBuffer);
+	}
 	if (UsesFlattenedRuntime(program)) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}

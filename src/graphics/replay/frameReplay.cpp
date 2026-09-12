@@ -1343,6 +1343,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	// Per frame, per loop: what design P did (docs/bda-sync-design.md). All zero with
 	// --bda-async-protect false.
 	std::vector<std::vector<AsyncProtectCounters>> frame_async(frame_count);
+	// Per frame, per loop: step 1 of docs/sync-points-design.md. All zero with
+	// --gpu-prologue-table false, except the data table's fault pages, which are counted always.
+	std::vector<std::vector<BdaPrologueCounters>> frame_prologue(frame_count);
 	std::vector<std::vector<uint64_t>> frame_writer_pre_wait_ns(frame_count);
 	std::vector<std::vector<uint64_t>> frame_writer_wait_ns(frame_count);
 	std::vector<std::vector<uint64_t>> frame_writer_bytes(frame_count);
@@ -1389,6 +1392,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			}
 			g_prepare_counters.Reset();
 			ResetAsyncProtectCounters();
+			ResetBdaPrologueFrameCounters();
 			// What the pre-event batch cost, before the counters start again for the frame
 			// itself; the bytes and the skipped pages stay cumulative over the loop.
 			const auto pre_wait_ns = writer ? writer->WaitNs() : 0;
@@ -1487,6 +1491,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			     g_prepare_counters.protect_calls.load(std::memory_order_relaxed),
 			     g_prepare_counters.protect_pages.load(std::memory_order_relaxed)});
 			frame_async[index].push_back(ReadAsyncProtectCounters());
+			frame_prologue[index].push_back(ReadBdaPrologueCounters());
 			frame_writer_pre_wait_ns[index].push_back(pre_wait_ns);
 			frame_writer_wait_ns[index].push_back(writer ? writer->WaitNs() : 0);
 			frame_writer_bytes[index].push_back(writer ? writer->Bytes() : 0);
@@ -1573,6 +1578,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		return total / counted;
 	};
 	AsyncProtectCounters async_per_loop;
+	BdaPrologueCounters  prologue_per_loop;
 	uint64_t             writer_pre_wait_ns_per_loop = 0;
 	uint64_t writer_wait_ns_per_loop  = 0;
 	uint64_t writer_bytes_per_loop    = 0;
@@ -1613,11 +1619,39 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			async_per_loop.boundary_scans += field(&AsyncProtectCounters::boundary_scans);
 			async_per_loop.boundary_scan_ns += field(&AsyncProtectCounters::boundary_scan_ns);
 		}
+		{
+			const auto& samples = frame_prologue[i];
+			const auto  field   = [&](uint64_t BdaPrologueCounters::*member) {
+                std::vector<uint64_t> values;
+                values.reserve(samples.size());
+                for (const auto& sample: samples) {
+                    values.push_back(sample.*member);
+                }
+                return mean_of(values);
+			};
+			prologue_per_loop.entry_writes += field(&BdaPrologueCounters::entry_writes);
+			prologue_per_loop.data_fault_pages += field(&BdaPrologueCounters::data_fault_pages);
+			prologue_per_loop.prologue_fault_pages +=
+			    field(&BdaPrologueCounters::prologue_fault_pages);
+		}
 		writer_pre_wait_ns_per_loop += mean_of(frame_writer_pre_wait_ns[i]);
 		writer_wait_ns_per_loop += mean_of(frame_writer_wait_ns[i]);
 		writer_bytes_per_loop += mean_of(frame_writer_bytes[i]);
 		writer_skipped_per_loop += mean_of(frame_writer_skipped[i]);
 	}
+
+	// Loop 1's own misses: the first touch of a page after the restore is what the prologue table
+	// is meant to remove, and it is exactly the loop the statistics exclude.
+	BdaPrologueCounters prologue_first_loop;
+	for (size_t i = 0; i < frame_count; i++) {
+		if (!frame_prologue[i].empty()) {
+			prologue_first_loop.entry_writes += frame_prologue[i].front().entry_writes;
+			prologue_first_loop.data_fault_pages += frame_prologue[i].front().data_fault_pages;
+			prologue_first_loop.prologue_fault_pages +=
+			    frame_prologue[i].front().prologue_fault_pages;
+		}
+	}
+	const auto prologue_totals = ReadBdaPrologueCounters();
 
 	// 5. Report. The first loop is a warm-up: pipelines, descriptor sets and history buffers are
 	// all cold, so it is excluded from the statistics (docs/frame-replay.md, limits).
@@ -1667,6 +1701,23 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		::printf("                 %llu forced scans at those boundaries, %.0f us a loop\n",
 		         static_cast<unsigned long long>(async_per_loop.boundary_scans),
 		         static_cast<double>(async_per_loop.boundary_scan_ns) / 1000.0);
+	}
+	::printf("  bda faults     data table %llu pages a loop (%llu in loop 1)\n",
+	         static_cast<unsigned long long>(prologue_per_loop.data_fault_pages),
+	         static_cast<unsigned long long>(prologue_first_loop.data_fault_pages));
+	if (Config::GpuPrologueTableEnabled()) {
+		::printf("  prologue table %llu misses a loop (%llu in loop 1), %llu entries written a "
+		         "loop\n",
+		         static_cast<unsigned long long>(prologue_per_loop.prologue_fault_pages),
+		         static_cast<unsigned long long>(prologue_first_loop.prologue_fault_pages),
+		         static_cast<unsigned long long>(prologue_per_loop.entry_writes));
+		::printf("  guest imports  %llu ranges alive, %.1f MiB, %.0f ms to import; %llu released, "
+		         "%llu failed\n",
+		         static_cast<unsigned long long>(prologue_totals.import_ranges),
+		         static_cast<double>(prologue_totals.import_bytes) / (1024.0 * 1024.0),
+		         static_cast<double>(prologue_totals.import_ns) / 1.0e6,
+		         static_cast<unsigned long long>(prologue_totals.import_releases),
+		         static_cast<unsigned long long>(prologue_totals.import_failures));
 	}
 	::printf("  drains         %llu a loop of %llu GPU-range syncs (readbacks on the render thread)\n",
 	         static_cast<unsigned long long>(drains_per_loop),
@@ -1805,6 +1856,23 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		report << "  \"async_boundary_scans\": " << async_per_loop.boundary_scans << ",\n";
 		report << "  \"async_boundary_scan_us\": " << async_per_loop.boundary_scan_ns / 1000
 		       << ",\n";
+		report << "  \"gpu_prologue_table\": "
+		       << (Config::GpuPrologueTableEnabled() ? "true" : "false") << ",\n";
+		report << "  \"bda_data_fault_pages_per_loop\": " << prologue_per_loop.data_fault_pages
+		       << ",\n";
+		report << "  \"bda_prologue_fault_pages_per_loop\": "
+		       << prologue_per_loop.prologue_fault_pages << ",\n";
+		report << "  \"bda_data_fault_pages_loop1\": " << prologue_first_loop.data_fault_pages
+		       << ",\n";
+		report << "  \"bda_prologue_fault_pages_loop1\": "
+		       << prologue_first_loop.prologue_fault_pages << ",\n";
+		report << "  \"bda_prologue_entry_writes_per_loop\": " << prologue_per_loop.entry_writes
+		       << ",\n";
+		report << "  \"guest_import_ranges\": " << prologue_totals.import_ranges << ",\n";
+		report << "  \"guest_import_bytes\": " << prologue_totals.import_bytes << ",\n";
+		report << "  \"guest_import_us\": " << prologue_totals.import_ns / 1000 << ",\n";
+		report << "  \"guest_import_releases\": " << prologue_totals.import_releases << ",\n";
+		report << "  \"guest_import_failures\": " << prologue_totals.import_failures << ",\n";
 		report << "  \"drains_per_loop\": " << drains_per_loop << ",\n";
 		report << "  \"syncs_per_loop\": " << syncs_per_loop << ",\n";
 		report << "  \"submits_per_loop\": " << submits_per_loop << ",\n";

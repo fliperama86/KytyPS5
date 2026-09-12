@@ -72,6 +72,12 @@ static void PrintUsage() {
 	         "                                       reads in the shader. Only has an effect\n"
 	         "                                       with --gpu-descriptors true.\n"
 	         "                                       Default: false.\n");
+	::printf("  --gpu-prologue-table <t|f>           Give every mapped guest page a second BDA\n"
+	         "                                       page-table entry pointing at guest memory\n"
+	         "                                       imported with VK_EXT_external_memory_host,\n"
+	         "                                       and read descriptor roots and flattened SRT\n"
+	         "                                       reads through it, so a prologue read never\n"
+	         "                                       misses. Default: false.\n");
 	::printf("  --gpu-indirect <true|false>          Let Vulkan consume indirect dispatch\n"
 	         "                                       arguments in place instead of reading\n"
 	         "                                       them back on the render thread.\n"
@@ -382,6 +388,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu-srt-reads") {
 			if (!ParseBool(value, options.config.gpu_srt_reads_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-prologue-table") {
+			if (!ParseBool(value, options.config.gpu_prologue_table_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

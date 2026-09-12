@@ -6,6 +6,7 @@
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/guestMemoryImport.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -26,13 +27,18 @@ constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 } // namespace
 
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
-                           BufferCache& buffer_cache)
-    : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
+                           BufferCache& buffer_cache, Role role)
+    : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache), m_role(role),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                      BufferCache::CACHING_NUMPAGES / 8),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
                         MaxPendingFaults * PageFaultAreaSize) {
-	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
+	if (m_role == Role::Prologue) {
+		SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(),
+		                     "Prologue Fault Buffer");
+	} else {
+		SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
+	}
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
@@ -147,6 +153,11 @@ void FaultManager::ProcessFaultBuffer() {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
 		}
+		if (m_role == Role::Prologue) {
+			for (uint32_t index = 1; index <= count; ++index) {
+				m_buffer_cache.NotePrologueFaultPage(faults[index]);
+			}
+		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
 			(void)m_buffer_cache.FindBuffer(start, end - start);
@@ -165,6 +176,7 @@ void FaultManager::RecordFaults(std::span<const uint64_t> pages) {
 	m_window_passes++;
 	m_fault_pages += pages.size();
 	m_window_pages += pages.size();
+	NoteBdaFaultPages(pages.size(), m_role == Role::Prologue);
 	for (const auto address: pages) {
 		const auto page = address & ~(BufferCache::CACHING_PAGESIZE - 1);
 		m_fault_ring[m_fault_ring_next % FaultRingSize] = {page, m_fault_passes};
@@ -181,13 +193,14 @@ void FaultManager::RecordFaults(std::span<const uint64_t> pages) {
 	}
 	// Stage 1 bring-up: how much of the guest memory a shader touches is one or more frames late.
 	if (Config::GpuDescriptorsEnabled() && (m_fault_passes % 60) == 0) {
-		std::printf("gpu-descriptors: fault pages %" PRIu64 " in the last %" PRIu64
+		const char* label = m_role == Role::Prologue ? "gpu-prologue-table" : "gpu-descriptors";
+		std::printf("%s: fault pages %" PRIu64 " in the last %" PRIu64
 		            " processing passes (total %" PRIu64 " over %" PRIu64 ")\n",
-		            m_window_pages, m_window_passes, m_fault_pages, m_fault_passes);
+		            label, m_window_pages, m_window_passes, m_fault_pages, m_fault_passes);
 		std::fflush(stdout);
-		LOGF("gpu-descriptors: fault pages %" PRIu64 " in the last %" PRIu64
+		LOGF("%s: fault pages %" PRIu64 " in the last %" PRIu64
 		     " processing passes (total %" PRIu64 " over %" PRIu64 ")\n",
-		     m_window_pages, m_window_passes, m_fault_pages, m_fault_passes);
+		     label, m_window_pages, m_window_passes, m_fault_pages, m_fault_passes);
 		m_window_pages  = 0;
 		m_window_passes = 0;
 	}

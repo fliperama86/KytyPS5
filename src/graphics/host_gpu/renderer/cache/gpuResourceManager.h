@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <shared_mutex>
@@ -32,6 +33,11 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Step 1 of docs/sync-points-design.md: imports every mapped range the prologue page
+	// table does not cover yet. Called from PrepareBda, so it runs on the GPU thread with a
+	// command buffer recording whatever thread the guest mapped from. One relaxed load when
+	// nothing is waiting.
+	void               ImportPendingRanges();
 	// Design P (docs/bda-sync-design.md): the submission boundary waits here for the
 	// re-protection helper to have drained and its last batch to have landed, then scans once so
 	// every landed page is uploaded again before the submission's first draw.
@@ -53,6 +59,9 @@ private:
 	RangeSet                  m_mapped_ranges;
 	GuestGpu*                 m_gpu = nullptr;
 	bool                      m_fault_process_pending = false;
+	// A guest map added a range the imports do not cover yet (step 1). Written under
+	// m_mapped_ranges_mutex by any guest thread, cleared on the GPU thread.
+	std::atomic_bool          m_import_pending {false};
 	uint64_t                  m_mapped_generation = 0;
 	uint64_t m_last_bda_buffer_generation = std::numeric_limits<uint64_t>::max();
 	uint64_t m_last_bda_mapped_generation = std::numeric_limits<uint64_t>::max();

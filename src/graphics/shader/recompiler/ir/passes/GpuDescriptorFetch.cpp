@@ -9,7 +9,8 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 void MarkGpuFetchBuffers(Program& program) {
-	program.info.gpu_descriptors = false;
+	program.info.gpu_descriptors    = false;
+	program.info.gpu_prologue_table = false;
 	program.info.gpu_read_slots.clear();
 	for (auto& buffer: program.info.buffers) {
 		buffer.gpu_fetch = false;
@@ -80,6 +81,9 @@ void MarkGpuFetchBuffers(Program& program) {
 		return;
 	}
 	program.info.gpu_descriptors = true;
+	// Step 1 of docs/sync-points-design.md: with the prologue table on, every root and
+	// flattened read this program evaluates resolves through it.
+	program.info.gpu_prologue_table = Config::GpuPrologueTableEnabled();
 	program.info.gpu_read_slots  = std::move(reads);
 	program.flat                 = std::move(plan.flat);
 }

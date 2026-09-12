@@ -1219,6 +1219,24 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		// Step 1 of docs/sync-points-design.md: the prologue BDA page table points at committed
+		// guest pages imported with this extension. Optional -- without it --gpu-prologue-table
+		// imports nothing and every prologue read keeps today's mirror-or-fault behaviour.
+		if (Config::GpuPrologueTableEnabled()) {
+			if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+				graphic_ctx.external_memory_host_enabled = true;
+				vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_properties {};
+				vk::PhysicalDeviceProperties2                    properties2 {};
+				properties2.pNext = &host_properties;
+				graphic_ctx.physical_device.getProperties2(&properties2);
+				graphic_ctx.imported_host_pointer_alignment =
+				    host_properties.minImportedHostPointerAlignment;
+			} else {
+				std::printf("gpu-prologue-table: VK_EXT_external_memory_host is absent; guest "
+				            "memory is not imported and prologue reads keep the mirror\n");
+			}
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);

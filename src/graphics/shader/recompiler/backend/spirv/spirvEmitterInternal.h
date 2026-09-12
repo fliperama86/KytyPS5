@@ -383,11 +383,16 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         descriptor_feedback_variable = 0;
+	// Step 1 of docs/sync-points-design.md: the prologue page table and its own fault buffer,
+	// defined only while --gpu-prologue-table marked this program.
+	uint32_t                                         bda_prologue_table_variable = 0;
+	uint32_t                                         prologue_fault_buffer_variable = 0;
 	std::array<GpuFetchBuffer, IR::ShaderInfo::MaxBuffers> gpu_fetch_buffers {};
 	// Stage 1b: one u32 id per flat SRT slot, the value EmitGpuFetchDescriptors lowered in the
 	// prologue. Zero where the slot still comes from the FlattenedSrt binding.
 	std::vector<uint32_t>                            gpu_read_values;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         bda_prologue_pointer_function = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -800,6 +805,10 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+// Step 1 of docs/sync-points-design.md: the same lookup on the prologue page table, whose
+// default entry is the guest page inside imported host memory. Defined only for a program
+// marked gpu_prologue_table; EmitBdaPointer then routes the prologue through it.
+void DefineGetBdaProloguePointer(EmitterState& state);
 
 // Resolves a guest address through the BDA page table, shared with the SRT lowering. The result
 // is zero when the page is not resident, and the lookup records a fault for the host to service.

@@ -65,6 +65,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::Gds:
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
+		case BindingKind::BdaPrologueTable:
+		case BindingKind::PrologueFaultBuffer:
 		case BindingKind::FlattenedSrt:
 		case BindingKind::DescriptorFeedback:
 		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
@@ -1191,11 +1193,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						}
 						break;
 					case BindingKind::BdaPagetable:
-					case BindingKind::FaultBuffer: {
-						auto&       cache      = m_context.GetBufferCache();
-						const auto* bda_buffer = binding.kind == BindingKind::BdaPagetable
-						                             ? cache.GetBdaPageTableBuffer()
-						                             : cache.GetFaultBuffer();
+					case BindingKind::FaultBuffer:
+					case BindingKind::BdaPrologueTable:
+					case BindingKind::PrologueFaultBuffer: {
+						auto&   cache       = m_context.GetBufferCache();
+						Buffer* bda_buffer  = nullptr;
+						switch (binding.kind) {
+							case BindingKind::BdaPagetable:
+								bda_buffer = cache.GetBdaPageTableBuffer();
+								break;
+							case BindingKind::FaultBuffer:
+								bda_buffer = cache.GetFaultBuffer();
+								break;
+							// Step 1 of docs/sync-points-design.md: the prologue table and its own
+							// fault buffer, bound beside the data ones for every stage that has
+							// them in its layout.
+							case BindingKind::BdaPrologueTable:
+								bda_buffer = cache.GetBdaPrologueTableBuffer();
+								break;
+							default: bda_buffer = cache.GetPrologueFaultBuffer(); break;
+						}
+						EXIT_IF(bda_buffer == nullptr);
 						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
 						                                  bda_buffer->Size());
 						break;

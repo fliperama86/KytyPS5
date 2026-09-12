@@ -151,20 +151,20 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 	                                          static_cast<uint64_t>(static_cast<int64_t>(immediate))));
 }
 
-uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
+uint32_t FaultElementPointer(EmitterState& state, uint32_t fault_variable, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-	                           state.fault_buffer_variable, ConstantU32(state, 0), index});
+	                           fault_variable, ConstantU32(state, 0), index});
 	return pointer;
 }
 
-void RecordBdaFault(EmitterState& state, uint32_t page) {
+void RecordBdaFault(EmitterState& state, uint32_t fault_variable, uint32_t page) {
 	const auto word = Binary(state, OpShiftRightLogical, TypeU32(state), page,
 	                         ConstantU32(state, 5));
 	const auto bit = Binary(
 	    state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	    Binary(state, OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
-	const auto pointer = FaultElementPointer(state, word);
+	const auto pointer = FaultElementPointer(state, fault_variable, word);
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
 	state.builder.AddFunction(
@@ -176,6 +176,21 @@ uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpFunctionCall, TypeDeviceAddress(state), result, state.bda_pointer_function, address});
+	return result;
+}
+
+// Step 1 of docs/sync-points-design.md: the same lookup on the prologue page table, whose default
+// entry is the guest page itself inside imported host memory. A program the setting did not mark
+// has no such table and falls back to the data one, so a run with --gpu-prologue-table off emits
+// exactly the module it emitted before.
+uint32_t GetBdaProloguePointer(ValueEmitContext& ctx, uint32_t address) {
+	auto& state = ctx.state;
+	if (state.bda_prologue_pointer_function == 0) {
+		return GetBdaPointer(ctx, address);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpFunctionCall, TypeDeviceAddress(state), result,
+	                           state.bda_prologue_pointer_function, address});
 	return result;
 }
 
@@ -1019,22 +1034,24 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 
 } // namespace
 
+// The reads a shader prologue makes -- descriptor roots and flattened SRT reads, both lowered
+// through EmitSrtFlatRoot -- resolve on the prologue page table when the program carries one.
+// Everything else, the body loads of resources and of uses_dma, keeps the data table and its
+// mirrors: the host-memory bench prices a body load from an import at 300 to 400 times a mirror
+// load, so the split is the design and not a detail of it.
 uint32_t EmitBdaPointer(ValueEmitContext& ctx, uint32_t address) {
-	return GetBdaPointer(ctx, address);
+	return GetBdaProloguePointer(ctx, address);
 }
 
-void DefineGetBdaPointer(EmitterState& state) {
-	if (!state.program.info.uses_dma && !state.program.info.gpu_descriptors) {
-		return;
-	}
-	const auto type            = TypeDeviceAddress(state);
-	const auto function_type   = state.builder.Type(OpTypeFunction, {type, type});
-	state.bda_pointer_function = state.builder.AllocateId();
-	const auto address         = state.builder.AllocateId();
-	const auto entry_label     = state.builder.AllocateId();
-	state.builder.AddName(state.bda_pointer_function, "get_bda_pointer");
-	state.builder.AddFunction(
-	    {OpFunction, type, state.bda_pointer_function, FunctionControlNone, function_type});
+// One page-table lookup: an address in, a device address out, zero and a fault bit on a miss.
+void DefineBdaPointerFunction(EmitterState& state, uint32_t function, uint32_t table_variable,
+                              uint32_t fault_variable, const char* name) {
+	const auto type          = TypeDeviceAddress(state);
+	const auto function_type = state.builder.Type(OpTypeFunction, {type, type});
+	const auto address       = state.builder.AllocateId();
+	const auto entry_label   = state.builder.AllocateId();
+	state.builder.AddName(function, name);
+	state.builder.AddFunction({OpFunction, type, function, FunctionControlNone, function_type});
 	state.builder.AddFunction({OpFunctionParameter, type, address});
 	EmitLabel(state, entry_label);
 
@@ -1044,7 +1061,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto page = Unary(state, OpUConvert, TypeU32(state), page64);
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, TypeDeviceAddressStoragePointer(state), entry_pointer,
-	                           state.bda_pagetable_variable, ConstantU32(state, 0), page});
+	                           table_variable, ConstantU32(state, 0), page});
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, type, base, entry_pointer});
 	const auto missing =
@@ -1057,7 +1074,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	    {OpBranchConditional, missing, fault_label, available_label});
 
 	EmitLabel(state, fault_label);
-	RecordBdaFault(state, page);
+	RecordBdaFault(state, fault_variable, page);
 	state.builder.AddFunction({OpBranch, merge_label});
 
 	EmitLabel(state, available_label);
@@ -1073,6 +1090,25 @@ void DefineGetBdaPointer(EmitterState& state) {
 	                           available, available_label});
 	state.builder.AddFunction({OpReturnValue, result});
 	state.builder.AddFunction({OpFunctionEnd});
+}
+
+void DefineGetBdaPointer(EmitterState& state) {
+	if (!state.program.info.uses_dma && !state.program.info.gpu_descriptors) {
+		return;
+	}
+	state.bda_pointer_function = state.builder.AllocateId();
+	DefineBdaPointerFunction(state, state.bda_pointer_function, state.bda_pagetable_variable,
+	                         state.fault_buffer_variable, "get_bda_pointer");
+}
+
+void DefineGetBdaProloguePointer(EmitterState& state) {
+	if (state.bda_prologue_table_variable == 0 || state.prologue_fault_buffer_variable == 0) {
+		return;
+	}
+	state.bda_prologue_pointer_function = state.builder.AllocateId();
+	DefineBdaPointerFunction(state, state.bda_prologue_pointer_function,
+	                         state.bda_prologue_table_variable,
+	                         state.prologue_fault_buffer_variable, "get_bda_prologue_pointer");
 }
 
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {

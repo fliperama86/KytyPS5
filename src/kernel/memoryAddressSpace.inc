@@ -166,6 +166,21 @@ public:
 		return true;
 	}
 
+	// Every live view of the backing store: which guest address it is at and where in the
+	// writable alias its bytes are. Step 1 of docs/sync-points-design.md imports the alias once
+	// and points the prologue page table into it with these offsets, instead of importing
+	// thousands of views the driver would refuse.
+	std::vector<Memory::GuestBackingView> SnapshotViews() {
+		std::lock_guard lock(m_mutex);
+		std::vector<Memory::GuestBackingView> views;
+		views.reserve(m_maps.size());
+		for (const auto& [key, entry]: m_maps) {
+			(void)key;
+			views.push_back({entry.vaddr, entry.size, entry.backing_offset});
+		}
+		return views;
+	}
+
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		if (data == nullptr) {
 			return false;
@@ -730,6 +745,10 @@ public:
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return VirtualRangesOverlap(vaddr, size, range.first, range.second);
 		});
+	}
+
+	std::vector<Memory::GuestBackingView> SnapshotBackingViews() {
+		return m_backing->SnapshotViews();
 	}
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {

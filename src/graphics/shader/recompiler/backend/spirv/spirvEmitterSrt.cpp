@@ -662,6 +662,7 @@ std::vector<uint32_t> EmitSrtFlatProgramTestModule(const IR::Program& program,
 
 	ValueEmitContext ctx(state);
 	DefineGetBdaPointer(state);
+	DefineGetBdaProloguePointer(state);
 	state.builder.AddFunction({OpFunction, TypeVoid(state), state.main_func, FunctionControlNone,
 	                           TypeFunction(state)});
 	EmitLabel(state, state.entry_label);

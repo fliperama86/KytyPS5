@@ -131,6 +131,19 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void                   SetFlexibleMemorySize(uint64_t size);
+// The single writable alias of the whole direct-memory backing store, the host pointer every
+// guest direct mapping is a view of. Step 1 of docs/sync-points-design.md imports it once instead
+// of importing thousands of views. False when there is no backing store.
+bool                   GetGuestBackingAlias(uint64_t* base, uint64_t* size);
+
+// One live view of that backing store: direct, flexible and pooled guest memory are all views of
+// it, so `backing_offset` says where in the alias a guest address's bytes are.
+struct GuestBackingView {
+	uint64_t vaddr          = 0;
+	uint64_t size           = 0;
+	uint64_t backing_offset = 0;
+};
+[[nodiscard]] std::vector<GuestBackingView> SnapshotGuestBackingViews();
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);

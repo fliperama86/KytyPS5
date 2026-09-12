@@ -278,11 +278,19 @@ enum class DescriptorBindingKind : uint32_t {
 	// resources sets its slot's bit when a runtime V# disagrees with the specialization it was
 	// compiled against. The host reads it back with the fault buffer.
 	DescriptorFeedback,
+	// Step 1 of docs/sync-points-design.md, --gpu-prologue-table: the second BDA page table, one
+	// device address per 16 KiB page, whose default entry is the guest page itself inside memory
+	// imported with VK_EXT_external_memory_host. Descriptor roots and flattened SRT reads
+	// evaluated in the shader prologue resolve through it instead of BdaPagetable, so they can
+	// never miss; body loads keep BdaPagetable and its mirrors.
+	BdaPrologueTable,
+	// The fault buffer of that table, so a prologue miss is counted apart from a data miss.
+	PrologueFaultBuffer,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 44u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 53u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -452,6 +460,11 @@ struct ShaderInfo {
 	// Any buffer resource has gpu_fetch. Implies the BdaPagetable, FaultBuffer and
 	// DescriptorFeedback bindings, the physical addressing model and a PrepareBda before use.
 	bool                             gpu_descriptors    = false;
+	// Step 1 of docs/sync-points-design.md: the prologue's roots and flattened reads resolve
+	// through BdaPrologueTable instead of BdaPagetable. Set with gpu_descriptors while
+	// --gpu-prologue-table is on; the emitted module differs, so it is part of the program's
+	// identity.
+	bool                             gpu_prologue_table = false;
 	// Stage 1b (docs/gpu-descriptor-fetch.md): one byte per flat SRT slot, non-zero where the
 	// shader evaluates the read itself in its prologue instead of loading it from the
 	// FlattenedSrt binding. Empty unless --gpu-srt-reads marked something.

@@ -36,6 +36,12 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// VK_EXT_external_memory_host, used by the prologue BDA page table of step 1
+	// (docs/sync-points-design.md) to import committed guest pages so the GPU can read them
+	// in place. Absent, --gpu-prologue-table imports nothing and behaves as before.
+	bool                                      external_memory_host_enabled          = false;
+	// VkPhysicalDeviceExternalMemoryHostPropertiesEXT::minImportedHostPointerAlignment.
+	uint64_t                                  imported_host_pointer_alignment       = 0;
 	// VkPhysicalDeviceFeatures::drawIndirectFirstInstance. --gpu-indirect needs it, because a
 	// guest argument block may carry a non-zero start_instance_location.
 	bool                                      draw_indirect_first_instance_enabled  = false;

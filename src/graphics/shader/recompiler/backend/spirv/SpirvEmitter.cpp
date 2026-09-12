@@ -81,6 +81,10 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (program.info.gpu_descriptors) {
 		Expect(Kind::DescriptorFeedback);
 	}
+	if (program.info.gpu_prologue_table) {
+		Expect(Kind::BdaPrologueTable);
+		Expect(Kind::PrologueFaultBuffer);
+	}
 	if (IR::UsesFlattenedRuntime(program)) {
 		Expect(Kind::FlattenedSrt);
 	}

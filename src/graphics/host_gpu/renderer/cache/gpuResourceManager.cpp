@@ -8,14 +8,23 @@
 #include "graphics/host_gpu/renderer/cache/readbackDiagnostics.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/replay/frameCapture.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <tuple>
+#include <vector>
+
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache) {}
+      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache) {
+	// Step 1 of docs/sync-points-design.md: everything the guest committed before this object
+	// existed -- a replay restores gigabytes of it -- is imported at the first preparation.
+	m_import_pending.store(m_buffer_cache.PrologueTableEnabled(), std::memory_order_relaxed);
+}
 
 GpuResourceManager::~GpuResourceManager() = default;
 
@@ -71,6 +80,12 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 		++m_mapped_generation;
 		// Buffers may already cover the new mapping; the next preparation must revisit it.
 		m_buffer_cache.InvalidateBda(vaddr, size);
+		// Step 1 of docs/sync-points-design.md: the range has to reach the prologue page table as
+		// imported host memory. The import itself is Vulkan work on a recording command buffer,
+		// so it waits for the GPU thread rather than blocking this one.
+		if (m_buffer_cache.PrologueTableEnabled()) {
+			m_import_pending.store(true, std::memory_order_release);
+		}
 	}
 	// Frame capture (docs/frame-replay.md, phase E): a guest map moves both generations, and a
 	// replay of one frame never maps anything.
@@ -92,6 +107,15 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
+		// Step 1: the import has to be gone before the guest decommits the pages behind it. The
+		// wait above has already drained the device, so nothing can be reading it; what is left
+		// is to clear the entries that pointed there and let the objects go.
+		m_buffer_cache.ReleaseGuestRange(vaddr, size);
+		// A release drops whole imports, so a mapping the range only clipped has to be covered
+		// again; the next preparation re-imports whatever is still mapped.
+		if (m_buffer_cache.PrologueTableEnabled()) {
+			m_import_pending.store(true, std::memory_order_release);
+		}
 		m_mapped_ranges.Subtract(vaddr, size);
 		++m_mapped_generation;
 		// Nothing can be uploaded to an unmapped range, and it must not linger in the set.
@@ -105,7 +129,72 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+// Step 1 of docs/sync-points-design.md. The mapped set is the truth: every part of it the imports
+// do not cover yet is imported here and its prologue entries filled, whatever order the guest's
+// map calls and the GPU thread's start-up happened in. An import that fails leaves its pages with
+// today's behaviour, a zero entry and the fault path.
+void GpuResourceManager::ImportPendingRanges() {
+	if (!m_import_pending.load(std::memory_order_acquire) || !m_scheduler.Active()) {
+		return;
+	}
+	m_import_pending.store(false, std::memory_order_relaxed);
+	// The kernel's committed ranges, not the GPU's mapped set: a range committed before the GPU
+	// thread existed never reached MapMemory, and the prologue has to be able to read it too.
+	// SnapshotVirtualRanges and SnapshotGuestBackingViews take their own lock and never the
+	// memory-operation mutex, so a guest thread waiting on this thread inside a memory syscall
+	// cannot deadlock them -- the frame capture reads the ranges from here for the same reason.
+	// Never a coalesced span of several ranges: an import that crosses two guest mappings is
+	// refused by the driver however contiguous the addresses look.
+	std::vector<RangeSet::Range> ranges;
+	for (const auto& range: Libs::LibKernel::Memory::SnapshotVirtualRanges()) {
+		if (range.is_committed && range.start != 0 && range.size != 0) {
+			ranges.push_back({range.start, range.size});
+		}
+	}
+	std::sort(ranges.begin(), ranges.end(),
+	          [](const RangeSet::Range& a, const RangeSet::Range& b) {
+		          return a.address < b.address;
+	          });
+	const auto before = ReadBdaPrologueCounters();
+	// One import for all of direct, flexible and pooled memory: they are views of the guest's
+	// backing store, and the driver takes that single 13.5 GiB allocation where it refuses even a
+	// few hundred MiB of separate views (docs/sync-points-design.md, step 1).
+	uint64_t alias_base = 0;
+	uint64_t alias_size = 0;
+	if (!m_buffer_cache.BackingAliasImported() &&
+	    Libs::LibKernel::Memory::GetGuestBackingAlias(&alias_base, &alias_size)) {
+		m_buffer_cache.ImportBackingAlias(alias_base, alias_size);
+	}
+	if (m_buffer_cache.BackingAliasImported()) {
+		for (const auto& view: Libs::LibKernel::Memory::SnapshotGuestBackingViews()) {
+			m_buffer_cache.MapBackingView(view.vaddr, view.size, view.backing_offset);
+		}
+	}
+
+	for (const auto& range: ranges) {
+		m_buffer_cache.ImportGuestRange(range.address, range.size);
+	}
+	const auto after = ReadBdaPrologueCounters();
+	if (after.imports != before.imports) {
+		std::printf("gpu-prologue-table: imported %llu guest ranges, %.1f MiB, in %.0f ms "
+		            "(%llu alive, %.1f MiB; %llu failed)\n",
+		            static_cast<unsigned long long>(after.imports - before.imports),
+		            static_cast<double>(after.import_bytes - before.import_bytes) /
+		                (1024.0 * 1024.0),
+		            static_cast<double>(after.import_ns - before.import_ns) / 1.0e6,
+		            static_cast<unsigned long long>(after.import_ranges),
+		            static_cast<double>(after.import_bytes) / (1024.0 * 1024.0),
+		            static_cast<unsigned long long>(after.import_failures));
+		const auto detail = m_buffer_cache.DescribeGuestImports();
+		std::printf("gpu-prologue-table: %s\n", detail.c_str());
+		std::fflush(stdout);
+	}
+}
+
 void GpuResourceManager::PrepareBda() {
+	// Both are a predictable branch with --gpu-prologue-table off.
+	ImportPendingRanges();
+	m_buffer_cache.FlushPrologueTable();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	const auto buffer_generation = m_buffer_cache.BdaGeneration();
 	const auto mapped_generation = m_mapped_generation;

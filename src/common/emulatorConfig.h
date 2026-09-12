@@ -75,6 +75,11 @@ struct ConfigOptions {
 	// Stage 1b of the same document: the flattened SRT scalar reads are lowered into the shader
 	// prologue too, so the render thread stops evaluating them. Needs gpu_descriptors_enabled.
 	bool                   gpu_srt_reads_enabled = false;
+	// Step 1 of the artifact-free path (docs/sync-points-design.md): a second BDA page table for
+	// the shader prologue whose default entry is the guest page itself, imported with
+	// VK_EXT_external_memory_host, so a descriptor or SRT read can never miss. The data table is
+	// unchanged. Off, nothing is imported and no shader carries the binding.
+	bool                   gpu_prologue_table_enabled = false;
 	// Vulkan consumes indirect draw and dispatch arguments in place instead of the render thread
 	// reading them back from the GPU (docs/performance-roadmap.md, item 1).
 	bool                   gpu_indirect_enabled = false;
@@ -167,6 +172,7 @@ bool                   ShaderLdsWaitcntBarrierEnabled();
 bool                   ShaderStorageImageBoundsCheckEnabled();
 bool                   GpuDescriptorsEnabled();
 bool                   GpuSrtReadsEnabled();
+bool                   GpuPrologueTableEnabled();
 bool                   GpuIndirectEnabled();
 bool                   GpuIndirectDrawsEnabled();
 bool                   GpuReadbackProducerWaitEnabled();

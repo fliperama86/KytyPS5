@@ -39,7 +39,13 @@ public:
 		uint64_t pages_known = 0;
 	};
 
-	FaultManager(GraphicContext& graphics, CommandScheduler& scheduler, BufferCache& buffer_cache);
+	// Step 1 of docs/sync-points-design.md gives the prologue its own fault buffer so a miss of
+	// the prologue page table is counted apart from a miss of the data one. Both register the
+	// faulted page the same way.
+	enum class Role { Data, Prologue };
+
+	FaultManager(GraphicContext& graphics, CommandScheduler& scheduler, BufferCache& buffer_cache,
+	             Role role = Role::Data);
 	~FaultManager();
 	KYTY_CLASS_NO_COPY(FaultManager);
 
@@ -53,6 +59,7 @@ private:
 	GraphicContext&                            m_graphics;
 	CommandScheduler&                          m_scheduler;
 	BufferCache&                               m_buffer_cache;
+	Role                                       m_role = Role::Data;
 	Buffer                                     m_fault_buffer;
 	Buffer                                     m_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};

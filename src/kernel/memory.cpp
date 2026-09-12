@@ -879,6 +879,24 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+bool GetGuestBackingAlias(uint64_t* base, uint64_t* size) {
+	if (g_guest_address_space == nullptr || base == nullptr || size == nullptr) {
+		return false;
+	}
+	*base = g_guest_address_space->GetBackingBase();
+	*size = g_guest_address_space->GetBackingSize();
+	return *base != 0 && *size != 0;
+}
+
+std::vector<GuestBackingView> SnapshotGuestBackingViews() {
+	if (g_guest_address_space == nullptr) {
+		return {};
+	}
+	// Only the backing store's own lock, as SnapshotVirtualRanges does: this runs on the GPU
+	// thread while a guest thread can be waiting on it inside a memory syscall.
+	return g_guest_address_space->SnapshotBackingViews();
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);

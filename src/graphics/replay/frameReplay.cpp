@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/readbackDiagnostics.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
@@ -1329,6 +1330,12 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	// indirect-argument ones, which is all of them in this capture.
 	std::vector<std::vector<uint64_t>> frame_drains(frame_count);
 	std::vector<std::vector<uint64_t>> frame_syncs(frame_count);
+	// Per frame, per loop: vkQueueSubmit calls on the graphics timeline (roadmap item 1b,
+	// periodic submits), and the read faults the render thread took with the device wait inside
+	// them. The last two are the item 1b headline numbers, counted in every build.
+	std::vector<std::vector<uint64_t>> frame_submits(frame_count);
+	std::vector<std::vector<uint64_t>> frame_faults(frame_count);
+	std::vector<std::vector<uint64_t>> frame_fault_wait_ns(frame_count);
 	// Per frame, per loop: what the memory writer cost and did. The wait is the render thread's,
 	// the rest the writer's; both are the harness's own and are reported apart from ms/loop. The
 	// pre-event batch is applied before the frame's clock starts, as it always has been, so its
@@ -1389,6 +1396,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 				writer->ResetWait();
 			}
 			Memory::ResetGpuBackingDrainCount();
+			const auto submits_before    = CommandScheduler::TotalSubmits();
+			const auto faults_before     = ReadbackDiag::TotalFaults();
+			const auto fault_wait_before = ReadbackDiag::TotalWaitNs();
 
 			const auto frame_start = Clock::now();
 			for (size_t i = frame.first; i < frame.first + frame.count; i++) {
@@ -1483,6 +1493,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			frame_writer_skipped[index].push_back(writer ? writer->SkippedPages() : 0);
 			frame_drains[index].push_back(Memory::GpuBackingDrainCount());
 			frame_syncs[index].push_back(Memory::GpuBackingSyncCount());
+			frame_submits[index].push_back(CommandScheduler::TotalSubmits() - submits_before);
+			frame_faults[index].push_back(ReadbackDiag::TotalFaults() - faults_before);
+			frame_fault_wait_ns[index].push_back(ReadbackDiag::TotalWaitNs() - fault_wait_before);
 			frame_gpu_ms[index].push_back(gpu_done);
 			frame_loop_ms[index].push_back(frame_done);
 			gpu_total += gpu_done;
@@ -1543,6 +1556,10 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	std::vector<uint64_t> sync_mean(frame_count, 0);
 	uint64_t              drains_per_loop = 0;
 	uint64_t              syncs_per_loop  = 0;
+	std::vector<uint64_t> submit_mean(frame_count, 0);
+	uint64_t              submits_per_loop    = 0;
+	uint64_t              faults_per_loop     = 0;
+	uint64_t              fault_wait_per_loop = 0;
 	const auto            mean_of = [](const std::vector<uint64_t>& samples) -> uint64_t {
 		const auto skipped = samples.size() > 1 ? 1u : 0u;
 		const auto counted = samples.size() - skipped;
@@ -1565,6 +1582,10 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		sync_mean[i]  = mean_of(frame_syncs[i]);
 		drains_per_loop += drain_mean[i];
 		syncs_per_loop += sync_mean[i];
+		submit_mean[i] = mean_of(frame_submits[i]);
+		submits_per_loop += submit_mean[i];
+		faults_per_loop += mean_of(frame_faults[i]);
+		fault_wait_per_loop += mean_of(frame_fault_wait_ns[i]);
 		{
 			const auto& samples = frame_async[i];
 			const auto  field   = [&](uint64_t AsyncProtectCounters::*member) {
@@ -1650,6 +1671,11 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	::printf("  drains         %llu a loop of %llu GPU-range syncs (readbacks on the render thread)\n",
 	         static_cast<unsigned long long>(drains_per_loop),
 	         static_cast<unsigned long long>(syncs_per_loop));
+	::printf("  submits        %llu a loop (vkQueueSubmit, graphics timeline); read faults %llu a "
+	         "loop, %.2f ms of device wait in them\n",
+	         static_cast<unsigned long long>(submits_per_loop),
+	         static_cast<unsigned long long>(faults_per_loop),
+	         static_cast<double>(fault_wait_per_loop) / 1.0e6);
 	for (size_t i = 0; i < frame_count; i++) {
 		::printf("  frame %-2zu %-5llu gpu median %8.3f  min %8.3f  max %8.3f | loop median %8.3f",
 		         i + 1, static_cast<unsigned long long>(recorded[frame_base + i].number),
@@ -1781,6 +1807,13 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		       << ",\n";
 		report << "  \"drains_per_loop\": " << drains_per_loop << ",\n";
 		report << "  \"syncs_per_loop\": " << syncs_per_loop << ",\n";
+		report << "  \"submits_per_loop\": " << submits_per_loop << ",\n";
+		report << "  \"read_faults_per_loop\": " << faults_per_loop << ",\n";
+		report << "  \"read_fault_wait_ms_per_loop\": "
+		       << static_cast<double>(fault_wait_per_loop) / 1.0e6 << ",\n";
+		report << "  \"gpu_submit_interval\": " << Config::GetGpuSubmitInterval() << ",\n";
+		report << "  \"gpu_submit_after_writes\": "
+		       << (Config::GpuSubmitAfterWritesEnabled() ? "true" : "false") << ",\n";
 		report << "  \"frame_drains\": [";
 		for (size_t i = 0; i < frame_count; i++) {
 			report << (i == 0 ? "" : ",") << drain_mean[i];

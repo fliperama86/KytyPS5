@@ -89,6 +89,15 @@ struct ConfigOptions {
 	// download and wait, and record what was being evaluated and which submission produced the
 	// page. Off in every measured run that is not the characterisation itself.
 	bool                   gpu_readback_diagnostics_enabled = false;
+	// "Periodic submits" of item 1b: after every N draws and dispatches the render thread records,
+	// the open command buffer is ended and submitted without a wait, so the device executes it
+	// while the CPU keeps recording. 0 keeps the old behaviour, one submission per guest
+	// submission or drain.
+	uint32_t               gpu_submit_interval = 0;
+	// The same, additionally right after any draw or dispatch that claimed a range for the GPU
+	// (ObtainBuffer with is_written), so a producer the render thread is about to read starts
+	// executing at once.
+	bool                   gpu_submit_after_writes_enabled = false;
 	// Design P of docs/bda-sync-design.md: the memory tracker stops re-protecting the pages a BDA
 	// scan uploads on the render thread and hands them to a helper thread, which protects them in
 	// batches; the next scan uploads each landed page once more. Off, the tracker is unchanged.
@@ -162,6 +171,8 @@ bool                   GpuIndirectEnabled();
 bool                   GpuIndirectDrawsEnabled();
 bool                   GpuReadbackProducerWaitEnabled();
 bool                   GpuReadbackDiagnosticsEnabled();
+uint32_t               GetGpuSubmitInterval();
+bool                   GpuSubmitAfterWritesEnabled();
 bool                   BdaAsyncProtectEnabled();
 BdaAsyncProtectAffinity GetBdaAsyncProtectAffinity();
 ShaderOptimizationType GetShaderOptimizationType();

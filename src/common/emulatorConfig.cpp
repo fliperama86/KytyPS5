@@ -103,6 +103,14 @@ bool GpuReadbackDiagnosticsEnabled() {
 	return g_config->gpu_readback_diagnostics_enabled;
 }
 
+uint32_t GetGpuSubmitInterval() {
+	return g_config->gpu_submit_interval;
+}
+
+bool GpuSubmitAfterWritesEnabled() {
+	return g_config->gpu_submit_after_writes_enabled;
+}
+
 bool BdaAsyncProtectEnabled() {
 	return g_config->bda_async_protect_enabled;
 }

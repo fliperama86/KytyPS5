@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -96,7 +97,9 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_submit_interval(Config::GetGpuSubmitInterval()),
+      m_submit_after_writes(Config::GpuSubmitAfterWritesEnabled()) {}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -179,6 +182,39 @@ void CommandScheduler::Flush() {
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
+}
+
+void CommandScheduler::NoteDrawRecorded() {
+	const bool write_flush = m_submit_gpu_write;
+	m_submit_gpu_write     = false;
+	if (m_submit_interval != 0) {
+		++m_submit_draws;
+	} else if (!write_flush) {
+		return;
+	}
+	if (!write_flush && m_submit_draws < m_submit_interval) {
+		return;
+	}
+	// Nothing to submit: the caller records a draw before every call, so the only way the buffer
+	// is not recording is a drain that has just happened on this very draw.
+	if (!Active() || m_command.IsInvalid()) {
+		m_submit_draws = 0;
+		return;
+	}
+	// Only outside a dynamic-rendering pass. Cutting one in half costs an attachment store and
+	// reload on both sides and can repeat a clear, and measured worse than it saved; a dispatch
+	// ends the pass before it records, so the producers this exists for are exactly the
+	// boundaries that are free. The counter keeps its value, so the submit happens at the first
+	// boundary that is outside a pass.
+	if (m_command.Rendering()) {
+		m_submit_gpu_write = write_flush;
+		return;
+	}
+	m_submit_draws = 0;
+	// Submit() ends the buffer and hands it to the queue without a wait. Queue submission order
+	// keeps every barrier already recorded in force over everything recorded after it, so nothing
+	// else changes.
+	Flush();
 }
 
 void CommandScheduler::FlushAndWait() {
@@ -393,6 +429,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
+	s_total_submits.fetch_add(1, std::memory_order_relaxed);
 	m_command.m_buffer = nullptr;
 	return tick;
 }

@@ -85,6 +85,14 @@ static void PrintUsage() {
 	::printf("  --gpu-readback-diagnostics <t|f>     Count and time the render thread's read\n"
 	         "                                       faults and record their producers.\n"
 	         "                                       Default: false.\n");
+	::printf("  --gpu-submit-interval <num>          Submit the open command buffer, without\n"
+	         "                                       waiting, after every N draws and dispatches\n"
+	         "                                       the render thread records, so the device\n"
+	         "                                       runs while the CPU records. 0 disables it.\n"
+	         "                                       Default: 0.\n");
+	::printf("  --gpu-submit-after-writes <t|f>      Also submit right after a draw or dispatch\n"
+	         "                                       that claimed a range for the GPU.\n"
+	         "                                       Default: false.\n");
 	::printf("  --bda-async-protect <true|false>     Re-protect the pages a BDA scan uploads on\n"
 	         "                                       a helper thread instead of the render\n"
 	         "                                       thread, and upload each page once more\n"
@@ -394,6 +402,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu-readback-diagnostics") {
 			if (!ParseBool(value, options.config.gpu_readback_diagnostics_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-submit-interval") {
+			const int32_t interval             = Common::ToInt32(value);
+			options.config.gpu_submit_interval = static_cast<uint32_t>(interval < 0 ? 0 : interval);
+		} else if (arg == "--gpu-submit-after-writes") {
+			if (!ParseBool(value, options.config.gpu_submit_after_writes_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

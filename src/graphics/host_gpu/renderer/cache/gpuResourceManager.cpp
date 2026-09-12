@@ -29,12 +29,18 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-	} else if (ReadbackDiag::Enabled() && GuestGpu::IsGpuThread()) {
+	} else if (GuestGpu::IsGpuThread()) {
 		// Item 1b (docs/performance-roadmap.md): a read fault on a GPU-dirty page is what turns an
-		// SRT evaluation into a device drain. Time it and record what was being evaluated.
-		ReadbackDiag::BeginFault(fault_vaddr);
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
-		ReadbackDiag::EndFault();
+		// SRT evaluation into a device drain. Always counted; --gpu-readback-diagnostics also
+		// times it and records what was being evaluated.
+		ReadbackDiag::CountFault();
+		if (ReadbackDiag::Enabled()) {
+			ReadbackDiag::BeginFault(fault_vaddr);
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+			ReadbackDiag::EndFault();
+		} else {
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}

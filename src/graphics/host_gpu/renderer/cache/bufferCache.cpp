@@ -214,9 +214,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies,
 		// overtakes the copy, and the work recorded since the last drain stays in the open
 		// command buffer, unsubmitted -- which is the whole saving.
 		const bool own_submission = producer_tick != 0 && m_scheduler.ReadbackReady();
-		const auto wait_start     = ReadbackDiag::Enabled()
-		                                ? std::chrono::steady_clock::now()
-		                                : std::chrono::steady_clock::time_point {};
+		const auto wait_start     = std::chrono::steady_clock::now();
 		if (own_submission) {
 			const auto native = m_scheduler.BeginReadback();
 			uint64_t   offset = 0;
@@ -252,11 +250,13 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies,
 			m_scheduler.Finish();
 			m_scheduler.WaitPriorityOperations(completion_tick);
 		}
+		const auto wait_ns =
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - wait_start)
+		                              .count());
+		ReadbackDiag::CountWait(wait_ns);
 		if (ReadbackDiag::Enabled()) {
-			ReadbackDiag::NoteWait(static_cast<uint64_t>(
-			    std::chrono::duration_cast<std::chrono::nanoseconds>(
-			        std::chrono::steady_clock::now() - wait_start)
-			        .count()));
+			ReadbackDiag::NoteWait(wait_ns);
 			ReadbackDiag::NoteOwnSubmission(own_submission);
 		}
 		uint64_t cursor = 0;
@@ -673,6 +673,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// Item 1b, periodic submits: this draw or dispatch is a producer, so --gpu-submit-after-
+		// writes submits the open buffer once it has been recorded.
+		m_scheduler.NoteGpuWrite();
 		if (m_track_gpu_write_ticks) {
 			RecordGpuWriteTick(vaddr, size, m_scheduler.CurrentTick());
 		}

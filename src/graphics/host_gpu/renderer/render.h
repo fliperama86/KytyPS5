@@ -130,6 +130,13 @@ public:
 	// whether what it left bound is still bound.
 	[[nodiscard]] uint64_t GraphicsStateEpoch() const noexcept { return m_graphics_state_epoch; }
 	void InvalidateGraphicsState() noexcept { ++m_graphics_state_epoch; }
+	// Whether a dynamic-rendering pass is open. The periodic submit (--gpu-submit-interval) only
+	// ends a command buffer when none is: closing a pass and reopening it in the next buffer
+	// would reload every attachment, and a pass whose load operations clear would clear a second
+	// time -- two consecutive draws that share a render state re-enter BeginRendering as a no-op
+	// today, so the clear happens once. Outside a pass neither can arise, because the next draw
+	// calls BeginRendering either way.
+	[[nodiscard]] bool Rendering() const noexcept { return m_rendering; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);

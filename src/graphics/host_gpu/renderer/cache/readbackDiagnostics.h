@@ -41,12 +41,32 @@ struct Evaluation {
 
 namespace Detail {
 inline std::atomic_bool g_enabled {false};
+// Always on, even with the characterisation off: two counters cheap enough to keep in a measured
+// build, so every replay report can print the item 1b headline numbers (read faults a loop, and
+// the device wait inside them) beside the submit count. About a hundred increments a loop.
+inline std::atomic<uint64_t> g_fault_count {0};
+inline std::atomic<uint64_t> g_fault_wait_ns {0};
 } // namespace Detail
 
 [[nodiscard]] inline bool Enabled() noexcept {
 	return Detail::g_enabled.load(std::memory_order_relaxed);
 }
 void Enable(bool on);
+
+// A read fault the render thread took on a GPU-dirty page, and the time the download's drain (or
+// its own submission) waited for the device.
+inline void CountFault() noexcept {
+	Detail::g_fault_count.fetch_add(1, std::memory_order_relaxed);
+}
+inline void CountWait(uint64_t wait_ns) noexcept {
+	Detail::g_fault_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+}
+[[nodiscard]] inline uint64_t TotalFaults() noexcept {
+	return Detail::g_fault_count.load(std::memory_order_relaxed);
+}
+[[nodiscard]] inline uint64_t TotalWaitNs() noexcept {
+	return Detail::g_fault_wait_ns.load(std::memory_order_relaxed);
+}
 
 [[nodiscard]] Evaluation& Current() noexcept;
 

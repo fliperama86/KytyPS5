@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
@@ -51,6 +52,23 @@ public:
 	[[nodiscard]] bool ReadbackReady() const noexcept;
 	vk::CommandBuffer  BeginReadback();
 	void               SubmitReadbackAndWait(uint64_t wait_tick);
+
+	// "Periodic submits" of item 1b (docs/performance-roadmap.md). Today the open command buffer
+	// is submitted only when something drains it or at a guest submission boundary, so between
+	// drains the device idles while the render thread records and at every drain the render
+	// thread waits for the whole buffer. With --gpu-submit-interval N the render thread calls
+	// this after each recorded draw and dispatch and the buffer is ended and submitted, without
+	// a wait, every N of them; --gpu-submit-after-writes submits after any of them that claimed
+	// a range for the GPU, which is the producer a readback is about to ask for.
+	void NoteDrawRecorded();
+	// ObtainBuffer with is_written, the event that makes a range GPU-owned. Only recorded when
+	// --gpu-submit-after-writes is on.
+	void NoteGpuWrite() noexcept { m_submit_gpu_write = m_submit_after_writes; }
+	// Every vkQueueSubmit on the graphics timeline since the process started, for the replay
+	// report. Always counted; the increment is one relaxed add per submission.
+	[[nodiscard]] static uint64_t TotalSubmits() noexcept {
+		return s_total_submits.load(std::memory_order_relaxed);
+	}
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -120,6 +138,15 @@ private:
 	uint64_t                                   m_readback_value     = 0;
 	size_t                                     m_readback_index     = 0;
 	vk::CommandBuffer                          m_readback_open      = nullptr;
+
+	// Periodic submits; see NoteDrawRecorded. Read once at construction so the steady state is
+	// two loads of our own members per draw.
+	uint32_t m_submit_interval    = 0;
+	bool     m_submit_after_writes = false;
+	uint32_t m_submit_draws       = 0;
+	bool     m_submit_gpu_write   = false;
+
+	inline static std::atomic<uint64_t> s_total_submits {0};
 };
 
 } // namespace Libs::Graphics

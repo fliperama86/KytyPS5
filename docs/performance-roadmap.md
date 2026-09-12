@@ -25,7 +25,7 @@ Where the 106 ms goes, by source file, self time:
 
 | File | ms/frame | share | what it is |
 | --- | --- | --- | --- |
-| SrtWalker.cpp | 28.1 | 26% | SRT evaluation on the CPU (`EvaluateRuntimeSourcesImpl`) |
+| SrtWalker.cpp | 28.1 | 26% | SRT evaluation on the CPU (`EvaluateRuntimeSourcesImpl`); 1.2 us of its 1.5 us an event is the first touch of the guest SRT pages ([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Packed flat program") |
 | renderDraw.cpp | 13.7 | 13% | per-draw recording: index buffer, shader refresh, depth target, draw |
 | pm4Handlers.cpp | 13.6 | 13% | PM4 packet handlers, indirect argument sync |
 | gpuResourceManager.cpp | 10.7 | 10% | BDA dirty-page sync (`SynchronizeBdaBuffers`), new with stage 1 |
@@ -176,7 +176,13 @@ Not measured: Vulkan validation. `VK_LAYER_KHRONOS_validation` is not installed 
 
 ### 2. Finish stage 1 of GPU-side descriptor fetch
 
-Status, September 12, 2026: **both halves are written and measured, and neither pays in replay.**
+Status, September 12, 2026: **both halves are written and measured, neither pays in replay, and
+the packed evaluator that followed says why.** The evaluator's per-event cost is the guest SRT
+pages, not the plan: a packed sequential form of the flat program cuts the synthetic cold cost by
+60% and the replay loop by 2 ms, and the same instrumentation prices the plan at 68 ns an event
+against 1 205 ns of first touch on guest memory
+([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Packed flat program"). Skipping roots removes
+reads, not cache lines, which is why stages 1 and 1b moved the zone by less than 1%.
 Stage 1 landed behind `--gpu-descriptors` (default off), measured slower, causes known
 ([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Stage 1 measured" and its re-baseline of
 September 11: 11.63 FPS off against 9.67 on, ratio 1.202). Stage 1b, the flat SRT reads in-shader,
@@ -195,9 +201,13 @@ the fixed per-call work is 149 ns of the 1 500 and the rest is the cache misses 
 takes on its own plan -- 40 to 60 lines of it an event, across 493 plans cycled a loop -- so the
 same evaluation runs in 188 ns out of L1 and 1 159 ns out of DRAM
 ([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Where the evaluator's 1.5 us goes").
-Either way the cost does not follow the roots out of the host, so the levers left are calling it
-less often (once a program a frame instead of once a stage a draw, which also reuses a warm plan
-across the program's draws) or removing the last host consumer of the walk, which is stage 3.
+Either way the cost does not follow the roots out of the host. The plan-cold reading of that
+measurement was tested on September 12 by packing the flat program into one sequential 16-byte-an
+-instruction schedule: the bench improved 60%, the replay loop 2 ms, and splitting the packed run
+into a pass that touches only the plan and a pass that reads guest memory priced them at **68 ns
+and 1 205 ns** an event. So the levers left are calling it less often (once a program a frame
+instead of once a stage a draw, which also makes the guest lines warm across the program's draws)
+or removing the last host consumer of the walk, which is stage 3.
 
 Two pieces, both foreseeable from the stats dump:
 

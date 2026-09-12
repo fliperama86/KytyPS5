@@ -412,9 +412,141 @@ lever is not making one evaluation cheaper; it is running it less often (one eva
 frame instead of one a stage a draw), which reuses the same warm plan across a program's draws, or
 removing the host's last consumer of the walk in stage 3.
 
+**Corrected by the next section.** "What is cold is the plan" is what the bench's flush columns
+say, and it is wrong for the renderer: the plan is warm there, because the caller walks it
+immediately before the evaluation. Packing the plan into a dozen contiguous lines was built and
+measured, and it buys 2 ms of a 73 ms loop; splitting the packed run prices the plan at 68 ns an
+event against 1 205 ns of first touch on the guest SRT pages. The rest of this section stands: the
+fixed per-call work is 149 ns, the chase is shallow, and skipping roots buys nothing -- because it
+removes reads, not the cache lines they share.
+
 Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/tracy-zones/` (four CSVs, their logs and the stats
 dump), `_Runtime/_Diagnostics/replay/nexus-6/srt-bench/` (bench tables),
 `_Runtime/_Diagnostics/replay/nexus-6/runs-zones/` (the 40-loop bench and its image).
+
+#### Packed flat program, September 12, 2026
+
+The section above said the evaluator's 1.5 us is the memory latency of the *plan*, and that the
+lever is its layout. A packed execution form was built to take that lever, and it is measured here
+both ways. **It works in the bench and buys about 2 ms of a 73 ms replay loop, one fifteenth of what
+the plan-cold model predicted -- and the same instrumentation shows why: in the renderer the plan is
+not cold. The call waits on the first touch of the guest SRT pages.**
+
+**The form.** `CompileSrtPlan` now also builds, per plan, one deduplicated topological schedule
+covering every descriptor source and every non-clean flat read (`SrtPackedProgram`,
+SrtFlatProgram.h). It is stored in one allocation, in execution order, **16 bytes an instruction**:
+a 4-byte immediate, an opcode byte, a flags byte (argument count, clean read, wide immediate,
+sign-extended immediate) and five 2-byte argument positions. 16 rather than 24 because the only
+immediate that does not fit 32 bits is a 64-bit literal, which gets an escape into a side table
+that no plan in the dump uses; positions are 16-bit because the largest plan in the dump executes
+290 instructions. Arguments are positions in the schedule, so the value memo is a dense array
+indexed by position, there is no `insts[schedule[step]]` indirection, and nothing has to be cleared
+between runs. The source roots carry their `dword_count` and the read roots their `flat_offset`, in
+the same blob, so an evaluation never touches the plan's `descriptor_sources` or `srt_reads`
+either. The compile-time structures are unchanged and still feed the SPIR-V lowering.
+
+Everything in the schedule runs. A root's validity is a failed bit on its result instead of an
+abort: a failure sets its own position's bit, every instruction ORs its arguments' bits, and an
+instruction with a failed operand is not executed -- which is what keeps a read off an address a
+failed operand would have produced. Any failure hands the whole call back to the compile-time form,
+which reproduces it with its diagnostics, so failures stay bit-identical and rare calls pay for
+both. Three cases keep the compile-time form: resource control flow (its conditions are clean
+context, and its inactive sources must not be evaluated at all), a clean slot inside an otherwise
+packed plan, and **any call that skips a flat slot** -- see the regression below.
+
+**The bench.** `srt_evaluator_bench --packed=0|1` measures both forms from one binary; the cold
+table's flush columns flush both forms' arrays, so the columns differ only in which one runs. Per
+call, ns, 200 000 iterations a row, the flush rows the median of six runs
+(`srt-bench/packed-sweep.txt`):
+
+| cycle footprint | copies | `nexus-flat` | packed | `nexus-mix` | packed |
+| --- | --- | --- | --- | --- | --- |
+| 8 KiB (L1) | 1 | 179.1 | **116.7** | 246.9 | **175.2** |
+| 0.5 MiB (L2) | 64 | 201.9 | 127.7 | 275.4 | 184.3 |
+| 4 MiB (L3) | 512 | 242.2 | 134.4 | 323.2 | 202.1 |
+| 32 MiB (L3) | 4 096 | 327.3 | 170.0 | 484.1 | 247.4 |
+| 128 MiB (past the L3) | 16 384 | 951.0 | **355.8** | 1 216.8 | **519.8** |
+| 385 MiB (DRAM) | 49 152 | 1 155.4 | 607.9 | 1 419.6 | 762.1 |
+| plan lines flushed, guest table warm | 64 | 881.2 | **352.1** | 958.2 | **417.2** |
+| guest table flushed, plan warm | 64 | 295.7 | 224.9 | 379.4 | 299.9 |
+| both flushed | 64 | 923.2 | 445.1 | 1 074.0 | 499.6 |
+| L1, with the renderer's per-call vectors | 1 | 240.2 | 179.7 | 311.0 | 234.8 |
+
+The gate this had to pass before the renderer was 50% off the past-L3 and plan-flushed rows with no
+rise in the hot row: **-63% and -60% on `nexus-flat`, -57% and -56% on `nexus-mix`, with the hot row
+down 35% and 29%**. The packed blob is 888 B (14 lines) for `nexus-flat`'s 44 instructions and
+1 440 B (23 lines) for `nexus-mix`'s 77, against 40 to 60 scattered lines before. Prefetching the
+whole blob before the memo is sized is worth 80 ns of the plan-flushed row and nothing in the cycle
+rows, where the streamer already follows the contiguous walk. Every shape's checksum is identical
+between the two forms, and the hot table moves with them: `typical-ps` 1 202 -> 916 ns,
+`heavy-ps` 2 899 -> 2 236, `waterfall-ps` 1 230 -> 958, `control-flow-ps` 1 212 -> 1 200 (not
+packed, by design).
+
+**The replay.** nexus-6, 40 loops, two repeats, `-Image`, one binary switched with
+`KYTY_SRT_PACKED` (`runs-packed-off3/`, `runs-packed-on4/`):
+
+| `ms/loop gpu`, both runs | packed off | packed on |
+| --- | --- | --- |
+| `--gpu-descriptors false`, min | 73.31 / 73.93 | **72.02 / 70.45** |
+| `--gpu-descriptors false`, median | 75.38 / 75.49 | 73.71 / 72.78 |
+| `--gpu-descriptors true`, min | 77.07 / 77.16 | **75.14 / 74.94** |
+| `--gpu-descriptors true`, median | 82.20 / 80.44 | 79.12 / 79.36 |
+| `--gpu-descriptors true --gpu-srt-reads true`, min | 77.80 / 77.91 | 77.43 / 77.18 |
+| image vs `reference.png` | R 9.8 G 7.8 B 4.1 | R 9.8 G 7.8 B 4.1 |
+
+About **2 ms a loop** on the two configurations that evaluate everything, and nothing on the third,
+where only the programs with no lowered slot are packed. The first version of the change packed
+those too, and it **cost 1.8 ms a loop** (`gd=true --gpu-srt-reads true` at 79.55 / 79.74 min,
+`runs-packed-on3/`): a sequential schedule cannot leave a skipped slot out, and what the host saves
+by skipping one is its guest line. That is the first direct evidence that the guest lines, not the
+plan, are what an evaluation waits for.
+
+**Why it is only 2 ms, measured.** Tracy, nexus-6, per-call means with each zone's single parked
+maximum dropped, two captures a configuration (`tracy-packed/`):
+
+| ns a call, `--gpu-descriptors false` | packed off (30 / 60 loops) | packed on (30 / 60) |
+| --- | --- | --- |
+| `SrtEval::Setup` | 29.5 / 29.6 | 29.6 / 29.3 |
+| `SrtEval::Prepare` | 41.5 / 42.8 | 43.6 / 42.4 |
+| `SrtEval::Execute` (the packed run) | - | **1 482.8 / 1 438.8** |
+| `SrtEval::Sources` | 533.6 / 535.4 | 50.0 / 53.1 |
+| `SrtEval::Slots` | 972.6 / 1 033.7 | 82.5 / 83.6 |
+| `SrtEval::Writeback` | 11.9 / 11.9 | 12.0 / 12.2 |
+| `EvaluateRuntimeSourcesImpl` self | 69.5 / 68.4 | 77.3 / 75.4 |
+| all parts | 1 580 / 1 640 | 1 638 / 1 599 |
+
+The instrumented call is the same size either way: the zones cannot resolve a 2 ms a loop change
+(30 ns a call) under their own 50 ns a zone. Two experiments inside the packed run do resolve it,
+both on `--gpu-descriptors false`, 30 loops:
+
+- **Run the whole packed program twice.** The second pass costs **+68 ns** (1 482.5 -> 1 550.8).
+  Executing 24 instructions and 21 guest reads over warm data is 68 ns; the other 1 400 ns of the
+  first pass is first touch.
+- **Split the pass in two**: one pass that executes every instruction and answers each read from
+  its own address without touching memory, then the real one. The first costs **68.0 ns** and the
+  second **1 205.3 ns**. The first pass touches the whole packed program, so the plan's cold cost in
+  the renderer is 68 ns; the guest pages are the 1 205.
+
+So the model that produced this design is wrong in the renderer, and the bench is why: flushing a
+plan's lines prices what the renderer never pays, because the caller walks the same plan
+(`ProgramCache::MaterializeResources`, `MaterializeSnapshot`, `info.buffers`,
+`materialization_sources`) immediately before the evaluation and leaves it warm. What is cold is the
+guest SRT: 4 lines and 2.2 pages an event, spread over 474 pages, with the whole rest of the render
+thread between two events. That also explains, at last, why stage 1 and stage 1b moved the zone by
+less than 1%: **skipping roots removes reads, not lines**. The 21.5 reads of an event land in 4
+lines, so dropping 17.8 of them leaves the same 4 first touches to pay.
+
+What is left for this zone is therefore not its shape but its frequency: one evaluation a program a
+frame instead of one a stage a draw (which would also make the guest lines warm across a program's
+draws), or a prefetch of the SRT table issued when the draw's user data is known, long before the
+evaluation reads it. Both are item 3 work, and both are now sized by the same number: 1.2 us of
+first touch an event, 25 ms of a 73 ms loop.
+
+Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/srt-bench/packed-sweep.txt` (the bench sweep),
+`.../tracy-packed/` (two captures a form for `--gpu-descriptors false`, one a form for `true`,
+plus the twice and split experiments), `.../runs-packed-off3/`,
+`.../runs-packed-on3/` (before the skipped-slot fallback) and `.../runs-packed-on4/` (the
+40-loop benches and their images).
 
 ### Stage 1 measured, September 11, 2026
 

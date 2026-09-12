@@ -1,8 +1,9 @@
 # Removing the render thread's sync points (proposal)
 
 Status, September 12, 2026: step 1 of the artifact-free variant is landed and measured behind
-`--gpu-prologue-table` (below, "Step 1"); its hard stop fired, so the rest of the path awaits a
-decision. The host-memory bench removed the need for an artifact policy.
+`--gpu-prologue-table` (below, "Step 1"): neither BDA page table misses any more, the image is
+unchanged, and it costs 2.4 ms a loop against the 1 ms it was allowed, so the rest of the path
+awaits a decision. The host-memory bench removed the need for an artifact policy.
 Builds on [performance-roadmap.md](performance-roadmap.md) item 1b and
 [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md).
 
@@ -146,126 +147,128 @@ about 45, the game 86 to about 60. Effort: about a week of agent work in four me
 
 ## Step 1: the prologue table (landed, `--gpu-prologue-table`, default off)
 
-Landed and measured September 12, 2026. **The hard stop fired**: the misses go to zero and the
-image is unchanged, but `ms/loop gpu` regresses by 5.1 ms against the 2 ms the step was allowed,
-and the regression is the GPU reading its descriptors over PCIe, not the bookkeeping. The design
-below is what is in the tree; the decision it now needs is in "What the 5 ms is".
+Landed and measured September 12, 2026. **The hard stop fired**: both page tables miss nothing,
+in loop 1 as well as in the steady state, the image is unchanged and the bookkeeping is free, but
+`ms/loop gpu` on `--gpu-descriptors true --gpu-srt-reads true` is 80.8 to 81.5 against 78.4 to
+78.8 with the table off. Three shapes of the design were built and measured to find out why; the
+last is what the tree holds.
 
 ### What was built
 
-A second BDA page table, the same shape as the data one (one 64-bit device address per 16 KiB
-page, 512 MiB of VRAM), read **only** by the shader prologue. The data table is untouched and
-still serves every body load, which is what the host-memory bench requires: a body read from an
-import is 300 to 400 times a mirror read.
+A second BDA page table read **only** by the shader prologue -- the descriptor roots and
+flattened SRT reads `--gpu-descriptors` and `--gpu-srt-reads` lower, which all go through
+`EmitSrtFlatRoot`. The data table is untouched and still serves every body load, which is what the
+host-memory bench requires: a body read from an import is 300 to 400 times a mirror read.
 
-- **Entries.** The default entry for a mapped guest page is the page itself inside guest memory
-  imported with `VK_EXT_external_memory_host`. A page the GPU owns (any byte of it claimed by
-  `ObtainBuffer` with `is_written`, until the download that gives it back) points at the VRAM
-  mirror instead, because that is where the GPU's writes are. A page that is neither imported nor
-  GPU-owned falls back to the mirror when a buffer covers it and to zero, the fault path, when
-  none does -- so an un-imported page behaves exactly as it does today.
+- **Entries.** A page a registered buffer covers holds that buffer's mirror -- the same address
+  the data table holds, kept up to date before every draw that reads it by the BDA scan, and a
+  VRAM read. Every other mapped page holds the page itself inside guest memory imported with
+  `VK_EXT_external_memory_host`, so the read cannot miss. A page that is neither keeps today's
+  answer, zero, which faults and reads zero. The tracker never moves an entry: only a buffer
+  registering or retiring, and an import arriving or going away, change one. **4 entries a loop**
+  on nexus-6 with `--gpu-descriptors true`, 41 with it false.
 - **The import is one allocation.** Direct, flexible and pooled guest memory are all views of the
   guest backing store (`GuestBackingStore`, one pagefile-backed section with a writable alias of
   the whole 13.5 GiB), so the alias is imported once and each view's pages point into it at
   `alias + backing_offset`. This is not an optimisation, it is the only thing that works: the
-  driver **refuses** an import that covers a part of a guest mapping, refuses most mappings above
+  driver **refuses** an import that covers part of a guest mapping, refuses most mappings above
   about 16 MiB, and refuses everything past roughly 2.3 GiB of separate views, all with
   `VK_ERROR_OUT_OF_DEVICE_MEMORY`, while it takes the single 13.5 GiB alias without complaint.
   Importing the 4,980 committed ranges one by one covered 2,306 MiB of 9,852 and left 74 prologue
-  misses a loop; importing the alias covers all of it in one allocation and leaves none. Private
-  commits (stack, code, runtime; 63.7 MiB on nexus-6) are not views of the backing store, are
-  imported on their own, and are refused -- the GPU never reads them, and they keep the mirror.
+  misses a loop; the alias covers all of it in one allocation and leaves none. Private commits
+  (stack, code, runtime; 63.7 MiB on nexus-6) are not views of the backing store, are imported on
+  their own, are refused, and keep the mirror -- the GPU never reads them.
+- **One binding, not three.** The prologue page table is the **upper half of the `BdaPagetable`
+  buffer** (which is twice as long with the setting on) and a prologue miss counts itself in a
+  dword past the `FaultBuffer` bitmap, which the host reads back with a four-byte copy; the bit it
+  sets is the bit a data miss sets, so the page is registered exactly as it always was and the
+  compaction shader still scans one bitmap. A stage therefore writes exactly the descriptors it
+  wrote before, and the emitter has one lookup function taking the half as an argument rather than
+  two functions.
 - **When.** `GpuResourceManager::ImportPendingRanges`, at the top of `PrepareBda`, on the GPU
   thread with a command buffer recording. It runs when a guest map set the pending flag and once
   at start-up, and it works from the kernel's committed ranges and backing views rather than the
   GPU's mapped set, because a replay commits gigabytes before the GPU thread exists.
-  `GuestResourceManager::UnmapMemory` releases before the guest decommits: it clears the entries,
+  `GpuResourceManager::UnmapMemory` releases before the guest decommits: it clears the entries,
   defers the Vulkan objects on the scheduler's tick, and the `Finish` plus `WaitPriorityOperations`
   it already did for the unmap runs them before returning.
-- **Maintenance.** `ChangeRegister` (both ways), the GPU claim in `ObtainBuffer` and the release in
-  `DownloadBufferMemory` queue the pages whose entry changed into one pending map, coalesced by
-  page; `PrepareBda` records them as runs of consecutive pages through the staging ring, the same
-  mechanism and ordering as the data table's own writes. 656 to 672 entries a loop on nexus-6.
-- **The shader.** `EmitBdaPointer` -- the one place `EmitSrtFlatRoot` reads guest memory, and so
-  every descriptor root and every flattened SRT read -- resolves through `get_bda_prologue_pointer`
-  instead of `get_bda_pointer`. Body loads keep `LoadBdaDword` and the data table. A miss still
-  sets a fault bit and reads zero; the bit goes to the prologue table's **own** fault buffer, so
-  its misses are counted apart. `ShaderInfo::gpu_prologue_table` carries the decision, so the
-  binding layout, the SPIR-V validator and the emitter agree, and a module compiled with the
-  setting off is byte-identical to before. The driver's pipeline cache is keyed on the SPIR-V, so
-  nothing else needs a key.
+- **Maintenance.** `ChangeRegister`, both ways, and the import queue the pages whose entry changed
+  into one pending map, coalesced by page; `PrepareBda` records them as runs of consecutive pages
+  through the staging ring, the same mechanism and ordering as the data table's own writes.
+- **The setting** carries into `ShaderInfo::gpu_prologue_table`, so the binding layout, the SPIR-V
+  validator and the emitter agree, and a module compiled with it off is what it always was. The
+  driver's pipeline cache is keyed on the SPIR-V, so nothing else needs a key.
 
 ### Measured, nexus-6, 40 loops x 2 repeats, `-Image`
 
-`_Runtime/_Diagnostics/replay/nexus-6/runs-prologue-ab/` (the four-way A/B),
-`runs-prologue/` (the first set, with the counters), `runs-prologue-diag/` (readback
-diagnostics), `runs-prologue-mirrorfirst/` (the variant below).
+`_Runtime/_Diagnostics/replay/nexus-6/runs-prologue-final/` is the build in the tree.
 
 | `ms/loop gpu` | min run 1 / 2 | median run 1 / 2 |
 | --- | --- | --- |
-| `--gpu-descriptors false`, table off | 73.08 / 72.32 | 74.89 / 74.00 |
-| `--gpu-descriptors false`, table **on** | 74.77 / 72.17 | 77.90 / 72.97 |
-| `--gpu-descriptors true --gpu-srt-reads true`, table off | 77.99 / 78.04 | 79.84 / 79.27 |
-| `--gpu-descriptors true --gpu-srt-reads true`, table **on** | 83.06 / 83.20 | 85.08 / 84.53 |
+| `--gpu-descriptors false`, table off | 71.87 / 71.86 | 72.54 / 72.72 |
+| `--gpu-descriptors false`, table **on** | 72.36 / 71.41 | 73.37 / 72.59 |
+| `--gpu-descriptors true --gpu-srt-reads true`, table off | 78.44 / 78.84 | 79.78 / 80.44 |
+| `--gpu-descriptors true --gpu-srt-reads true`, table **on** | 81.47 / 80.83 | 82.49 / 82.07 |
 
-| per loop | table off | table **on** |
+| per loop, `--gpu-descriptors true --gpu-srt-reads true` | table off | table **on** |
 | --- | --- | --- |
 | prologue-table misses | - | **0** (0 in loop 1) |
-| data-table fault pages | 12 (652 to 692 in loop 1) | 0 (1,173 to 1,188 in loop 1) |
-| prologue entries written | - | 656 to 672 |
-| read faults / device wait in them (`--gpu-readback-diagnostics`) | 89.6 / 28.73 ms | 89.6 / 30.83 ms |
+| data-table fault pages | 12 (702 to 729 in loop 1) | **2** (1,110 to 1,113 in loop 1) |
+| prologue entries written | - | 4 |
+| read faults / device wait in them (`--gpu-readback-diagnostics`) | 89.6 / 28.7 ms | 89.6 / 30.8 ms |
 | drains / GPU-range syncs | 14 / 10,248 | 14 / 10,248 |
 | image against `reference.png` | R 9.8 G 7.8 B 4.1 | R 9.8 G 7.8 B 4.1 |
 
-Imports: **71 allocations, 13.5 GiB, 1.41 s**, of which one is the 13.5 GiB backing alias and 70
-are private commits; 4,899 views recorded against the alias; 10 imports refused (63.7 MiB of
-stack, code and runtime memory the GPU never reads). Loop 1's presented frame is byte-identical
-to loop 40's in every configuration, so nothing renders a frame late.
+Imports: **71 allocations, 13.5 GiB, 1.37 s**, one of them the backing alias and 70 private
+commits; 4,899 views recorded against the alias; 10 refused (63.7 MiB). Loop 1's presented frame
+is byte-identical to loop 40's in every configuration, so nothing renders a frame late. The SPIR-V
+validates (`--shader-validation true`).
 
-### What the 5 ms is
+### What the 2.4 ms is, and what it is not
 
-Not the bookkeeping. With `--gpu-descriptors false` the table is still imported, filled and
-maintained -- 672 entry writes a loop -- and **no shader binds it**, and the loop does not move
-(72.17 to 74.77 min against 72.32 to 73.08 off, inside the run-to-run spread). The whole cost
-appears exactly when shaders start reading through it.
+**Not the bookkeeping.** With `--gpu-descriptors false` the table is still imported, filled and
+maintained and **no shader binds it**, and the loop does not move (71.41 to 72.36 min against
+71.86 to 71.87 off). The cost appears only when shaders read through it.
 
-So it is the prologue's own reads, from imported host memory over PCIe instead of from the VRAM
-mirror. The bench (docs/investigations/bda-host-memory-bench-2026-09-12.md) bounded that at
-**0.17 ms a frame overlapped and 10.1 ms fully serialized**, and named the risk that decides
-between them: a pipeline barrier drops the prologue's cache lines, and an imported host pointer is
-the one allocation the driver will not keep in L2 across one. The frame has hundreds of barriers,
-and the answer is **5.1 ms**, half way between the two bounds. The readback diagnostics say the
-same from the other end: the same 89.6 read faults a loop wait 2.1 ms longer because the device is
-slower.
+**Not the descriptor writes.** The first shape gave the prologue table and its fault buffer
+bindings of their own, two more storage-buffer descriptors per stage per draw over 20,700 stage
+events a loop. Folding both into the halves of the two bindings that already exist, so a stage
+writes exactly what it wrote before, changed the cost by nothing measurable.
 
-A variant confirms it. Pointing the prologue entry at the **mirror whenever a buffer covers the
-page** and at the import only for pages no buffer covers -- still miss-free, still image-identical,
-but an upload is again needed for a prologue read of a CPU-dirty page -- costs **2.4 ms** instead
-of 5.1 (80.18 / 80.89 min against 78.39 / 77.42 off, `runs-prologue-mirrorfirst/`). So about
-2.7 ms is the import reads themselves and about 2.4 ms is the second table's own binding: two more
-storage-buffer descriptors written per stage per draw, 20,700 stage events a loop, plus the extra
-function in every module.
+**Not the second fault-buffer scan.** The second shape gave the prologue half a bitmap of its own,
+compacted by a second 32,768-workgroup dispatch on the fault-processing schedule, about 39 times a
+loop. Replacing it with a counter dword and a four-byte copy also changed nothing measurable.
+
+**Not the import reads, mostly.** With mirror-first entries the prologue reads a mirror for every
+page a buffer covers, which is nearly all of them: only 2 pages a loop are still resolved through
+the import against 12 that faulted with the table off. A diagnostic build whose prologue lookup
+reads the **data** half -- the same addresses as the table-off build, with everything else of step
+1 in place -- still cost 2.0 ms (`runs-prologue-diag2/`). So at most a few tenths of the 2.4 is
+PCIe.
+
+**What is left is the lookup itself.** Every guest read of the SRT flat program goes through it,
+hundreds of thousands of times a loop, and step 1 makes it read a table selected at run time
+instead of a fixed one. Two functions cost 2.6 ms, one function with a half argument costs 2.4,
+and the same function reading the same half as before costs 2.0: the shape of the module is worth
+about 2 ms whatever is done to it, and the remaining 0.4 is the two integer operations the half
+adds. The rest of the 26 ms this path is meant to remove has not been touched yet.
+
+**Two variants that were tried and are not in the tree.** Entries following the tracker -- the
+import by default and the mirror only for a page the GPU owns, which is what the design called
+for -- costs **5.1 ms**, the extra 2.7 being the prologue reading imported memory for every
+CPU-owned page; it is the shape the later steps want, because it needs no upload, and this is its
+price. A soft fault, where a page resolved through the import also records itself so the host
+registers it and the next frame reads a mirror, costs **4.0 ms**: the recording is paid on every
+read of an unregistered page and the pages churn.
 
 ### Where that leaves the path
 
-The step does what it was for: **a prologue read can never miss**, in loop 1 as well as in the
-steady state, with the image unchanged and the 1b counters unchanged. What it does not do is come
-for free, and the 5.1 ms has to be paid back by step 2 -- which removes the 26 ms of drains that
-item 1b measured -- before the path is ahead. That is still a good trade on paper, and the
-measurement above is the first real price for the import rather than a bench projection.
-
-Three things a decision should weigh:
-
-- **The second table's binding is 2.4 ms of the 5.1 and is avoidable.** Folding the prologue table
-  and its fault buffer into the existing `BdaPagetable` and `FaultBuffer` bindings as two-element
-  arrays, or dropping the separate fault buffer once the counter has done its job, removes
-  descriptor writes rather than reads.
-- **The import reads are about 2.7 ms and are the design.** They shrink only if the driver starts
-  keeping imported host pointers in L2 across a barrier, which the bench already flagged as worth
-  re-checking on a driver update.
-- **The mirror-first variant is miss-free too**, for 2.4 ms instead of 5.1, and keeps the uploads
-  the artifact-free path wanted to delete. It is the cheaper half of step 1 if step 2 turns out to
-  need only "a prologue read never misses" and not "a prologue read never needs an upload".
+Step 1 does what it was for: **neither page table misses**, in loop 1 as well as in the steady
+state, with the image unchanged and item 1b's counters unchanged. It costs 2.4 ms a loop, against
+the 1 ms allowed, and that cost is in the one place nothing here can remove: the prologue's
+page-table lookup, which every root and every flattened read makes. Step 2 removes the 26 ms of
+drains item 1b measured, so the trade is still heavily in favour on paper -- but the 2.4 ms is
+real and the decision is whether to spend it now or to build step 2 far enough to see the return.
 
 ### Commands
 
@@ -278,6 +281,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\_Build\replay-des.p
              '--gpu-descriptors true --gpu-srt-reads true --gpu-prologue-table true'"
 ```
 
-`replay-des.ps1`'s table now carries `bda miss`, `pro miss`, `pro l1` and `pro write`, and the
-replay report carries `bda_prologue_fault_pages_per_loop`, `bda_prologue_fault_pages_loop1`,
+`replay-des.ps1`'s table carries `bda miss`, `pro miss`, `pro l1` and `pro write`, and the replay
+report carries `bda_prologue_fault_pages_per_loop`, `bda_prologue_fault_pages_loop1`,
 `bda_prologue_entry_writes_per_loop` and the `guest_import_*` totals.
+
+Earlier shapes, for the numbers above: `runs-prologue/` and `runs-prologue-ab/` (tracker-following
+entries, separate bindings), `runs-prologue-mirrorfirst/` (mirror-first, separate bindings),
+`runs-prologue-v3/` (mirror-first, folded bindings, two functions), `runs-prologue-v4/` (soft
+fault), `runs-prologue-diag2/` (the prologue lookup reading the data half).

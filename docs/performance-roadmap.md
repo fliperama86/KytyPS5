@@ -654,6 +654,32 @@ producer left behind. It stays off. The remaining 22 faults a loop are image and
 pixel and vertex shaders plus 6 outside any evaluation, which is the number stage 3 should be
 sized from ([sync-points-design.md](sync-points-design.md), "Step 2").
 
+State of the work, September 12, end of day (checked by hand, not relayed):
+
+- **The frame is about 90 CPU-to-GPU sync points** (item 1b): the SRT evaluator reading tables a
+  compute pass just wrote, faulting, and draining. 26 ms of a 72 ms replay loop, the same in the
+  game. Every CPU-side change measured today moved the frame by 0 to 3 ms because the next sync
+  point waits for the same GPU work; the end-to-end pair confirmed it (85.3 to 83.9 ms for three
+  levers replay priced at 7.7 ms).
+- **The way out is the console's way**: shaders read their own tables. Step 1 (the prologue table
+  over imported guest memory, `--gpu-prologue-table`) is landed, miss-free, and costs 2.4 ms of GPU
+  time that only shows while the sync points exist. Step 2 (compute programs' roots in-shader,
+  `--gpu-fetch-side-effects`) is landed and disabled: it removes the compute class of sync points
+  (faults 89 to 22 a loop) but its safety net skips dispatches on speculative reads the shader
+  never executes, which cascades into garbage and a crash. Root cause traced to one dword in
+  [sync-points-design.md](sync-points-design.md), "Step 2 fact check, part two".
+- **Next, in order**: (1) remove the skip, zero on an invalid read as stage 1b does, and make the
+  host T#/V# decoders treat garbage from GPU-written tables as an absent resource instead of
+  `EXIT`; (2) measure step 2 on a clean build with `--replay-timeout` raised (faults, wait,
+  `ms/loop gpu`, image), which also prices the per-wave prologue cost for the first time; (3) if
+  that cost is real, evaluate the SRT once per dispatch on the GPU into `FlattenedSrt`; (4) piece B,
+  images and samplers; (5) one end-to-end run.
+- **Two fragilities found on the way, both worth fixing regardless**: the CPU path evaluates every
+  flattened read eagerly and exits on failure, and only survives GPU-cleared table slots because
+  an earlier download left a stale copy; and the host descriptor decoders exit on garbage that
+  GPU-driven games legitimately leave in unused slots (the September 11 stage 1 crash and today's
+  `unsupported texture mip view` are the same failure).
+
 ### 3. Stages 2 and 3: vertex fetch in-shader, bindless images and samplers
 
 Status: designed, not started. [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Stage 2" and

@@ -549,3 +549,30 @@ What follows for the design:
    CPU side, where it belongs.
 3. With the skips gone, the per-wave cost of the prologue (the "19 ms") becomes measurable for
    the first time, and the 95 misses either vanish with the cascade or get their own trace.
+
+## Lessons from the day, for whoever continues
+
+- **Look at a zone's distribution before designing against its mean.** `EvaluateRuntimeSourcesImpl`
+  looked like 1.5 us of work a call; its median was 70 ns and 80% of its time sat in 90 calls a
+  frame that waited on the GPU. Four projections were built on the mean before anyone exported
+  the calls (`tracy-csvexport -u`).
+- **Verify a subagent's attribution against the raw log before acting on it.** Today's agents
+  were right about counts and wrong about causes four times (TLB churn, plan-data latency,
+  first-touch latency, inactive roots). Each wrong cause was cheap to refute with one grep or one
+  percentile, and expensive to build on.
+- **A dirty build recompiles every pipeline, and the replay's 2 s watchdog then cuts frames**,
+  which looks like corruption (a "corrupted PM4 stream", an access violation, unfinished frames).
+  Raise `--replay-timeout` for any run on a build whose SPIR-V changed, and read "did not finish
+  frame" lines before believing a crash.
+- **The NVIDIA compiler hangs on some instrumentation shapes**: a compare-exchange plus nested
+  selection inside every guest read, or an extra selection block in the prologue guard, across
+  340 side-effect programs, never finished `vkCreateComputePipelines`. Gate shader-side
+  diagnostics to one program by hash (`KYTY_GPU_FETCH_DUMP_HASH`) and prefer plain stores and
+  `OpAtomicIAdd`.
+- **The replay reproduces counts and CPU work; it does not price a GPU wait's removal** when the
+  next wait covers the same work. Judge sync-point work by sync points removed.
+- **Speculative reads are normal.** The recompiler hoists every `ReadConst` a shader might
+  execute; GPU-driven games clear and refill tables within a frame and leave garbage in unused
+  slots. Nothing on either side may treat an unexecuted read's failure as fatal, and nothing on
+  the host may exit on a descriptor it cannot decode.
+

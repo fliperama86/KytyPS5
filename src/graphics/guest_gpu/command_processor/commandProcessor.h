@@ -50,6 +50,10 @@ public:
 		int64_t flip_arg  = 0;
 	};
 
+	// DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS: the indirect arguments are thread counts, which
+	// the host divides by the shader's group size. Vulkan cannot, so that form keeps the readback.
+	static constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
+
 	CommandProcessor(RenderContext& renderer, int interrupt_event_id)
 	    : m_renderer(renderer), m_interrupt_event_id(interrupt_event_id) {}
 	~CommandProcessor() = default;

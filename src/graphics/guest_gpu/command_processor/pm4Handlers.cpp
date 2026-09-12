@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1341,6 +1342,16 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 		uint32_t   mode      = buffer[2];
 
 		EXIT_NOT_IMPLEMENTED(args_addr == 0);
+		// With --gpu-indirect the arguments stay on the device: DispatchDirect records
+		// vkCmdDispatchIndirect against this address, so nothing has to be read back. The
+		// thread-dimensions form is the exception -- the host divides those counts by the
+		// shader's group size, which Vulkan cannot do -- and keeps the readback.
+		if (Config::GpuIndirectEnabled() &&
+		    (mode & CommandProcessor::DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0) {
+			KYTY_PROFILER_BLOCK("CpOpDispatchIndirect::Dispatch");
+			cp.DispatchDirect(0, 0, 0, mode, args_addr);
+			return 3;
+		}
 		{
 			KYTY_PROFILER_BLOCK("CpOpDispatchIndirect::SyncArguments");
 			if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(

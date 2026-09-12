@@ -63,6 +63,9 @@ struct ConfigOptions {
 	bool                   shader_storage_image_bounds_check_enabled = true;
 	// Shaders evaluate eligible buffer descriptors in-shader (docs/gpu-descriptor-fetch.md).
 	bool                   gpu_descriptors_enabled = false;
+	// Vulkan consumes indirect draw and dispatch arguments in place instead of the render thread
+	// reading them back from the GPU (docs/performance-roadmap.md, item 1).
+	bool                   gpu_indirect_enabled = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -122,6 +125,7 @@ bool                   ShaderValidationEnabled();
 bool                   ShaderLdsWaitcntBarrierEnabled();
 bool                   ShaderStorageImageBoundsCheckEnabled();
 bool                   GpuDescriptorsEnabled();
+bool                   GpuIndirectEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 ShaderLogDirection     GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();

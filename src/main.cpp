@@ -68,6 +68,10 @@ static void PrintUsage() {
 	::printf("  --gpu-descriptors <t|f>              Evaluate eligible buffer descriptors in the\n"
 	         "                                       shader instead of on the render thread.\n"
 	         "                                       Experimental. Default: false.\n");
+	::printf("  --gpu-indirect <true|false>          Let Vulkan consume indirect draw and\n"
+	         "                                       dispatch arguments in place instead of\n"
+	         "                                       reading them back on the render\n"
+	         "                                       thread. Default: false.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -341,6 +345,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu-descriptors") {
 			if (!ParseBool(value, options.config.gpu_descriptors_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-indirect") {
+			if (!ParseBool(value, options.config.gpu_indirect_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

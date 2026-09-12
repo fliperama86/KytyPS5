@@ -83,6 +83,10 @@ bool GpuDescriptorsEnabled() {
 	return g_config->gpu_descriptors_enabled;
 }
 
+bool GpuIndirectEnabled() {
+	return g_config->gpu_indirect_enabled;
+}
+
 ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }

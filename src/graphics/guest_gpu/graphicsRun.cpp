@@ -1288,6 +1288,13 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
+	// See CpOpDispatchIndirect: with --gpu-indirect the device consumes the arguments in place,
+	// except in the thread-dimensions form, where the host has to divide them by the group size.
+	if (Config::GpuIndirectEnabled() &&
+	    (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0) {
+		DispatchDirect(0, 0, 0, mode, args_addr);
+		return;
+	}
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
 		static std::atomic<uint32_t> sync_fallback_logs {0};
 		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {

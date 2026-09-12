@@ -371,6 +371,7 @@ void WriteLocked(Collector& collector) {
 		out += "\t\t\"srt_chase\": {\n";
 		out += fmt::format("\t\t\t\"events\": {},\n", chase.events);
 		out += fmt::format("\t\t\t\"walker_events\": {},\n", chase.walker_events);
+		out += fmt::format("\t\t\t\"packed_events\": {},\n", chase.packed_events);
 		out += fmt::format("\t\t\t\"reads\": {},\n", chase.reads);
 		out += fmt::format("\t\t\t\"reads_per_event\": {:.3f},\n",
 		                   static_cast<double>(chase.reads) / events);

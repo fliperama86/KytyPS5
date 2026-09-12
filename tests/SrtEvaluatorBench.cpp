@@ -23,6 +23,12 @@ namespace {
 
 using namespace Libs::Graphics::ShaderRecompiler::IR;
 
+// The packed execution form of the flat program (docs/gpu-descriptor-fetch.md, "Packed flat
+// program"). --packed=0 leaves every plan on the schedule-driven form, which is the "before"
+// column of every table here.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_packed = true;
+
 void Check(bool value, const char* text) {
 	if (!value) {
 		std::fprintf(stderr, "SrtEvaluatorBench: failed: %s\n", text);
@@ -224,6 +230,9 @@ BuiltPlan BuildPlan(const PlanShape& shape, uint32_t* external = nullptr,
 	built.plan.clean_flat_slots.assign(built.plan.srt_reads.size(), 0u);
 	// The plan was patched after extraction, so lower it again.
 	CompileSrtPlan(built.plan);
+	if (!g_packed) {
+		built.plan.flat.packed.compiled = false;
+	}
 
 	built.all_mask.assign(built.plan.srt_reads.size(), 1u);
 	built.body_mask.assign(built.plan.srt_reads.size(), 0u);
@@ -325,6 +334,7 @@ void FlushPlan(const BuiltPlan& built) {
 	const auto& flat = plan.flat;
 	FlushRange(&plan, sizeof(ResourcePlan));
 	FlushRange(&built, sizeof(BuiltPlan));
+	FlushRange(flat.packed.blob.data(), flat.packed.BlobBytes());
 	FlushRange(flat.insts.data(), flat.insts.size() * sizeof(SrtFlatInst));
 	FlushRange(flat.schedule.data(), flat.schedule.size() * sizeof(uint32_t));
 	FlushRange(flat.sources.data(), flat.sources.size() * sizeof(SrtFlatSourceRoot));
@@ -351,7 +361,8 @@ enum FlushKind : uint32_t {
 // Bytes of plan and guest table one evaluation can touch, for the footprint column.
 size_t PlanBytes(const BuiltPlan& built) {
 	const auto& flat = built.plan.flat;
-	return sizeof(ResourcePlan) + flat.insts.size() * sizeof(SrtFlatInst) +
+	return sizeof(ResourcePlan) + flat.packed.BlobBytes() +
+	       flat.insts.size() * sizeof(SrtFlatInst) +
 	       flat.schedule.size() * sizeof(uint32_t) +
 	       flat.sources.size() * sizeof(SrtFlatSourceRoot) +
 	       flat.flat_reads.size() * sizeof(SrtFlatValueRoot) +
@@ -527,9 +538,11 @@ int main(int argc, char** argv) {
 			sweep = true;
 		} else if (arg == "--cold") {
 			cold = true;
+		} else if (arg.rfind("--packed=", 0) == 0) {
+			g_packed = std::strtoull(arg.c_str() + 9, nullptr, 10) != 0;
 		} else {
 			std::fprintf(stderr, "usage: srt_evaluator_bench [--iterations=N] [--only=NAME] "
-			                     "[--sweep] [--cold] [--copies=N]\n");
+			                     "[--sweep] [--cold] [--copies=N] [--packed=0|1]\n");
 			return 2;
 		}
 	}
@@ -538,9 +551,9 @@ int main(int argc, char** argv) {
 		// Where the per-call cost goes once the data is not in L1. Every row is the same
 		// evaluation; only the locality of the plan and of the guest table changes. The flushed
 		// columns subtract a baseline loop that performs the same flushes and no evaluation.
-		std::printf("%-12s %7s %6s %6s %9s %9s %9s %9s %9s %9s %9s %9s\n", "shape", "copies",
-		            "insts", "reads", "plan_KB", "cycle_MB", "hot_ns", "fresh_ns", "cycle_ns",
-		            "coldplan", "coldguest", "coldboth");
+		std::printf("%-12s %6s %7s %6s %6s %8s %8s %9s %9s %9s %9s %9s %9s\n", "shape", "packed",
+		            "copies", "insts", "reads", "plan_KB", "pack_B", "hot_ns", "fresh_ns",
+		            "cycle_ns", "coldplan", "coldguest", "coldboth");
 		for (const auto& shape: Shapes) {
 			if (!only.empty() && only != shape.name) {
 				continue;
@@ -571,11 +584,10 @@ int main(int argc, char** argv) {
 			const auto cold_both  = MeasureCycle(few.plans, iterations, false, FlushBoth);
 			checksum += hot.checksum + fresh.checksum + cycle.checksum + cold_plan.checksum +
 			            cold_guest.checksum + cold_both.checksum;
-			std::printf("%-12s %7zu %6zu %6u %9.2f %9.2f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f\n",
-			            shape.name, copies, insts, reads,
+			std::printf("%-12s %6d %7zu %6zu %6u %8.2f %8zu %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f\n",
+			            shape.name, g_packed ? 1 : 0, copies, insts, reads,
 			            static_cast<double>(plan_bytes) / 1024.0,
-			            static_cast<double>(copies) *
-			                (static_cast<double>(plan_bytes) + 4096.0) / (1024.0 * 1024.0),
+			            one.plans.front().plan.flat.packed.BlobBytes(),
 			            hot.ns_per_call, fresh.ns_per_call, cycle.ns_per_call,
 			            cold_plan.ns_per_call - base_plan.ns_per_call,
 			            cold_guest.ns_per_call - base_guest.ns_per_call,

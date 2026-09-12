@@ -139,6 +139,10 @@ struct SrtChaseStats {
 
 	uint64_t events         = 0; // evaluations that ran the compiled flat program
 	uint64_t walker_events  = 0; // evaluations that fell back to the IR walker
+	// Evaluations the shipping build would have run as a packed program. The counters above
+	// instrument the compile-time form, so a stats run keeps every evaluation on it and only
+	// counts these (docs/gpu-descriptor-fetch.md, "Packed flat program").
+	uint64_t packed_events  = 0;
 	uint64_t reads          = 0; // guest reads executed
 	uint64_t depth_sum      = 0; // dependent depth, summed over events
 	uint64_t lines_sum      = 0; // distinct lines read, summed over events

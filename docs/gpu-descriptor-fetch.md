@@ -548,6 +548,127 @@ plus the twice and split experiments), `.../runs-packed-off3/`,
 `.../runs-packed-on3/` (before the skipped-slot fallback) and `.../runs-packed-on4/` (the
 40-loop benches and their images).
 
+#### Prefetch experiments, September 12, 2026
+
+The section above priced the call at 68 ns of program and 1 205 ns of first touch on the guest SRT
+pages, and named two ways to hide that touch: start the independent misses together inside the
+evaluation, or start the first one at parse time, when the draw's user data is written. A third
+experiment tested the reading that made the number plausible in the first place -- that 280 ns a
+line and 500 ns a page is TLB, not DRAM, because the render thread streams the 512 MiB staging ring
+past the SRT pages between two evaluations. **All three came back empty, and the third came back
+with its premise disproved: after the first loop the staging ring reserves 7.3 MiB a loop, not
+hundreds.** Nothing here shipped.
+
+Baseline and all three experiments are the same binary, switched by environment variable, benched
+in one session: nexus-6, 40 loops, two repeats, `-Image`, `ms/loop gpu`.
+
+**Experiment 1: memory-level parallelism inside the evaluator.** A pre-pass over the packed
+schedule that executes every instruction except the guest reads, issues `_mm_prefetch(T0)` on each
+read's line instead of loading it, and marks the read's result unavailable so everything downstream
+of it is skipped. Exactly the depth-0 reads are issued, together; the dependent ones are left to
+the real pass that follows. It ran on 345 420 of 622 170 calls (55.5%), which is the 57% of events
+whose program reads at all.
+
+| `ms/loop gpu`, both runs | baseline | pre-pass |
+| --- | --- | --- |
+| `--gpu-descriptors false`, min | **71.81 / 71.18** | 72.60 / 72.60 |
+| `--gpu-descriptors false`, median | 73.98 / 73.18 | 74.81 / 75.12 |
+| `--gpu-descriptors true`, min | **75.45 / 75.54** | 75.96 / 75.96 |
+| `--gpu-descriptors true`, median | 80.38 / 80.97 | 86.66 / 80.07 |
+| image vs `reference.png` | - | R 9.8 G 7.8 B 4.1 |
+
+**About 1 ms a loop worse**, which is roughly what the pre-pass itself costs: Tracy prices
+`SrtEval::Prefetch` at 60.2 / 62.5 ns on the 55.5% of calls that take it, 0.7 ms over the 20 739
+events of a loop. What it buys back is inside the noise. Per-call means, `--gpu-descriptors false`,
+packed path, each zone's parked maximum dropped, two captures a configuration (`tracy-prefetch/`):
+
+| ns a call | baseline | exp 1 (pre-pass) | exp 2 (user data) | exp 3 (384 MiB ring) |
+| --- | --- | --- | --- | --- |
+| `SrtEval::Setup` | 28.3 / 27.8 | 27.8 / 29.0 | 28.1 / 28.4 | 27.7 / 28.5 |
+| `SrtEval::Prepare` | 38.2 / 39.9 | 38.2 / 39.8 | 38.1 / 39.0 | 38.8 / 38.9 |
+| `SrtEval::Prefetch` | - | **60.2 / 62.5** | - | - |
+| `SrtEval::Execute` | **1 428.6 / 1 575.4** | 1 484.0 / 1 367.7 | 1 487.5 / 1 615.8 | 1 608.2 / 1 467.3 |
+| `SrtEval::Sources` | 36.4 / 40.0 | 36.9 / 38.6 | 37.8 / 37.9 | 37.6 / 39.7 |
+| `SrtEval::Slots` | 49.4 / 51.5 | 49.3 / 50.1 | 49.5 / 50.9 | 49.6 / 50.7 |
+| `SrtEval::Writeback` | 12.3 / 12.4 | 11.6 / 12.5 | 12.4 / 12.5 | 12.4 / 12.4 |
+| `EvaluateRuntimeSourcesImpl` self | 76.9 / 75.1 | 95.1 / 83.5 | 76.6 / 77.7 | 76.5 / 78.8 |
+| all parts | 1 670 / 1 822 | 1 803 / 1 671 | 1 730 / 1 862 | 1 851 / 1 716 |
+
+`SrtEval::Execute` swings 147 ns between two captures of the same configuration, so the zone cannot
+resolve what the bench measures as 1 ms a loop (48 ns a call); the four columns are one number.
+Reverted.
+
+**Experiment 2: prefetch at the user-data register write.** `HwShSet{Ps,Gs,Hs,Cs}UserSgpr` is where
+`SET_SH_REG` lands the SGPRs an SRT root starts from. After the write, every 64-bit pair that
+overlaps the dwords just written is formed and, if it falls between 0x40000 and the 1 TiB GPU
+address limit (`IsGpuAddressRange`, a range compare, no lookup), its line is prefetched. That puts
+the first-level miss in flight before the pipeline lookup and the binding work that sit between the
+packet and the evaluation.
+
+| `ms/loop gpu`, both runs | baseline | at user-data writes |
+| --- | --- | --- |
+| `--gpu-descriptors false`, min | **71.81 / 71.18** | 72.06 / 71.79 |
+| `--gpu-descriptors false`, median | 73.98 / 73.18 | 74.21 / 74.51 |
+| `--gpu-descriptors true`, min | **75.45 / 75.54** | 75.74 / 75.81 |
+| `--gpu-descriptors true`, median | 80.38 / 80.97 | 80.93 / 78.96 |
+| prefetches a loop | - | **5 684** from 18 703 user-data dwords |
+| image vs `reference.png` | - | R 9.8 G 7.8 B 4.1 |
+
+Neutral to half a millisecond worse, and the counters say why it could not have been much else: the
+loop writes 18 703 user-data dwords and issues 5 684 prefetches, against **20 739 evaluations**.
+The game sets about two user-data dwords a draw and leaves the rest of the file standing from
+earlier packets, so most evaluations have no nearby write to hang a prefetch on -- the pointer they
+read was written thousands of draws ago, and its line is as cold at the draw as it ever was.
+Reverted.
+
+**Experiment 3: is it the TLB? No, and not the staging ring.** The ring could not be shrunk to
+32 MiB or to 64 MiB: replay aborts in `ObtainBufferForImage`, which stages a whole guest image
+through the ring in one reservation, and this capture's reservations run to **352 MiB** (32 MiB
+fails on a 180 MiB image, 256 MiB on a 320 MiB one). 384 MiB is the smallest size that completes.
+That is still a quarter off the window, and it changed nothing:
+
+| `ms/loop gpu`, both runs | 512 MiB ring | 384 MiB ring |
+| --- | --- | --- |
+| `--gpu-descriptors false`, min | 71.81 / 71.18 | 71.35 / 71.31 |
+| `--gpu-descriptors false`, median | 73.98 / 73.18 | 73.84 / 74.09 |
+| `--gpu-descriptors true`, min | 75.45 / 75.54 | 75.15 / 74.69 |
+| `--gpu-descriptors true`, median | 80.38 / 80.97 | 79.02 / 78.16 |
+| `SrtEval::Execute`, ns a call | 1 428.6 / 1 575.4 | 1 608.2 / 1 467.3 |
+| image vs `reference.png` | - | R 9.8 G 7.8 B 4.1 |
+
+The counter added for the experiment says the premise was wrong. Bytes reserved in the staging ring
+per loop, measured at two loop counts so the warm-up separates from the steady state:
+
+| run | reserved a loop | largest single reservation |
+| --- | --- | --- |
+| 10 loops | 369.0 MiB | 352.0 MiB |
+| 40 loops | **97.7 MiB** | 352.0 MiB |
+
+3 690 MiB over ten loops and 3 908 MiB over forty is **7.3 MiB a loop in the steady state on top of
+3 617 MiB of first-loop staging**. The ring is filled once, when the frame's images and buffers are
+first uploaded, and after that it advances 7.3 MiB a loop -- it wraps its 512 MiB once every seventy
+loops. It is not streaming address space past the SRT pages at all, and no size it can legally take
+on this capture would change what the evaluator sees.
+
+**What the three say together.** The 1.2 us of first touch is not a serialized chain of line misses
+that more memory-level parallelism can shorten (experiment 1 issued the independent lines together
+and bought nothing measurable), it is not a latency a prefetch can simply start earlier (experiment
+2 put the first line in flight at parse time, for the quarter of events that have a nearby write,
+and bought nothing), and the staging ring is not what evicts those pages between two evaluations
+(experiment 3: 7.3 MiB a loop). The TLB reading is therefore **unproven, and the one direct test of
+it came back negative**: whatever makes 4 lines on 2.2 pages cost 1.2 us is either spread across the
+rest of the render thread's working set -- 22 368 draws of binding, descriptor and page table work
+between one evaluation of a program and the next -- or is not a wait a prefetch can cover. Nothing
+here changes the lever the previous section named: the way to stop paying 1.2 us an event 20 739
+times a loop is to have fewer events, not faster ones.
+
+Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/runs-pf-base/` (the same-session baseline),
+`.../runs-pf-exp1/`, `.../runs-pf-exp2/`, `.../runs-pf-exp3-384/` (the 40-loop benches and their
+images), `.../runs-pf-exp3-smoke/` and `.../runs-pf-exp3-smoke256/` (the 32 MiB and 256 MiB
+aborts), `.../runs-pf-staging/` and `.../runs-pf-staging40/` (the ring counter at 10 and 40 loops),
+`.../tracy-prefetch/` (two captures a configuration), and `.../runs-pf-reverted/` (the tree with all
+three experiments taken out again: 70.32 and 75.21 ms/loop gpu minimum, image unchanged).
+
 ### Stage 1 measured, September 11, 2026
 
 Parked Nexus, Remote Desktop session, same build, 4 minute warm-up, 30 s sample:

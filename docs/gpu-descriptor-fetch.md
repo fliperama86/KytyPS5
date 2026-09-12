@@ -252,7 +252,7 @@ does buy is the `FlattenedSrt` upload: `RebindBuffers` and `FindBuffers` togethe
 loop, which is the whole measured effect.
 
 **The stats run** (`KYTY_DEBUG_SRT_STATS=1`, three loops, 33 frames, 62,034 stage events;
-`_Diagnostics/srt-stats-20260912-033257.json`):
+`runs-1b/srt-stats-20260912-033257.json`):
 
 | | |
 | --- | --- |

@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -424,14 +425,22 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
-	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	{
+		// The BDA scan's phases are separate zones so a capture says where a scan's time goes
+		// (docs/bda-sync-design.md, step 0b). This one is the tracker walk: its self time is the
+		// walk itself, the lock and the re-protection are nested zones of their own, and the
+		// upload callback's cost is in SynchronizeBuffer::Stage and ::Copy.
+		KYTY_PROFILER_BLOCK("SynchronizeBuffer::Track");
+		m_memory_tracker.ForEachUploadRange(
+		    vaddr, size, is_written,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+			    total_size += bytes;
+		    },
+		    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	}
 	if (source) {
+		KYTY_PROFILER_BLOCK("SynchronizeBuffer::Record");
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -469,12 +478,23 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	// Reserving the staging slice can wait on the GPU when the ring wraps, so it is timed apart
+	// from the copy itself.
+	uint8_t* mapped      = nullptr;
+	uint64_t base_offset = 0;
+	{
+		KYTY_PROFILER_BLOCK("SynchronizeBuffer::Stage");
+		std::tie(mapped, base_offset) = m_staging_buffer.Map(total_size, 4);
+	}
 	if (mapped != nullptr) {
-		for (auto& copy: copies) {
-			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
-			copy.srcOffset += base_offset;
+		{
+			KYTY_PROFILER_BLOCK("SynchronizeBuffer::Copy");
+			for (auto& copy: copies) {
+				const auto address = buffer.CpuAddress() + copy.dstOffset;
+				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address),
+				            copy.size);
+				copy.srcOffset += base_offset;
+			}
 		}
 		m_staging_buffer.Commit();
 		return m_staging_buffer.Handle();

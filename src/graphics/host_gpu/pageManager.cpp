@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 
+#include "common/profiler.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
 
@@ -225,6 +226,9 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
+		// Step 0b of docs/bda-sync-design.md: the kernel call alone, nested inside
+		// PageManager::Protect so a capture separates the bitmap walk from the syscall.
+		KYTY_PROFILER_BLOCK("PageManager::ProtectCall");
 		g_protect_calls.fetch_add(1, std::memory_order_relaxed);
 		g_protect_pages.fetch_add(size / PAGE_SIZE, std::memory_order_relaxed);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
@@ -328,6 +332,9 @@ template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+	// The re-protection a BDA scan pays for when the tracker clears CPU-dirty state
+	// (RegionManager::UpdateCpuProtection); the same zone covers the GPU-side updates.
+	KYTY_PROFILER_BLOCK("PageManager::Protect");
 	if (base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||
 	    REGION_SIZE > ADDRESS_SIZE - base_addr) {
 		Fatal("invalid tracking region base 0x%016" PRIx64, base_addr);

@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -123,7 +124,12 @@ public:
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			manager->lock.lock();
+			{
+				// Step 0b of docs/bda-sync-design.md: what a BDA scan waits for on the region
+				// lock, which the guest's fault handler holds while it re-marks pages.
+				KYTY_PROFILER_BLOCK("MemoryTracker::Lock");
+				manager->lock.lock();
+			}
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {

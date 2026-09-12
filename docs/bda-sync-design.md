@@ -1,9 +1,10 @@
-# Copy-free BDA sync (roadmap item 2, first half)
+# Cheap BDA sync (roadmap item 2, first half)
 
-Status, September 12, 2026: design written; step 0 done (partial reproduction, see its result);
-step 0b (scan breakdown in the game) in progress.
+Status, September 12, 2026: the cost is measured and understood (below); design P (re-protection
+off the render thread) chosen; implementation in progress.
 Companion to [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md) ("What stage 1 needs to pay
-off", point 2) and [performance-roadmap.md](performance-roadmap.md) item 2.
+off", point 2, and "Scan breakdown, September 12") and [performance-roadmap.md](performance-roadmap.md)
+item 2.
 
 ## The problem in numbers
 
@@ -14,9 +15,7 @@ and 6.7 ms of that is this scan.
 
 What a scan is given is small: 2.9 dirty ranges, 33 KiB, about two page re-protections. The same
 scan on the same inputs costs 4.1 us in a replay ([frame-replay.md](frame-replay.md), phase E),
-and twelve spinning threads on the guest CPUs move it to 4.8 us. So the cost is not the scan's
-inputs, not thread count, not the number of protection changes, and not buffer churn (the parked
-Nexus has none).
+and twelve spinning threads on the guest CPUs move it to 4.8 us.
 
 ## What a scan does today
 
@@ -27,136 +26,132 @@ Nexus has none).
 calls `SynchronizeBuffer`, which:
 
 1. asks the memory tracker for the CPU-modified sub-ranges (`ForEachUploadRange`), which clears
-   their dirty state and re-protects the pages (a kernel call per run of pages);
+   their dirty state and re-protects the pages (`PageManager::UpdatePageWatchersForRegion`, one
+   `NtProtectVirtualMemory` per run of pages);
 2. `UploadCopies`: maps a slice of the 512 MiB host-visible staging ring and `memcpy`s each
    sub-range from guest memory into it, on the render thread;
 3. records `copyBuffer` from the staging ring into the device-local mirror between two barriers.
 
 The generation pair (`BdaGeneration`, `m_mapped_generation`) is bumped by buffer register and
 retire (`ChangeRegister`), by map and unmap, and by every CPU-dirty mark (`InvalidateBda`,
-`InvalidateMemory`, `MarkRegionAsCpuModified`). In the parked Nexus, 4.8% of the 9,845
-preparations a frame find a moved generation, and those are the 399 scans.
+`InvalidateMemory`, `MarkRegionAsCpuModified`). A CPU-dirty mark is a guest write faulting on a
+protected page: the fault handler unprotects the page (another `NtProtectVirtualMemory`, on the
+guest thread) and marks it.
 
-## Where the 26 us goes: hypothesis
+## Where the 26.8 us goes: measured
 
-Step 2 is the only part of a scan that touches the guest's bytes. In the game those bytes were
-written moments earlier by a guest thread on the other CCD (the affinity policy puts the render
-thread on the X3D CCD and the guest on the other one). Every cache line the `memcpy` reads is
-dirty in a remote core's cache, so each line is a cross-CCD transfer: 33 KiB is 528 lines, and
-26 us over 528 lines is 49 ns a line, which is what a cross-CCD dirty-line fetch costs on Zen 5
-once memory-level parallelism is counted. In a replay nothing writes those pages between loops:
-the lines are cold in DRAM, and the hardware prefetcher streams them at 4 us per 33 KiB, about
-8 ns a line. The two numbers fit the same mechanism.
+Two steps, both on September 12.
 
-Unproven. Step 0 below tests it in the replay in an hour. If it holds, the harness reproduces the
-cost and every design below can be judged in seconds. If it does not, the next suspect is lock
-contention with guest threads inside the tracker (`RegionManager::lock`) or the kernel calls
-under real guest load, and the measurement that settles it is sub-zones inside the scan
-(`memcpy`, protect, lock) recorded into the capture's prepare events by one game run.
+**Step 0, writer imitation in replay** ([frame-replay.md](frame-replay.md), "Writer imitation"):
+a thread on the guest CPUs rewriting each dirty page right after its mark takes a scan from 4.0
+to 9.3 us; on the render CPUs 8.7 us; with twelve spinners on top 12.1 us. So freshly written
+lines cost about 5 us a scan, the die boundary under 1 us, and 14 us stayed unexplained. The
+hypothesis this document first carried, a cross-CCD `memcpy`, was wrong about the size of the
+effect.
 
-### Step 0 result, September 12
+**Step 0b, the scan split into phases inside the game** ([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md),
+"Scan breakdown, September 12, 2026"; Tracy capture in
+`_Runtime/_Diagnostics/replay/e2e-rebaseline/scan-breakdown/`), per scan of 28.6 us:
 
-The writer imitation ([frame-replay.md](frame-replay.md), "Writer imitation") raises a scan from
-4.0 us to 9.3 us with the writer on the guest CPUs and to 8.7 us with it on the render CPUs;
-twelve spinners on top take it to 12.1 us. Reports in
-`_Runtime/_Diagnostics/replay/nexus-6/runs-20260912-012758` and `runs-20260912-012958`.
-So fresh lines in another core's cache are real and worth about 5 us a scan, the die boundary
-adds under 1 us, and about 14 us of the game's 26.8 us are still unexplained. Two candidates
-the imitation does not cover: the guest writing the same page *while* the scan copies it (true
-sharing, which costs far more per line than a one-time fetch; the game's bump allocators keep
-writing the page the last draw dirtied), and the re-protection kernel calls or the tracker lock
-under real guest load. The decisive measurement is the breakdown of the scan inside the game:
-Tracy sub-zones for the tracker walk (lock and protect), the copy and the record, one warm run
-with `--gpu-descriptors true`. That is step 0b; the design choice below waits for it, because E
-only helps if the copy is where the time goes.
+| phase | us a scan | share |
+| --- | --- | --- |
+| `PageManager::ProtectCall`, the `NtProtectVirtualMemory` syscall, 3.7 calls | 20.2 | 71% |
+| `SynchronizeBuffer::Record`, barriers and `copyBuffer` | 3.0 | 10% |
+| the dirty-set walk and intersection | 1.9 | 7% |
+| `SynchronizeBuffer::Copy`, the `memcpy` | 1.2 | 4% |
+| `MemoryTracker::Lock` | 1.0 | 3% |
+| staging map, bitmap walk, rest | 1.3 | 5% |
 
-## Designs
+The scan is the syscall. Each re-protection is 5.4 us in the game against about 1 us in a replay,
+because changing a page's protection while sixteen guest threads run is a TLB shootdown to every
+processor the process is on, and the replay has no guest threads. The whole process pays for the
+same policy: 5,286 protect calls a frame, 18 ms of thread time, of which 1,342 (7.4 ms) are the
+render thread inside BDA scans, about 3 ms more are the render thread's per-bind syncs outside
+scans, and the rest are the guest threads' faults unprotecting pages they write. With
+`--gpu-descriptors false` the render thread still pays its per-bind share, which is most of the
+3.98 ms of scans in that configuration.
 
-Three ways to stop the render thread copying freshly written guest memory, from smallest to
-largest. They are not exclusive: E is the step that makes stage 1 pay off now, B and A are the
-mirror-free end state and each needs a number before it is chosen.
+Consequences for the designs this document carried before: E (the `memcpy` off the render
+thread) would save 1.2 us of 28.6 and is dropped. B (GPU copies from imported guest memory) does
+nothing about protection and is dropped. A (no mirror, shaders read guest memory) removes the
+tracking entirely for the pages it covers and stays the end state for BDA-read pages, still
+gated on the host-memory read bench (below). What stage 1 needs now is a tracker policy that
+keeps the render thread out of `NtProtectVirtualMemory`.
 
-### E. The copy leaves the render thread (recommended first)
+## Design P: re-protection leaves the render thread
 
-Keep the mirror, the staging ring and the dirty tracking. Change only who does step 2:
+The tracker keeps its states and its faults. What changes is who re-protects an uploaded page
+and when the mirror is trusted again.
 
-- The render thread still runs `ForEachUploadRange` (clear dirty, re-protect), still reserves the
-  staging slice and still records the `copyBuffer` and its barriers. It no longer `memcpy`s: it
-  pushes one job per copy (guest address, staging pointer, size) to an upload helper thread and
-  moves on. Render-thread cost of a scan becomes the walk, the reservation and the record: about
-  2 us on the replay's numbers.
-- One helper thread, pinned with the guest affinity group (`Common::ApplyThreadAffinity`,
-  `ThreadAffinityGroup::Guest`), pops jobs and performs the `memcpy` (`TryReadBacking`, and
-  `TryReadPrtBacking` for aperture ranges, exactly the reads `UploadMemory` makes today). Its
-  cost is off the critical path; at 26 us a scan it is 10 ms a frame of a core the guest is not
-  saturating. Measure guest-group and render-group placement both; the cross-CCD transfer has to
-  happen once either way, and where it is cheapest is an experiment.
-- `CommandScheduler::Flush` (and therefore `FlushAndWait`, downloads and presents) waits for the
-  helper's outstanding jobs before `vkQueueSubmit`. Jobs are microseconds and a command buffer
-  spans many draws, so the wait is normally already satisfied. The staging ring's slice is
-  reserved on the render thread, so ring reuse is fenced exactly as today; if `Commit` flushes
-  non-coherent memory it moves to the helper, after the copy.
+- **A new page state, U (uploaded, unprotected).** A scan that uploads a dirty page no longer
+  protects it. It leaves the page writable, moves it to U, and queues a protect request for a
+  helper thread. The render thread makes no `NtProtectVirtualMemory` call in the upload path.
+- **The helper thread** (one, any affinity group; measure both) drains the queue: it coalesces
+  adjacent pending pages into one call per contiguous run (a run may span already-protected
+  pages, whose protection it re-applies unchanged), calls `NtProtectVirtualMemory`, then marks
+  each page "landed" and bumps the BDA generation once per batch. Every shootdown still
+  interrupts every processor, the render thread included; what is removed is the syscall's own
+  latency from the render thread's critical path, 1,342 times a frame.
+- **Trusting the mirror again.** A U page may have been written after its upload without a
+  fault. The upload that follows the landing catches everything written before the protection
+  took effect, so: the next scan after a batch lands uploads every landed U page once more and
+  moves it to P (protected, clean). A write after the landing faults and marks as today. One
+  extra `memcpy` per page, 0.3 us.
+- **Submission boundary.** Draws of a submission may read only what the guest wrote before
+  submitting it (the console's rule; anything else reads garbage on the console too). So when
+  the render thread starts processing a guest submission (`GuestGpu::Submit`, `SubmitCompute`,
+  and `Done`), it waits for the helper to drain and for the landed pages to be re-uploaded by the
+  next scan, which the landing's generation bump forces. A few waits a frame, normally already
+  satisfied. This closes the only window in which a draw could see a stale mirror: a write to a
+  U page in the microseconds between its upload and the helper's landing, read by a draw recorded
+  in those same microseconds, which cannot happen across a submission boundary.
+- **Everything else unchanged**: dirty marks, the generation pair, `PrepareBda`'s gate, the
+  staging ring, the record. Faults on the guest threads are untouched by this design (a
+  follow-up: larger tracker pages or `MEM_WRITE_WATCH` would cut those, and they are 10 ms a
+  frame of guest thread time, not render thread time).
 
-Semantics: today the re-protection precedes the `memcpy` by nanoseconds; with E by microseconds.
-A guest write in that window faults, re-marks the page dirty and is uploaded by the next scan,
-in both designs; the copy in flight carries a torn page in both designs. That is the console's
-semantics too (the GPU reads whatever is in memory when it runs), so no game that works on the
-console can depend on the narrower window.
-
-Expected: 10.7 ms to about 1 ms of render-thread time on `--gpu-descriptors true`, so 103 ms
-to about 93 ms. Still slower than off (86 ms) until the flat reads move in-shader (second half of
-item 2), which removes most of the 31 ms of `EvaluateRuntimeSourcesImpl`.
+Expected on the render thread: the scan drops from 28.6 to about 8 us (walk 1.9, record 3.0, copy
+1.2 plus the extra upload, lock, rest); 399 scans a frame from 10.7 ms to about 3 ms; the per-bind
+syncs outside scans lose their protect share too. `--gpu-descriptors true` from 103 to about 95
+ms, `false` from 86 to about 83. Still slower on than off until the flat reads move in-shader
+(second half of item 2), which removes most of the 30 ms of `EvaluateRuntimeSourcesImpl`.
 
 Gate: a runtime setting, default off, listed in [settings.md](settings.md).
 
-### B. The GPU copies from imported guest memory
+### Measuring P in replay
 
-`VK_EXT_external_memory_host`: import each committed guest range as a `VkDeviceMemory` with a
-`VkBuffer` over it (`eTransferSrc`, later `eShaderDeviceAddress`), and record `copyBuffer` from the
-import into the mirror. Nothing on the CPU reads the bytes; the DMA engine fetches them over
-PCIe with cache snooping. The render thread's scan becomes the walk and the record, as in E, and
-the staging ring is out of the upload path.
+The replay reproduces the counts, not the syscall's game-side cost: a protect call is about 1 us
+there and 5.4 us in the game. So P is judged in replay by counts and correctness, and its
+milliseconds are the counts times the game's per-call cost:
 
-Needs: imports made at commit granularity, not map granularity, and released before any
-decommit (`Common::VirtualMemory::Commit` and `Decommit` in src/common/virtualMemory.cpp are the
-choke points; the memory pool commit and the PRT aperture paths must go through them);
-`minImportedHostPointerAlignment` (4 KiB on NVIDIA, guest pages are 16 KiB) and sizes rounded to
-it; the driver pinning several GB of guest memory at load, which costs time once and physical
-memory permanently. Risk: a decommit while pinned leaves the import pointing at the old physical
-pages, and a later commit silently reads stale data. That bookkeeping is the whole cost of B over
-E, and E already removes the render-thread cost. B is worth it only as the road to A.
+- render-thread `PageManager::ProtectCall` count per loop: 1,342 a frame today, must go to 0 in the
+  upload path;
+- helper protect calls per loop (after coalescing), extra uploads per loop, submission-boundary
+  waits per loop and their total time;
+- `ms/loop gpu` for the residual (walk, record, copy), which the replay does measure fairly;
+- the image against the reference, in both `--gpu-descriptors` settings.
 
-### A. No mirror for BDA reads
+Then one end-to-end A/B on the same build closes the number.
 
-The BDA page table points at the imported guest memory instead of the mirror for pages that are
-only read through BDA. No scan, no dirty tracking, no copy for those pages; the page table changes
-only at map, unmap, commit and decommit. The shader reads system memory over PCIe, which is the
-console's semantics exactly.
+## Parked: A, no mirror for BDA-read pages
 
-Unknown: what a dependent chain of uniform loads from host memory costs a wave. The SRT prologue
-is three to five dependent loads; over PCIe each is about a microsecond rather than the
-sub-microsecond of VRAM, and 9,300 draws a frame with small waves could turn that into tens of
-milliseconds of GPU time, or into nothing if the driver caches host reads in L2 and draws overlap.
-`bda_load_bench` (docs/investigations/bda-load-bench-2026-09-11.md) measured device-local memory
-only. The number that decides A: the same bench with the 257 MB fixture imported from host memory,
-uniform pattern, plus a single-wave dependent-chain variant for latency. Two hours. Not before
-step 0 and E.
+The BDA page table points at guest memory imported with `VK_EXT_external_memory_host` instead of
+the mirror, for pages only read through BDA. No scan, no fault, no protection for those pages.
+Unknown: the cost of a dependent chain of uniform loads from host memory over PCIe in a wave's
+prologue, 9,300 draws a frame. `bda_load_bench` (docs/investigations/bda-load-bench-2026-09-11.md)
+measured device-local memory only; the same bench with the fixture imported from host memory,
+uniform pattern plus a single-wave dependent chain, decides it. Two hours, after P and the flat
+reads. Imports have to follow commit and decommit (`Common::VirtualMemory::Commit` / `Decommit`,
+src/common/virtualMemory.cpp), which is the bookkeeping risk.
 
 ## Plan
 
-0. **Writer imitation in replay.** `--replay-writer <none|guest|render>`, default none. A thread
-   pinned to the named affinity group rewrites (load, store the same value, one store per 64-byte
-   line) every byte of a dirty event's range immediately before the render thread applies the
-   mark, so the scan that follows copies lines that are dirty in another core's cache. Synchronous
-   handoff at the mark (the render thread waits for the writer, and the wait is timed and reported
-   separately so it can be subtracted). Success: the per-scan cost in `replay-report.json` goes
-   from 4 us to 15 us or more with `guest`; `render` tells whether same-CCD freshness is enough.
-   Hard stop if it stays near 4 us: the hypothesis is wrong, instrument the scan in the game
-   instead.
-1. **E**, behind a setting, measured in replay with the writer on: render-thread scan cost back to
-   about 2 us, `ms/loop gpu` on `--gpu-descriptors true` down by the difference times 462, image
-   unchanged, `--gpu-descriptors false` unchanged.
-2. **Flat SRT reads in-shader** (second half of item 2, recompiler work, its own brief): measured
-   by `EvaluateRuntimeSourcesImpl` calls and time per loop in replay.
-3. One end-to-end A/B against `--gpu-descriptors false` on the same build.
-4. Bench for A when 1 to 3 are in.
+0. Writer imitation in replay: done, partial (above).
+0b. Scan breakdown in the game: done, decisive (above).
+1. Capture analysis, no runs: from `nexus-6`'s dirty and prepare events, per frame the distinct
+   dirty pages, how often each is re-protected, and the run lengths of adjacent pages, to size
+   the helper's coalescing. Half an hour.
+2. P behind a setting, measured in replay as above.
+3. Flat SRT reads in-shader (second half of item 2, recompiler work, its own brief).
+4. One end-to-end A/B against `--gpu-descriptors false` on the same build.
+5. Bench for A.

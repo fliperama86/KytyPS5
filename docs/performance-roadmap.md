@@ -196,8 +196,10 @@ Two pieces, both foreseeable from the stats dump:
   replay; what the game's scan makes is not recorded yet and is the measurement that would settle
   where the 26 µs goes. Removes most of the 10.7 ms.
 
-Design for the sync half, with the hypothesis for the 26 us and the validation plan:
-[bda-sync-design.md](bda-sync-design.md) (September 12).
+The sync half, measured on September 12: the scan is 71% `NtProtectVirtualMemory`, the page
+re-protection after each upload, a TLB shootdown across the guest's threads (5.4 us a call, 3.7
+calls a scan); the copy is 4%. Design and plan: [bda-sync-design.md](bda-sync-design.md), design P
+(re-protection off the render thread).
 
 Expected: about 16 FPS in this scene (projection in the design document).
 

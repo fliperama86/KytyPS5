@@ -147,10 +147,14 @@ assembly (`SHADER_STAGES` bit 5), where the index count becomes a mesh workgroup
 primitive-reset index, which makes the host scan the index buffer before it can pick the pipeline;
 and a device without `VkPhysicalDeviceFeatures::drawIndirectFirstInstance`, which is now requested
 when the device has it because a guest argument block may carry a non-zero
-`start_instance_location`. One deviation to know about: on the native path `m_num_instances` is not
-updated, because the CPU never learns the draw's instance count, so a later short-form draw that
-leaves `instance_count` at 0 uses the last `IT_NUM_INSTANCES` packet's value instead of the
-previous indirect draw's.
+`start_instance_location`. Two deviations to know about. `m_num_instances` is not updated on the
+native path, because the CPU never learns the draw's instance count, so a later short-form draw
+that leaves `instance_count` at 0 uses the last `IT_NUM_INSTANCES` packet's value instead of the
+previous indirect draw's. And a degenerate indirect draw is no longer dropped: `DrawIndex` returns
+early on a zero index or instance count, which the CPU can no longer see, so those draws now bind
+their resources and record a command the device retires as a no-op. The replay counts them --
+`progress 22382 of 22368` against `22368 of 22368` with the flag off -- so the parked Nexus has
+**14 of them a loop**, out of 8 794 indirect draws.
 
 Where the barrier is: a per-draw `eIndirectCommandRead` buffer barrier cannot be recorded, because
 `vkCmdPipelineBarrier` inside a dynamic-rendering pass may only name framebuffer-space stages and

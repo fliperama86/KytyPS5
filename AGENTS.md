@@ -27,3 +27,5 @@ Fork of KytyPS5 focused on getting Demon's Souls (PPSA01342) to run well. Read
 - Steer performance work by frame rate and Tracy zone self time on the render thread, not by
   whole-process CPU share or by sampled symbol names (this LTO build mis-attributes them).
 - Document findings in `docs/` as you go and commit them with the code.
+- Only the top-level agent delegates. A sub-agent does its own reading, building and measuring
+  and never launches further agents.

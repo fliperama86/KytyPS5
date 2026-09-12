@@ -17,6 +17,20 @@ enum class PageFaultAccess { Read, Write, Execute, Unknown };
 [[nodiscard]] uint64_t PageProtectCallCount() noexcept;
 [[nodiscard]] uint64_t PageProtectPageCount() noexcept;
 
+// The same two, for the calling thread alone. Design P moves the re-protection to a helper
+// thread, and the process-wide counters cannot tell a render-thread call from one that merely
+// happened while the render thread was scanning, so what a BDA scan reports is this pair.
+[[nodiscard]] uint64_t PageProtectThreadCallCount() noexcept;
+[[nodiscard]] uint64_t PageProtectThreadPageCount() noexcept;
+
+// The same two numbers for one call, so a caller can attribute its own protections without
+// reading the process-wide counters, which every thread bumps. Design P (docs/bda-sync-design.md)
+// needs the render thread's upload path and the helper thread's landings counted apart.
+struct ProtectStats {
+	uint64_t calls = 0;
+	uint64_t pages = 0;
+};
+
 class PageManager final {
 public:
 	PageManager();
@@ -28,9 +42,10 @@ public:
 	[[nodiscard]] uint64_t GetPageSize() const;
 
 	template <bool track>
-	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
+	void UpdatePageWatchers(uint64_t vaddr, uint64_t size, ProtectStats* stats = nullptr);
 	template <bool track, bool is_read = false>
-	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
+	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask,
+	                                 ProtectStats* stats = nullptr);
 
 private:
 	struct Impl;

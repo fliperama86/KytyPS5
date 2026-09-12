@@ -91,6 +91,14 @@ bool GpuIndirectDrawsEnabled() {
 	return g_config->gpu_indirect_draws_enabled;
 }
 
+bool BdaAsyncProtectEnabled() {
+	return g_config->bda_async_protect_enabled;
+}
+
+BdaAsyncProtectAffinity GetBdaAsyncProtectAffinity() {
+	return g_config->bda_async_protect_affinity;
+}
+
 ShaderOptimizationType GetShaderOptimizationType() {
 	return g_config->shader_optimization_type;
 }

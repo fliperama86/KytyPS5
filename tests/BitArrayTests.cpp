@@ -1,6 +1,7 @@
 #include "common/bitArray.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -297,6 +298,48 @@ void TestTrackerSizedRandomizedDifferential() {
   }
 }
 
+// The set operations the memory tracker's design-P states are built out of
+// (docs/bda-sync-design.md): union, intersection, difference and a population count.
+void TestSetOperations() {
+  Bits a;
+  Bits b;
+  a.SetRange(0, 10);
+  a.SetRange(64, 70);
+  b.SetRange(5, 20);
+  b.SetRange(100, 128);
+
+  const auto either = a | b;
+  const auto both = a & b;
+  Bits difference = a;
+  difference.AndNot(b);
+
+  for (std::size_t index = 0; index < 128; index++) {
+    const bool in_a = a.Get(index);
+    const bool in_b = b.Get(index);
+    Check(either.Get(index) == (in_a || in_b), "union diverged");
+    Check(both.Get(index) == (in_a && in_b), "intersection diverged");
+    Check(difference.Get(index) == (in_a && !in_b), "difference diverged");
+  }
+
+  Check(a.Count() == 16, "count of a diverged");
+  Check(b.Count() == 43, "count of b diverged");
+  Check(either.Count() == 54, "count of the union diverged");
+  Check(both.Count() == 5, "count of the intersection diverged");
+  Check(difference.Count() == 11, "count of the difference diverged");
+
+  Bits accumulated = a;
+  accumulated |= b;
+  Check(accumulated.Count() == either.Count(), "in-place union diverged");
+  accumulated &= a;
+  Check(accumulated.Count() == a.Count(), "in-place intersection diverged");
+
+  Bits empty;
+  Check(empty.Count() == 0, "count of the empty set is not zero");
+  Bits full;
+  full.Fill();
+  Check(full.Count() == 128, "count of the full set is not the size");
+}
+
 } // namespace
 
 int main() {
@@ -305,6 +348,7 @@ int main() {
   TestRangeDiscoveryAndIteration();
   TestRandomizedDifferential();
   TestTrackerSizedRandomizedDifferential();
+  TestSetOperations();
   std::puts("BitArrayTests: all cases passed");
   return 0;
 }

@@ -1,10 +1,12 @@
 #include "graphics/replay/frameReplay.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1330,6 +1332,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	// the rest the writer's; both are the harness's own and are reported apart from ms/loop. The
 	// pre-event batch is applied before the frame's clock starts, as it always has been, so its
 	// wait is counted on its own: only the in-frame one is inside ms/loop gpu.
+	// Per frame, per loop: what design P did (docs/bda-sync-design.md). All zero with
+	// --bda-async-protect false.
+	std::vector<std::vector<AsyncProtectCounters>> frame_async(frame_count);
 	std::vector<std::vector<uint64_t>> frame_writer_pre_wait_ns(frame_count);
 	std::vector<std::vector<uint64_t>> frame_writer_wait_ns(frame_count);
 	std::vector<std::vector<uint64_t>> frame_writer_bytes(frame_count);
@@ -1374,6 +1379,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 				g_inline_marking.events = &frame.timed_events;
 			}
 			g_prepare_counters.Reset();
+			ResetAsyncProtectCounters();
 			// What the pre-event batch cost, before the counters start again for the frame
 			// itself; the bytes and the skipped pages stay cumulative over the loop.
 			const auto pre_wait_ns = writer ? writer->WaitNs() : 0;
@@ -1468,6 +1474,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			     g_prepare_counters.scan_ns.load(std::memory_order_relaxed),
 			     g_prepare_counters.protect_calls.load(std::memory_order_relaxed),
 			     g_prepare_counters.protect_pages.load(std::memory_order_relaxed)});
+			frame_async[index].push_back(ReadAsyncProtectCounters());
 			frame_writer_pre_wait_ns[index].push_back(pre_wait_ns);
 			frame_writer_wait_ns[index].push_back(writer ? writer->WaitNs() : 0);
 			frame_writer_bytes[index].push_back(writer ? writer->Bytes() : 0);
@@ -1546,7 +1553,8 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		}
 		return total / counted;
 	};
-	uint64_t writer_pre_wait_ns_per_loop = 0;
+	AsyncProtectCounters async_per_loop;
+	uint64_t             writer_pre_wait_ns_per_loop = 0;
 	uint64_t writer_wait_ns_per_loop  = 0;
 	uint64_t writer_bytes_per_loop    = 0;
 	uint64_t writer_skipped_per_loop  = 0;
@@ -1555,6 +1563,31 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		sync_mean[i]  = mean_of(frame_syncs[i]);
 		drains_per_loop += drain_mean[i];
 		syncs_per_loop += sync_mean[i];
+		{
+			const auto& samples = frame_async[i];
+			const auto  field   = [&](uint64_t AsyncProtectCounters::*member) {
+                std::vector<uint64_t> values;
+                values.reserve(samples.size());
+                for (const auto& sample: samples) {
+                    values.push_back(sample.*member);
+                }
+                return mean_of(values);
+			};
+			async_per_loop.upload_protect_calls += field(&AsyncProtectCounters::upload_protect_calls);
+			async_per_loop.upload_protect_pages += field(&AsyncProtectCounters::upload_protect_pages);
+			async_per_loop.written_protect_calls +=
+			    field(&AsyncProtectCounters::written_protect_calls);
+			async_per_loop.written_protect_pages +=
+			    field(&AsyncProtectCounters::written_protect_pages);
+			async_per_loop.helper_protect_calls += field(&AsyncProtectCounters::helper_protect_calls);
+			async_per_loop.helper_protect_pages += field(&AsyncProtectCounters::helper_protect_pages);
+			async_per_loop.helper_batches += field(&AsyncProtectCounters::helper_batches);
+			async_per_loop.landed_pages += field(&AsyncProtectCounters::landed_pages);
+			async_per_loop.extra_uploads += field(&AsyncProtectCounters::extra_uploads);
+			async_per_loop.drains += field(&AsyncProtectCounters::drains);
+			async_per_loop.waits += field(&AsyncProtectCounters::waits);
+			async_per_loop.wait_ns += field(&AsyncProtectCounters::wait_ns);
+		}
 		writer_pre_wait_ns_per_loop += mean_of(frame_writer_pre_wait_ns[i]);
 		writer_wait_ns_per_loop += mean_of(frame_writer_wait_ns[i]);
 		writer_bytes_per_loop += mean_of(frame_writer_bytes[i]);
@@ -1589,6 +1622,23 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		         static_cast<double>(writer_pre_wait_ns_per_loop) / 1000.0,
 		         static_cast<double>(writer_bytes_per_loop) / (1024.0 * 1024.0),
 		         static_cast<unsigned long long>(writer_skipped_per_loop));
+	}
+	if (Config::BdaAsyncProtectEnabled()) {
+		::printf("  async protect  render-thread protect calls in the deferred upload path %llu a "
+		         "loop (%llu more in written uploads, which the GPU claims anyway); "
+		         "helper %llu calls over %llu pages in %llu batches\n",
+		         static_cast<unsigned long long>(async_per_loop.upload_protect_calls),
+		         static_cast<unsigned long long>(async_per_loop.written_protect_calls),
+		         static_cast<unsigned long long>(async_per_loop.helper_protect_calls),
+		         static_cast<unsigned long long>(async_per_loop.helper_protect_pages),
+		         static_cast<unsigned long long>(async_per_loop.helper_batches));
+		::printf("                 %llu pages landed, %llu uploaded a second time; %llu of %llu "
+		         "boundary drains waited, %.0f us in all\n",
+		         static_cast<unsigned long long>(async_per_loop.landed_pages),
+		         static_cast<unsigned long long>(async_per_loop.extra_uploads),
+		         static_cast<unsigned long long>(async_per_loop.waits),
+		         static_cast<unsigned long long>(async_per_loop.drains),
+		         static_cast<double>(async_per_loop.wait_ns) / 1000.0);
 	}
 	::printf("  drains         %llu a loop of %llu GPU-range syncs (readbacks on the render thread)\n",
 	         static_cast<unsigned long long>(drains_per_loop),
@@ -1699,6 +1749,26 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			report << (i == 0 ? "" : ",") << JsonStats(frame_loop_stats[i]);
 		}
 		report << "],\n";
+		report << "  \"bda_async_protect\": "
+		       << (Config::BdaAsyncProtectEnabled() ? "true" : "false") << ",\n";
+		report << "  \"async_upload_protect_calls\": " << async_per_loop.upload_protect_calls
+		       << ",\n";
+		report << "  \"async_upload_protect_pages\": " << async_per_loop.upload_protect_pages
+		       << ",\n";
+		report << "  \"async_written_protect_calls\": " << async_per_loop.written_protect_calls
+		       << ",\n";
+		report << "  \"async_written_protect_pages\": " << async_per_loop.written_protect_pages
+		       << ",\n";
+		report << "  \"async_helper_protect_calls\": " << async_per_loop.helper_protect_calls
+		       << ",\n";
+		report << "  \"async_helper_protect_pages\": " << async_per_loop.helper_protect_pages
+		       << ",\n";
+		report << "  \"async_helper_batches\": " << async_per_loop.helper_batches << ",\n";
+		report << "  \"async_landed_pages\": " << async_per_loop.landed_pages << ",\n";
+		report << "  \"async_extra_uploads\": " << async_per_loop.extra_uploads << ",\n";
+		report << "  \"async_boundary_drains\": " << async_per_loop.drains << ",\n";
+		report << "  \"async_boundary_waits\": " << async_per_loop.waits << ",\n";
+		report << "  \"async_boundary_wait_us\": " << async_per_loop.wait_ns / 1000 << ",\n";
 		report << "  \"drains_per_loop\": " << drains_per_loop << ",\n";
 		report << "  \"syncs_per_loop\": " << syncs_per_loop << ",\n";
 		report << "  \"frame_drains\": [";

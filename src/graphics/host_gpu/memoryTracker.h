@@ -3,12 +3,14 @@
 
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -16,6 +18,34 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// What design P (docs/bda-sync-design.md) did, per process, since the last reset. The frame
+// replay prints and reports these; nothing else reads them.
+struct AsyncProtectCounters {
+	uint64_t upload_protect_calls = 0; // kernel calls the deferred upload path made: must be 0
+	uint64_t upload_protect_pages = 0;
+	// A written range is claimed by the GPU in the same call and protected at no-access either
+	// way, so it is not deferred and its protections are counted apart.
+	uint64_t written_protect_calls = 0;
+	uint64_t written_protect_pages = 0;
+	uint64_t helper_protect_calls = 0; // kernel calls the helper made, after coalescing
+	uint64_t helper_protect_pages = 0;
+	uint64_t helper_batches       = 0;
+	uint64_t landed_pages         = 0;
+	uint64_t extra_uploads        = 0; // pages a later scan uploaded a second time
+	uint64_t drains               = 0; // submission boundaries that asked for a drain
+	uint64_t waits                = 0; // of those, the ones that had to wait
+	uint64_t wait_ns              = 0;
+};
+
+[[nodiscard]] AsyncProtectCounters ReadAsyncProtectCounters() noexcept;
+void                               ResetAsyncProtectCounters() noexcept;
+
+// The landed runs of one helper batch, handed to the buffer cache so it can put them back in the
+// BDA dirty set and move the generation once for the whole batch.
+using AsyncProtectSink = std::function<void(const GuestRange*, size_t)>;
+
+class AsyncProtectHelper;
 
 class MemoryTracker final {
 public:
@@ -123,19 +153,56 @@ public:
 		CheckNotInUploadCallback();
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
-		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			{
-				// Step 0b of docs/bda-sync-design.md: what a BDA scan waits for on the region
-				// lock, which the guest's fault handler holds while it re-marks pages.
-				KYTY_PROFILER_BLOCK("MemoryTracker::Lock");
-				manager->lock.lock();
-			}
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
-			if (!is_written) {
-				manager->lock.unlock();
-			}
-		});
+		// Design P (docs/bda-sync-design.md): a read upload leaves every page it takes writable
+		// and hands it to the helper thread, so that loop makes no NtProtectVirtualMemory call.
+		// A written range is claimed by the GPU right after, which protects the same pages at
+		// no-access anyway, so deferring it would buy nothing and would leave the guest free to
+		// write bytes the GPU is about to own. The two loops are written out separately so the
+		// setting off runs the same instructions it ran before the design existed: this is the
+		// path every bind of every draw takes.
+		ProtectStats stats;
+		uint64_t     landed_pages = 0;
+		const bool   defer        = m_async_protect && !is_written;
+		if (!m_async_protect) [[likely]] {
+			Iterate<false>(vaddr, size,
+			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               {
+					               // Step 0b of docs/bda-sync-design.md: what a BDA scan waits for
+					               // on the region lock, which the guest's fault handler holds
+					               // while it re-marks pages.
+					               KYTY_PROFILER_BLOCK("MemoryTracker::Lock");
+					               manager->lock.lock();
+				               }
+				               manager->ForEachModifiedRange<DirtySource::Cpu, true>(
+				                   manager->GetCpuAddr() + offset, bytes, range_func);
+				               if (!is_written) {
+					               manager->lock.unlock();
+				               }
+			               });
+		} else {
+			auto& queued = QueuedRegions();
+			queued.clear();
+			Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset,
+			                                uint64_t bytes) {
+				{
+					KYTY_PROFILER_BLOCK("MemoryTracker::Lock");
+					manager->lock.lock();
+				}
+				bool queue_protect = false;
+				manager->ForEachModifiedRange<DirtySource::Cpu, true>(
+				    manager->GetCpuAddr() + offset, bytes, range_func, defer, &stats,
+				    &landed_pages, &queue_protect);
+				if (queue_protect && !manager->queued.exchange(true, std::memory_order_acq_rel)) {
+					// Announced with the region lock still held, so a drain cannot see an empty
+					// queue while a page of this region is still writable.
+					AnnounceAsyncProtect();
+					queued.push_back(manager);
+				}
+				if (!is_written) {
+					manager->lock.unlock();
+				}
+			});
+		}
 		upload_func();
 		if (is_written) {
 			Iterate<false>(vaddr, size,
@@ -146,9 +213,36 @@ public:
 			               });
 		}
 		s_upload_owner = previous_upload_owner;
+		if (m_async_protect) {
+			RecordUploadProtect(stats, landed_pages, defer);
+			auto& queued = QueuedRegions();
+			if (!queued.empty()) {
+				QueueAsyncProtect(queued.data(), queued.size());
+				queued.clear();
+			}
+		}
 	}
 
+	// Design P. Enabling it creates the helper thread; it is never turned off again while the
+	// tracker lives, and every region created afterwards carries the deferred-protection states.
+	void EnableAsyncProtect(Common::ThreadAffinityGroup group, AsyncProtectSink sink);
+	void StopAsyncProtect() noexcept;
+	// Waits until the helper's queue is empty and its last batch has landed. Called at every
+	// submission boundary; a no-op and one relaxed load with the setting off.
+	void               DrainAsyncProtect();
+	[[nodiscard]] bool AsyncProtectEnabled() const noexcept { return m_async_protect; }
+
 private:
+	static std::vector<RegionManager*>& QueuedRegions() {
+		static thread_local std::vector<RegionManager*> regions;
+		return regions;
+	}
+
+	void AnnounceAsyncProtect() noexcept;
+	void QueueAsyncProtect(RegionManager* const* regions, size_t count);
+	static void RecordUploadProtect(const ProtectStats& stats, uint64_t landed_pages,
+	                                bool deferred) noexcept;
+
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
@@ -195,6 +289,8 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::unique_ptr<AsyncProtectHelper>            m_async;
+	bool                                           m_async_protect = false;
 };
 
 } // namespace Libs::Graphics

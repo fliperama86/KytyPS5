@@ -34,6 +34,8 @@ constexpr uint64_t REGION_SIZE  = TRACKER_REGION_SIZE;
 // Counted for the frame replay; see PageProtectCallCount in the header.
 std::atomic_uint64_t g_protect_calls {0};
 std::atomic_uint64_t g_protect_pages {0};
+thread_local uint64_t t_protect_calls = 0;
+thread_local uint64_t t_protect_pages = 0;
 constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
@@ -225,12 +227,18 @@ struct PageManager::Impl {
 		return ptr;
 	}
 
-	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
+	void Protect(uint64_t vaddr, uint64_t size, uint32_t protection, ProtectStats* stats) noexcept {
 		// Step 0b of docs/bda-sync-design.md: the kernel call alone, nested inside
 		// PageManager::Protect so a capture separates the bitmap walk from the syscall.
 		KYTY_PROFILER_BLOCK("PageManager::ProtectCall");
 		g_protect_calls.fetch_add(1, std::memory_order_relaxed);
 		g_protect_pages.fetch_add(size / PAGE_SIZE, std::memory_order_relaxed);
+		t_protect_calls++;
+		t_protect_pages += size / PAGE_SIZE;
+		if (stats != nullptr) {
+			stats->calls++;
+			stats->pages += size / PAGE_SIZE;
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,
@@ -240,7 +248,7 @@ struct PageManager::Impl {
 
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
-	                          const RegionBits* mask = nullptr) {
+	                          ProtectStats* stats, const RegionBits* mask = nullptr) {
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
@@ -249,7 +257,7 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms, stats);
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -290,7 +298,7 @@ struct PageManager::Impl {
 	}
 
 	template <bool track, bool is_read>
-	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
+	void UpdatePageWatchers(uint64_t vaddr, uint64_t size, ProtectStats* stats) {
 		const auto begin = PageStart(vaddr);
 		const auto end   = PageEnd(vaddr, size);
 		for (auto chunk_begin = begin; chunk_begin < end;) {
@@ -302,7 +310,7 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last, stats);
 			chunk_begin = chunk_end;
 		}
 	}
@@ -323,15 +331,16 @@ uint64_t PageManager::GetPageSize() const {
 }
 
 template <bool track>
-void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
-	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
+void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size, ProtectStats* stats) {
+	m_impl->UpdatePageWatchers<track, false>(vaddr, size, stats);
 }
 
-template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
-template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t, ProtectStats*);
+template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t, ProtectStats*);
 
 template <bool track, bool is_read>
-void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask,
+                                              ProtectStats* stats) {
 	// The re-protection a BDA scan pays for when the tracker clears CPU-dirty state
 	// (RegionManager::UpdateCpuProtection); the same zone covers the GPU-side updates.
 	KYTY_PROFILER_BLOCK("PageManager::Protect");
@@ -349,7 +358,7 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	const auto last  = end_range.second;
 	if (start_range.second == end_range.second) {
 		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
-		                                           (last - first) * PAGE_SIZE);
+		                                           (last - first) * PAGE_SIZE, stats);
 		return;
 	}
 
@@ -357,13 +366,18 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	if (region == nullptr) {
 		Fatal("untracking unknown region 0x%016" PRIx64, base_addr);
 	}
-	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
+	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, stats,
+	                                                   &mask);
 }
 
-template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&,
+                                                                   ProtectStats*);
+template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&,
+                                                                    ProtectStats*);
+template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&,
+                                                                    ProtectStats*);
+template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&,
+                                                                     ProtectStats*);
 
 uint64_t PageProtectCallCount() noexcept {
 	return g_protect_calls.load(std::memory_order_relaxed);
@@ -371,6 +385,14 @@ uint64_t PageProtectCallCount() noexcept {
 
 uint64_t PageProtectPageCount() noexcept {
 	return g_protect_pages.load(std::memory_order_relaxed);
+}
+
+uint64_t PageProtectThreadCallCount() noexcept {
+	return t_protect_calls;
+}
+
+uint64_t PageProtectThreadPageCount() noexcept {
+	return t_protect_pages;
 }
 
 } // namespace Libs::Graphics

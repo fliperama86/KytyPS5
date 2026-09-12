@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -216,6 +217,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	// Design P (docs/bda-sync-design.md), before the first region exists: the tracker stops
+	// re-protecting uploaded pages on the render thread and a helper thread does it instead.
+	if (Config::BdaAsyncProtectEnabled()) {
+		m_memory_tracker.EnableAsyncProtect(
+		    Config::GetBdaAsyncProtectAffinity() == Config::BdaAsyncProtectAffinity::Render
+		        ? Common::ThreadAffinityGroup::Render
+		        : Common::ThreadAffinityGroup::Guest,
+		    [this](const GuestRange* landed, size_t count) { OnAsyncProtectLanded(landed, count); });
+	}
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -239,6 +249,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	// Nothing may land in the BDA dirty set once the cache starts tearing down.
+	m_memory_tracker.StopAsyncProtect();
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -856,6 +868,22 @@ void BufferCache::InvalidateBda(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_bda_dirty_mutex);
 		m_bda_dirty_ranges.Add(begin, end - begin);
 	}
+	BumpBdaGeneration();
+}
+
+void BufferCache::OnAsyncProtectLanded(const GuestRange* landed, size_t count) {
+	{
+		std::lock_guard lock(m_bda_dirty_mutex);
+		for (size_t i = 0; i < count; i++) {
+			const auto begin = std::max(landed[i].address, TRACKER_PAGE_SIZE);
+			const auto end   = std::min(landed[i].End(), TRACKER_ADDRESS_SIZE);
+			if (begin < end) {
+				m_bda_dirty_ranges.Add(begin, end - begin);
+			}
+		}
+	}
+	// One bump for the batch: it is what forces the next PrepareBda to scan, and the submission
+	// boundary waits for this to have happened before the first draw that could read the pages.
 	BumpBdaGeneration();
 }
 

@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <utility>
 
@@ -69,10 +71,33 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// Design P (docs/bda-sync-design.md): with asynchronous re-protection on, a region carries two
+// extra page sets beside the CPU- and GPU-dirty ones.
+//
+//   pending (state U, "uploaded, unprotected"): the scan uploaded the page and cleared its
+//       CPU-dirty bit but left it writable, so the render thread made no NtProtectVirtualMemory
+//       call. A helper thread protects it later.
+//   landed: the helper has protected the page. The page may have been written between the upload
+//       and the protection taking effect without faulting, so the next upload that covers it
+//       uploads it once more and it becomes P (protected, clean).
+//
+// The invariant the whole scheme rests on is m_writable == m_cpu_dirty | pending: the
+// protection applied to a page says "writable if the guest may write it without faulting", and a
+// U page may. UpdateCpuProtection therefore drives protection from that union, and every state
+// change keeps the sets disjoint where it matters: pending & cpu_dirty, landed & cpu_dirty and
+// pending & landed are all empty.
 class RegionManager final {
 public:
-	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
-	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
+	// The design-P page sets live behind a pointer so a region keeps its size and its layout when
+	// the setting is off, which is the configuration every other game runs in.
+	struct AsyncState {
+		RegionBits pending;
+		RegionBits landed;
+	};
+
+	RegionManager(PageManager& page_manager, uint64_t cpu_addr, bool async_protect = false)
+	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr),
+	      m_async(async_protect ? std::make_unique<AsyncState>() : nullptr) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -111,21 +136,61 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
+			if (m_async != nullptr) {
+				// Whichever way the CPU-dirty bit moves, the page leaves the asynchronous states:
+				// a page marked dirty is already writable and needs no protection change and no
+				// second upload, and a page cleared through this path is protected right here.
+				m_async->pending.UnsetRange(start, end);
+				m_async->landed.UnsetRange(start, end);
+			}
 			UpdateCpuProtection<!enable>();
 		} else {
+			if (m_async != nullptr && enable) {
+				// The GPU owns these pages and will write them back; nothing may upload guest
+				// memory over them, so drop the pending second upload. The pending-protect bits
+				// stay: the helper still owes the page its write watcher, and applying it while
+				// the GPU access watcher holds the page at no-access costs no kernel call.
+				m_async->landed.UnsetRange(start, end);
+			}
 			UpdateGpuProtection<enable>();
 		}
 	}
 
+	// Design P adds four out-of-band parameters, all inert with the setting off. `defer_protect`
+	// is passed only by the CPU upload path: with it the pages this call clears stay writable and
+	// go to the helper's queue instead of being re-protected here, so the caller makes no kernel
+	// call at all. `stats` counts the calls it does make, `landed_pages` the pages re-uploaded
+	// because the helper protected them since, and `queue_protect` says the region now owes the
+	// helper work.
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func,
+	                          bool defer_protect = false, ProtectStats* stats = nullptr,
+	                          uint64_t* landed_pages = nullptr, bool* queue_protect = nullptr) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		RegionBits mask(GetBits<source>(), start, end);
 		if constexpr (clear) {
 			GetBits<source>().UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu && clear) {
-			UpdateCpuProtection<true>();
+			if (m_async != nullptr) {
+				if (defer_protect && mask.Any()) {
+					// State U: the bits move from CPU-dirty to pending, so the union that drives
+					// protection does not change and UpdateCpuProtection makes no kernel call.
+					m_async->pending |= mask;
+					if (queue_protect != nullptr) {
+						*queue_protect = true;
+					}
+				}
+				RegionBits landed(m_async->landed, start, end);
+				if (landed.Any()) {
+					m_async->landed.UnsetRange(start, end);
+					if (landed_pages != nullptr) {
+						*landed_pages += landed.Count();
+					}
+					mask |= landed;
+				}
+			}
+			UpdateCpuProtection<true>(stats);
 			ForEachRange(mask, std::forward<Func>(func));
 			return;
 		}
@@ -135,17 +200,56 @@ public:
 		ForEachRange(mask, std::forward<Func>(func));
 	}
 
+	// The helper thread's half of design P, called with `lock` held. Protects every pending page
+	// of the region in as few kernel calls as the page manager coalesces them into -- a run may
+	// span already-protected pages, whose protection it re-applies unchanged -- moves them to the
+	// landed set unless the GPU has claimed them meanwhile, and reports the landed runs so the
+	// caller can put them back in the BDA dirty set. Returns the number of landed pages.
+	template <typename Func>
+	uint64_t LandPendingProtect(ProtectStats* stats, Func&& func) {
+		if (m_async == nullptr || m_async->pending.None()) {
+			return 0;
+		}
+		auto landed = m_async->pending;
+		m_async->pending.Clear();
+		// A page the GPU has claimed since its upload is downloaded, not uploaded: leaving it out
+		// of the landed set keeps the tracker's rule that nothing overwrites GPU-owned bytes.
+		landed.AndNot(m_gpu_dirty);
+		m_async->landed |= landed;
+		UpdateCpuProtection<true>(stats);
+		ForEachRange(landed, std::forward<Func>(func));
+		return landed.Count();
+	}
+
+	// Whether this region is already on the helper's queue. The producer sets it and the helper
+	// clears it, both with `lock` held, so a region is queued at most once per batch.
+	std::atomic_bool queued {false};
+
 	TrackingSpinLock lock;
 
 private:
 	template <bool track>
-	void UpdateCpuProtection() {
-		auto mask  = m_cpu_dirty ^ m_writable;
-		m_writable = m_cpu_dirty;
+	void UpdateCpuProtection(ProtectStats* stats = nullptr) {
+		if (m_async == nullptr) [[likely]] {
+			auto mask  = m_cpu_dirty ^ m_writable;
+			m_writable = m_cpu_dirty;
+			if (mask.None()) {
+				return;
+			}
+			m_page_manager.UpdatePageWatchersForRegion<track>(m_cpu_addr, mask, stats);
+			return;
+		}
+		// Design P: a page stays writable when the guest may write it without faulting, which
+		// means CPU-dirty or not protected yet (state U). Kept apart from the branch above so the
+		// setting off costs no extra copy of the region's bit sets on a path a bind runs.
+		auto desired = m_cpu_dirty;
+		desired |= m_async->pending;
+		auto mask  = desired ^ m_writable;
+		m_writable = desired;
 		if (mask.None()) {
 			return;
 		}
-		m_page_manager.UpdatePageWatchersForRegion<track>(m_cpu_addr, mask);
+		m_page_manager.UpdatePageWatchersForRegion<track>(m_cpu_addr, mask, stats);
 	}
 
 	template <bool track>
@@ -204,6 +308,8 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// Design P: null when the setting is off, which is the only thing the off path tests.
+	std::unique_ptr<AsyncState> m_async;
 };
 
 } // namespace Libs::Graphics

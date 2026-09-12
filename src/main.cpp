@@ -74,6 +74,13 @@ static void PrintUsage() {
 	         "                                       Default: false.\n");
 	::printf("  --gpu-indirect-draws <true|false>    The same for indirect draws. Measures\n"
 	         "                                       neutral in replay. Default: false.\n");
+	::printf("  --bda-async-protect <true|false>     Re-protect the pages a BDA scan uploads on\n"
+	         "                                       a helper thread instead of the render\n"
+	         "                                       thread, and upload each page once more\n"
+	         "                                       after the protection lands.\n"
+	         "                                       Default: false.\n");
+	::printf("  --bda-async-protect-affinity <grp>   Which CPU group that helper runs on:\n"
+	         "                                       guest or render. Default: guest.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -362,6 +369,21 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--gpu-indirect-draws") {
 			if (!ParseBool(value, options.config.gpu_indirect_draws_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--bda-async-protect") {
+			if (!ParseBool(value, options.config.bda_async_protect_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--bda-async-protect-affinity") {
+			if (value == "guest") {
+				options.config.bda_async_protect_affinity = Config::BdaAsyncProtectAffinity::Guest;
+			} else if (value == "render") {
+				options.config.bda_async_protect_affinity = Config::BdaAsyncProtectAffinity::Render;
+			} else {
+				::printf("invalid affinity group for %s: %s (guest or render)\n", arg.c_str(),
+				         value.c_str());
 				return false;
 			}
 		} else if (arg == "--shader-optimization-type") {

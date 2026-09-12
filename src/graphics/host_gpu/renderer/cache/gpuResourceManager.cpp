@@ -106,8 +106,8 @@ void GpuResourceManager::PrepareBda() {
 	// relaxed load and no clock reads.
 	const bool watched = Replay::PrepareEventsWatched();
 	const auto started = watched ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-	const auto protect_calls_before = watched ? PageProtectCallCount() : 0;
-	const auto protect_pages_before = watched ? PageProtectPageCount() : 0;
+	const auto protect_calls_before = watched ? PageProtectThreadCallCount() : 0;
+	const auto protect_pages_before = watched ? PageProtectThreadPageCount() : 0;
 	KYTY_PROFILER_BLOCK("GpuResourceManager::SynchronizeBdaBuffers");
 	// Take the dirty set before the scan. A range added afterwards also advances the
 	// generation captured above, so the next call picks it up.
@@ -140,11 +140,14 @@ void GpuResourceManager::PrepareBda() {
 		                          std::chrono::steady_clock::now() - started)
 		                          .count(),
 		                      UINT32_MAX));
-		// The re-protection the scan's uploads caused: every SynchronizeBuffersInRange that
-		// uploads a page has the tracker protect it again, which is a kernel call and, with guest
-		// threads running, a TLB shootdown across every one of them.
-		sample.protect_calls = static_cast<uint32_t>(PageProtectCallCount() - protect_calls_before);
-		sample.protect_pages = static_cast<uint32_t>(PageProtectPageCount() - protect_pages_before);
+		// The re-protection the scan's uploads caused, on this thread only: every
+		// SynchronizeBuffersInRange that uploads a page has the tracker protect it again, which is
+		// a kernel call and, with guest threads running, a TLB shootdown across every one of them.
+		// Design P moves those calls to a helper thread, where they do not count here.
+		sample.protect_calls =
+		    static_cast<uint32_t>(PageProtectThreadCallCount() - protect_calls_before);
+		sample.protect_pages =
+		    static_cast<uint32_t>(PageProtectThreadPageCount() - protect_pages_before);
 		Replay::RecordPrepareEvent(sample);
 	}
 }

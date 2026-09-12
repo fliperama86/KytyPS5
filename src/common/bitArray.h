@@ -243,6 +243,49 @@ public:
 		return result;
 	}
 
+	constexpr BitArray& operator|=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			m_data[word] |= other.m_data[word];
+		}
+		return *this;
+	}
+
+	[[nodiscard]] constexpr BitArray operator|(const BitArray& other) const {
+		auto result = *this;
+		result |= other;
+		return result;
+	}
+
+	constexpr BitArray& operator&=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			m_data[word] &= other.m_data[word];
+		}
+		return *this;
+	}
+
+	[[nodiscard]] constexpr BitArray operator&(const BitArray& other) const {
+		auto result = *this;
+		result &= other;
+		return result;
+	}
+
+	// Bits set here and not in `other`, which is how the tracker subtracts one page set from
+	// another without building the complement first.
+	constexpr BitArray& AndNot(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			m_data[word] &= ~other.m_data[word];
+		}
+		return *this;
+	}
+
+	[[nodiscard]] constexpr size_t Count() const {
+		size_t total = 0;
+		for (const auto word: m_data) {
+			total += static_cast<size_t>(std::popcount(word));
+		}
+		return total;
+	}
+
 	[[nodiscard]] constexpr BitArray operator~() const {
 		auto result = *this;
 		for (auto& word: result.m_data) {

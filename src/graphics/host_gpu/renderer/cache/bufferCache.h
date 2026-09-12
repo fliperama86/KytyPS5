@@ -42,6 +42,10 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Design P (docs/bda-sync-design.md): waits for the asynchronous re-protection helper to have
+	// drained and its last batch to have landed, so the scan that follows re-uploads every page
+	// it protected. One relaxed load when the setting is off.
+	void                   DrainAsyncProtect() { m_memory_tracker.DrainAsyncProtect(); }
 	// Frame replay (docs/frame-replay.md): re-marks a range as CPU-written, the state the game's
 	// page faults leave behind, so a replay loop exercises the same dirty-upload path.
 	void                   MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
@@ -180,6 +184,11 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	// The helper thread's landing: the pages it protected go back in the BDA dirty set and the
+	// generation moves once for the whole batch, which is what makes the next scan upload them a
+	// second time. Runs on the helper thread.
+	void OnAsyncProtectLanded(const GuestRange* landed, size_t count);
+
 	void BumpBdaGeneration() noexcept {
 		m_bda_generation.fetch_add(1, std::memory_order_release);
 	}

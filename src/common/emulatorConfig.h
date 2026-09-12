@@ -38,6 +38,10 @@ enum class ThreadAffinity { Auto, None };
 // follows copies lines another core wrote moments earlier (docs/bda-sync-design.md, step 0).
 enum class ReplayWriter { None, Guest, Render };
 
+// Which CPU group design P's re-protection helper thread runs on
+// (docs/bda-sync-design.md, --bda-async-protect).
+enum class BdaAsyncProtectAffinity { Guest, Render };
+
 using Keymap = std::vector<std::string>;
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
@@ -74,6 +78,12 @@ struct ConfigOptions {
 	// The draw half of the same item. Separate because it measures neutral in replay: it removes
 	// the argument syncs but pays a buffer-cache lookup per draw instead.
 	bool                   gpu_indirect_draws_enabled = false;
+	// Design P of docs/bda-sync-design.md: the memory tracker stops re-protecting the pages a BDA
+	// scan uploads on the render thread and hands them to a helper thread, which protects them in
+	// batches; the next scan uploads each landed page once more. Off, the tracker is unchanged.
+	bool                   bda_async_protect_enabled = false;
+	// Which CPU group that helper thread runs on. Measured both ways, see the design document.
+	BdaAsyncProtectAffinity bda_async_protect_affinity = BdaAsyncProtectAffinity::Guest;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -138,6 +148,8 @@ bool                   ShaderStorageImageBoundsCheckEnabled();
 bool                   GpuDescriptorsEnabled();
 bool                   GpuIndirectEnabled();
 bool                   GpuIndirectDrawsEnabled();
+bool                   BdaAsyncProtectEnabled();
+BdaAsyncProtectAffinity GetBdaAsyncProtectAffinity();
 ShaderOptimizationType GetShaderOptimizationType();
 ShaderLogDirection     GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();

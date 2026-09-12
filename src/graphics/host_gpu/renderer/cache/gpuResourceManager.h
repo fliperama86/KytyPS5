@@ -32,6 +32,9 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Design P (docs/bda-sync-design.md): the submission boundary waits here for the
+	// re-protection helper to have drained and its last batch to have landed.
+	void               DrainAsyncProtect() { m_buffer_cache.DrainAsyncProtect(); }
 	void               RunGarbageCollector();
 
 private:

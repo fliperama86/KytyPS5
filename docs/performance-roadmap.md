@@ -205,7 +205,9 @@ Design P is implemented behind `--bda-async-protect` (default off) and measured 
 ([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Design P measured, September 12, 2026"): the
 render thread's upload path makes 0 protect calls with it on against 926 a loop off, the image is
 unchanged in both `--gpu-descriptors` settings, and the projected render-thread saving in the game
-is about 8 ms of a 103 ms frame. The end-to-end A/B has not been run yet.
+is about 5 ms of a 103 ms frame -- 10.3 ms of syscall latency moved off the render thread, 5.2 ms
+of second uploads and boundary scans paid back. The replay cannot see the saving, only the price,
+so the end-to-end A/B is what settles it and it has not been run yet.
 
 Expected: about 16 FPS in this scene (projection in the design document).
 

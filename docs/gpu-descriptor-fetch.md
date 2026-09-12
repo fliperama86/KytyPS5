@@ -318,22 +318,51 @@ page's successive marks, 5.8% fall inside the same batch, 30.5% one scan later a
 P in one number: most of the protection the scan pays for is undone almost immediately.
 
 **Step 2, the replay bench.** nexus-6, 40 loops, two repeats of each configuration interleaved,
-`-Image`; reports in `_Runtime/_Diagnostics/replay/nexus-6/runs-p-final/`, the pre-change build's
-baseline in `runs-p-baseline/`, the helper-affinity A/B in `runs-p-affinity/`. Per loop:
+`-Image`; reports in `_Runtime/_Diagnostics/replay/nexus-6/runs-p-nobump{,2}/`, the first variant in
+`runs-p-final/`, the pre-change build's baseline in `runs-p-baseline/`, the helper-affinity A/B in
+`runs-p-affinity/`. Per loop, of the shipped variant:
 
 | | gd=true, off | gd=true, **on** | gd=false, off | gd=false, **on** |
 | --- | --- | --- | --- | --- |
 | render-thread protect calls, upload path | 926 (1,469 pages) | **0** | 316 (845 pages) | **0** |
-| of which in written uploads, not deferred | -- | 1 | -- | 2 |
-| helper protect calls (pages) | -- | 690 (3,214) | -- | 256 (2,249) |
-| pages a helper call | -- | 4.66 | -- | 8.80 |
-| helper batches | -- | 505 | -- | 159 |
-| pages landed / uploaded a second time | -- | 2,425 / 2,260 | -- | 1,877 / 1,883 |
-| submission-boundary drains / waits / µs | -- | 39 / 1 / 39 | -- | 39 / 1 / 42 |
-| BDA scans | 462 | 545 | 16 | 21 |
-| µs a scan | 4.12 | 7.05 | 44.6 | 77.2 |
-| `ms/loop gpu` median | 78.96 | 83.00 | 73.52 | 76.28 |
+| of which in written uploads, not deferred | -- | 0 | -- | 0 |
+| helper protect calls (pages) | -- | 700 (3,263) | -- | 275 (2,409) |
+| pages a helper call | -- | 4.66 | -- | 8.76 |
+| helper batches | -- | 499 | -- | 132 |
+| pages landed / uploaded a second time | -- | 2,445 / 2,242 | -- | 1,926 / 1,902 |
+| boundary drains / waits / wait µs | -- | 39 / 1 / 15 | -- | 39 / 1 / 24 |
+| boundary forced scans / their µs | -- | 39 / 1,270 | -- | 39 / 1,685 |
+| draw-driven BDA scans | 462 | 458 | 16 | 12 |
+| total scan time, ms a loop | 2.0 | 2.6 + 1.3 | 0.8 | 0.2 + 1.7 |
+| `ms/loop gpu`, min of the measured loops | 76.9 | 82.1 | 72.5 | 75.0 |
 | image vs reference | R 9.8 G 7.8 B 4.1 | **identical** | identical | identical |
+
+(The `ms/loop gpu` medians of this batch are unusable -- the machine picked up background load
+between sessions, jitter went from 0.15-0.50 to 0.55-0.77 and the *off* configurations moved with
+it. `gpu min` did not: 76.4 to 77.1 for `gd=true` off and 72.2 to 73.2 for `gd=false` off across
+all four sessions, so it is what the row above reports.)
+
+**The generation bump per landing, and why it went.** The first implementation had the helper move
+the BDA generation once per batch, as the design says, so that the next `PrepareBda` would scan and
+re-upload the landed pages. That raised the scan count from 462 to **545** a loop with `gd=true`
+and from 16 to 21 with `gd=false` -- 505 batches a loop, each asking for a scan. It is not needed:
+any scan or bind that later covers a landed page uploads it anyway, and a draw of a submission may
+only read what the guest wrote before that submission was enqueued, while everything a U page can
+be stale by was written *after* its upload, which is during the submission's own processing. So the
+bump was removed and the submission boundary, which already drains the helper, forces one scan
+instead. The scan count comes back to 458 (and 12 with `gd=false`, below the 16 it does off,
+because the boundary scan takes the dirty set the draws would have scanned for).
+
+**It did not buy milliseconds, and the measurement says why.** The total scan time is the same
+either way -- 3.84 ms a loop with the bump (545 scans), 3.87 ms without it (458 scans plus 39
+boundary scans) -- because the cost is the 2,242 pages uploaded a second time, not the dispatch of
+the scans that upload them. By `gpu min`, the no-bump variant is in fact 0.7 ms a loop *worse* on
+`gd=true` (82.1 against 81.4) and 0.6 worse on `gd=false`, because a forced boundary scan runs on
+every submission and each one sweeps a larger dirty set (32 µs with `gd=true`, 43 with `gd=false`).
+It is kept regardless: it makes the correctness argument local and provable -- every page is
+protected and clean before a submission's first draw, whether or not that submission ever calls
+`PrepareBda` -- and it keeps the replay's scan count comparable to the capture's recorded 474,
+which the bump variant's 545 did not.
 
 The render thread makes **no** `NtProtectVirtualMemory` call in the deferred upload path, which is
 what the design is for. One or two calls a loop remain in *written* uploads, which are not
@@ -345,22 +374,21 @@ The helper does **fewer** calls than the render thread did -- 690 against 926 wi
 more pages, because a batch coalesces across the buffers of several scans, which the render thread
 cannot do; with `gd=false` the batches are larger still (8.8 pages a call).
 
-What the design costs, and the replay measures fairly: 2,260 pages a loop uploaded a second time,
-and 83 more scans a loop (462 to 545) because each landed batch moves the generation. Together they
-take a scan from 4.12 to 7.05 µs and the loop from 78.96 to 83.00 ms. **In replay the setting is a
-loss**, exactly as [bda-sync-design.md](bda-sync-design.md) predicts: a protect call costs about
-1 µs there and 5.4 µs in the game, so the replay pays the design's price without collecting its
-saving.
+What the design costs, and the replay measures fairly: **2,242 pages a loop uploaded a second
+time**, which is 1.9 ms more of scan work with `gd=true` and 1.1 ms with `gd=false`, and about
+5.2 ms a loop in all. **In replay the setting is a loss**, exactly as
+[bda-sync-design.md](bda-sync-design.md) predicts: a protect call costs about 1 µs there and 5.4 µs
+in the game, so the replay pays the design's price without collecting its saving.
 
 **The projection for the game.** The game's render thread makes 1,342 protect calls a frame inside
 BDA scans at 5.41 µs, 7.26 ms, and about 3 ms more in the per-bind syncs outside them: about
 **10.3 ms a frame of syscall latency** that design P moves to the helper. Against that it adds the
-extra uploads and extra scans the replay measures at **4.0 ms a loop** (`gd=true`), which the game
-pays as well and probably pays more, because its copies are of freshly written lines (5.4 µs a scan
-in the writer experiment, [frame-replay.md](frame-replay.md)). Net **about 6 ms a frame off the
-render thread**, 103.4 ms to roughly 97, against the design document's estimate of 95. For
-`gd=false` the same arithmetic over a per-bind share that is most of 3.98 ms gives about 2 ms.
-Only the end-to-end A/B settles it.
+second uploads and the boundary scans the replay measures at **5.2 ms a loop** (`gd=true`), which
+the game pays as well and probably pays more, because its copies are of freshly written lines
+(5.4 µs a scan in the writer experiment, [frame-replay.md](frame-replay.md)). Net **about 5 ms a
+frame off the render thread**, 103.4 ms to roughly 98, against the design document's estimate of
+95. For `gd=false` the same arithmetic over a per-bind share that is most of 3.98 ms gives about
+1.5 ms. Only the end-to-end A/B settles it, and it is the next step.
 
 Off, the build measures as the one before it: `gd=true` 78.11 against 78.19 ms, `gd=false` 74.07
 against 72.76, the second inside its own run-to-run spread of 1.1 ms and not visible in the scan

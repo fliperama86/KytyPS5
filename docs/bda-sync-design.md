@@ -1,7 +1,8 @@
 # Cheap BDA sync (roadmap item 2, first half)
 
-Status, September 12, 2026: the cost is measured and understood (below); design P (re-protection
-off the render thread) chosen; implementation in progress.
+Status, September 12, 2026: cause measured (below); design P (re-protection off the render thread)
+landed behind `--bda-async-protect` (default off) and measured in replay, see "P measured"; next
+is the flat SRT reads in-shader.
 Companion to [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md) ("What stage 1 needs to pay
 off", point 2, and "Scan breakdown, September 12") and [performance-roadmap.md](performance-roadmap.md)
 item 2.
@@ -99,10 +100,11 @@ and when the mirror is trusted again.
   extra `memcpy` per page, 0.3 us.
 - **Submission boundary.** Draws of a submission may read only what the guest wrote before
   submitting it (the console's rule; anything else reads garbage on the console too). So when
-  the render thread starts processing a guest submission (`GuestGpu::Submit`, `SubmitCompute`,
-  and `Done`), it waits for the helper to drain and for the landed pages to be re-uploaded by the
-  next scan, which the landing's generation bump forces. A few waits a frame, normally already
-  satisfied. This closes the only window in which a draw could see a stale mirror: a write to a
+  the render thread starts *processing* a guest submission (`GuestGpu::Process`, after
+  `BufferInit`; not the guest's enqueue points), it waits for the helper to drain and forces one
+  scan, which re-uploads every landed page before the submission's first draw. The landing
+  itself bumps nothing: a per-landing generation bump was tried and cost 83 extra scans a frame
+  for no gain (`c571c72`). This closes the only window in which a draw could see a stale mirror: a write to a
   U page in the microseconds between its upload and the helper's landing, read by a draw recorded
   in those same microseconds, which cannot happen across a submission boundary.
 - **Everything else unchanged**: dirty marks, the generation pair, `PrepareBda`'s gate, the
@@ -110,13 +112,46 @@ and when the mirror is trusted again.
   follow-up: larger tracker pages or `MEM_WRITE_WATCH` would cut those, and they are 10 ms a
   frame of guest thread time, not render thread time).
 
-Expected on the render thread: the scan drops from 28.6 to about 8 us (walk 1.9, record 3.0, copy
-1.2 plus the extra upload, lock, rest); 399 scans a frame from 10.7 ms to about 3 ms; the per-bind
-syncs outside scans lose their protect share too. `--gpu-descriptors true` from 103 to about 95
-ms, `false` from 86 to about 83. Still slower on than off until the flat reads move in-shader
-(second half of item 2), which removes most of the 30 ms of `EvaluateRuntimeSourcesImpl`.
+Expected on the render thread, as first written: the scan from 28.6 to about 8 us, 103 to about
+95 ms. Measured (next section): the syscalls do leave the render thread, but the second uploads
+are a real line item, and the net is about 5 ms a frame, not 8.
 
-Gate: a runtime setting, default off, listed in [settings.md](settings.md).
+Gate: `--bda-async-protect <true|false>`, default false, and `--bda-async-protect-affinity
+<guest|render>` for the helper's placement, both in [settings.md](settings.md). Uploads with
+`is_written` (the GPU claims the range in the same call and it is protected no-access anyway) keep
+the synchronous path; 0 to 2 calls a loop.
+
+### P measured, September 12 (replay, nexus-6, `gpu min` over 40 loops x 2)
+
+| per loop | gd=true off | gd=true on | gd=false off | gd=false on |
+| --- | --- | --- | --- | --- |
+| render-thread protect calls, upload path | 926 | **0** | 316 | **0** |
+| helper protect calls (pages) | - | 696 (3,288) | - | 273 (2,399) |
+| second uploads | - | 2,246 | - | 1,901 |
+| boundary drains / waits / forced scans | - | 39 / 0 / 39 | - | 39 / 0 / 39 |
+| `ms/loop gpu` | 76.9 | 82.1 | 72.5 | 75.0 |
+| image vs reference | R9.8 G7.8 B4.1 | identical | identical | identical |
+
+Reports: `_Runtime/_Diagnostics/replay/nexus-6/runs-p-nobump{,2}/` (shipped variant),
+`runs-p-final/` (per-landing bump), `runs-p-affinity/` (guest 83.3 against render 85.4).
+Off is byte-identical to the previous build. The capture analysis behind the design
+(`nexus-6/analyse-protect.py`): 2,816 tracker pages dirtied a frame, two thirds of a re-protected
+page is dirty again within two scans, runs of adjacent pages are short (82% one page).
+
+What replay prices fairly is the design's overhead: 5.2 ms a loop on gd=true, almost all of it the
+2,246 second uploads at about 2.3 us each (walk, staging, record; the copy itself is a fraction),
+plus 1.1 ms of forced boundary scans. What replay cannot price is the saving, so it is projected
+from the game's breakdown: 1,342 render-thread calls a frame inside scans x 5.4 us = 7.3 ms, plus
+about 3 ms of per-bind syncs outside scans, 10.3 ms off the render thread. **Net about 5 ms a frame
+on `--gpu-descriptors true` (103 to about 98 ms) and about 1.5 ms on `false`.** A replayed scan
+grows from 4.1 to 6.4 us with the second uploads, so expect about 11 us in the game, not 8.
+
+Why the second uploads are many: the game rewrites the same pages within one or two scans, so
+under the old policy each rewrite cost a fault on the guest thread and a re-protection on the
+render thread, and under P it costs one more copy. A cheaper trust rule needs to know whether a U
+page was written, which only hardware dirty bits could say; the remaining lever on this path is
+the per-upload overhead (one barrier pair and one `copyBuffer` per buffer per scan), and the way
+to remove the path is A.
 
 ### Measuring P in replay
 
@@ -151,7 +186,7 @@ src/common/virtualMemory.cpp), which is the bookkeeping risk.
 1. Capture analysis, no runs: from `nexus-6`'s dirty and prepare events, per frame the distinct
    dirty pages, how often each is re-protected, and the run lengths of adjacent pages, to size
    the helper's coalescing. Half an hour.
-2. P behind a setting, measured in replay as above.
+2. P behind a setting, measured in replay: done (above).
 3. Flat SRT reads in-shader (second half of item 2, recompiler work, its own brief).
 4. One end-to-end A/B against `--gpu-descriptors false` on the same build.
 5. Bench for A.

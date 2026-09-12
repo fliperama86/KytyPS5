@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -65,6 +66,11 @@ struct PlanShape {
 	uint32_t    indirection     = 0;
 	bool        control_flow    = false;
 	bool        read_first_lane = false;
+	// Flat SRT slots no descriptor source consumes: values the shader body reads for itself. The
+	// game's mix is about 21.5 slots an event against 8.5 descriptor dwords, so most slots are
+	// these. Stage 1b of docs/gpu-descriptor-fetch.md only removes host work for them, because a
+	// slot a descriptor source also reads is the same instruction in the flat program.
+	uint32_t    body_slots      = 0;
 };
 
 struct BuiltPlan {
@@ -72,14 +78,18 @@ struct BuiltPlan {
 	std::unique_ptr<SrtMemory> memory;
 	std::vector<uint32_t> sources;
 	std::vector<uint32_t> user_data;
+	// One byte per flat slot, non-zero for a slot no descriptor source consumes.
+	std::vector<uint8_t>  body_mask;
+	std::vector<uint8_t>  all_mask;
 };
 
 // Builds a post-planning plan directly: srt_reads hold the raw loads, and descriptor dwords
 // reference them through ReadConst(GetSrtResource, slot) exactly as PlanBuilder rewrites them.
 BuiltPlan BuildPlan(const PlanShape& shape) {
 	const uint32_t descriptor_count = shape.buffers + shape.images + shape.samplers;
-	const uint32_t dword_total =
+	const uint32_t descriptor_dwords =
 	    shape.buffers * 4u + shape.images * 8u + shape.samplers * 4u;
+	const uint32_t dword_total = descriptor_dwords + shape.body_slots;
 
 	BuiltPlan built;
 	built.memory = std::make_unique<SrtMemory>(static_cast<size_t>(dword_total) * 4u + 64u);
@@ -197,6 +207,12 @@ BuiltPlan BuildPlan(const PlanShape& shape) {
 	// The plan was patched after extraction, so lower it again.
 	CompileSrtPlan(built.plan);
 
+	built.all_mask.assign(built.plan.srt_reads.size(), 1u);
+	built.body_mask.assign(built.plan.srt_reads.size(), 0u);
+	for (size_t slot = descriptor_dwords; slot < built.body_mask.size(); slot++) {
+		built.body_mask[slot] = 1u;
+	}
+
 	built.sources.resize(built.plan.descriptor_sources.size());
 	for (uint32_t index = 0; index < built.sources.size(); index++) {
 		built.sources[index] = index;
@@ -219,7 +235,10 @@ struct Result {
 };
 
 // use_flat selects the compiled program or the IR walker; both must produce the same values.
-Result Measure(BuiltPlan& built, uint64_t iterations, bool use_flat) {
+// skip names the flat slots the shader evaluates for itself (docs/gpu-descriptor-fetch.md, stage
+// 1b), which the evaluator leaves zero; the checksum is then not comparable across masks.
+Result Measure(BuiltPlan& built, uint64_t iterations, bool use_flat,
+               std::span<const uint8_t> skip = {}) {
 	built.plan.flat.compiled = use_flat;
 	const SrtRuntime runtime {
 	    .user_data   = built.user_data,
@@ -236,14 +255,14 @@ Result Measure(BuiltPlan& built, uint64_t iterations, bool use_flat) {
 	// Warm up so the first-touch page faults and branch predictors do not skew the sample.
 	for (uint64_t index = 0; index < 64; index++) {
 		Check(EvaluateRuntimeSources(built.plan, built.sources, runtime, results, flat,
-		                             built.plan.clean_flat_slots, active),
+		                             built.plan.clean_flat_slots, active, {}, skip),
 		      "warm-up evaluation failed");
 	}
 
 	const auto start = std::chrono::steady_clock::now();
 	for (uint64_t index = 0; index < iterations; index++) {
 		if (!EvaluateRuntimeSources(built.plan, built.sources, runtime, results, flat,
-		                            built.plan.clean_flat_slots, active)) {
+		                            built.plan.clean_flat_slots, active, {}, skip)) {
 			Check(false, "evaluation failed");
 		}
 		checksum += results.empty() ? 0u : results.front().dwords[0];
@@ -291,6 +310,14 @@ const PlanShape Shapes[] = {
      .samplers        = 4,
      .arithmetic_ops  = 2,
      .read_first_lane = true},
+    // The parked Nexus average out of the KYTY_DEBUG_SRT_STATS dump: 1.97 descriptor sources and
+    // 8.5 descriptor dwords an event against 21.5 flat slots, so 13 slots are body-only.
+    {.name           = "nexus-mix",
+     .buffers        = 2,
+     .images         = 0,
+     .samplers       = 1,
+     .arithmetic_ops = 1,
+     .body_slots     = 13},
 };
 
 } // namespace
@@ -353,8 +380,8 @@ int main(int argc, char** argv) {
 		return 0;
 	}
 
-	std::printf("%-18s %10s %12s %12s %12s %8s\n", "shape", "sources", "flat_slots",
-	            "walker_ns", "flat_ns", "speedup");
+	std::printf("%-18s %10s %12s %12s %12s %8s %12s %12s\n", "shape", "sources", "flat_slots",
+	            "walker_ns", "flat_ns", "speedup", "body_skip_ns", "all_skip_ns");
 	for (const auto& shape: Shapes) {
 		if (!only.empty() && only != shape.name) {
 			continue;
@@ -363,10 +390,14 @@ int main(int argc, char** argv) {
 		const auto walker = Measure(built, iterations, false);
 		const auto flat   = Measure(built, iterations, true);
 		Check(walker.checksum == flat.checksum, "flat program disagrees with walker");
-		checksum += flat.checksum;
-		std::printf("%-18s %10zu %12zu %12.1f %12.1f %7.2fx\n", shape.name,
+		// What stage 1b can remove: the slots no descriptor source consumes, then every slot.
+		const auto body_skip = Measure(built, iterations, true, built.body_mask);
+		const auto all_skip  = Measure(built, iterations, true, built.all_mask);
+		checksum += flat.checksum + body_skip.checksum + all_skip.checksum;
+		std::printf("%-18s %10zu %12zu %12.1f %12.1f %7.2fx %12.1f %12.1f\n", shape.name,
 		            built.sources.size(), built.plan.srt_reads.size(), walker.ns_per_call,
-		            flat.ns_per_call, walker.ns_per_call / flat.ns_per_call);
+		            flat.ns_per_call, walker.ns_per_call / flat.ns_per_call,
+		            body_skip.ns_per_call, all_skip.ns_per_call);
 	}
 	std::printf("checksum %llu\n", static_cast<unsigned long long>(checksum));
 	return 0;

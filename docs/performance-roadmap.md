@@ -638,7 +638,12 @@ projected 5 ms a frame, and the per-event cost itself belongs to item 3.
 Decision state, September 12 evening: item 2 as "finish stage 1" is closed (both halves landed
 behind flags, neither pays); the frame is the 90 sync points of item 1b, and the path that removes
 them without artifacts is [sync-points-design.md](sync-points-design.md), "After the bench", built on
-the host-memory bench (docs/investigations/bda-host-memory-bench-2026-09-12.md). Awaiting a go.
+the host-memory bench (docs/investigations/bda-host-memory-bench-2026-09-12.md). Step 1 of that path, the prologue
+page table over imported guest memory, is landed behind `--gpu-prologue-table` and measured: the
+prologue misses go to 0 a loop and 0 in loop 1, the image is unchanged, the bookkeeping is free --
+and the GPU reading its descriptors over PCIe costs 5.1 ms a loop, against the 2 ms the step was
+allowed, so it stays off and the path waits on that decision
+([sync-points-design.md](sync-points-design.md), "Step 1").
 
 ### 3. Stages 2 and 3: vertex fetch in-shader, bindless images and samplers
 

@@ -403,7 +403,9 @@ Without `-OutputRoot` the reports land in `<capture>\runs-<yyyyMMdd-HHmmss>`.
 to start if one is already running — moves each `replay-report.json` into a timestamped
 `runs-<date>-<time>` subfolder of the capture as `<config>-run<n>.json`, keeps each run's console
 log beside it, writes `summary.json`, and prints one table: config, run, gpu median, gpu min, gpu
-max, gpu jitter, loop median, report file. Parameters: `-Loops` (default 60), `-Configs` (one string
+max, gpu jitter, drains, syncs, the BDA fault pages a loop of each page table, the prologue
+table's misses in loop 1 and its entries written a loop (docs/sync-points-design.md, step 1),
+loop median, report file. Parameters: `-Loops` (default 60), `-Configs` (one string
 per flag set, split on whitespace; `''` means the defaults), `-Repeats` (how many times to walk the
 whole list, so repeats of a configuration interleave instead of clustering), `-VblankFrequency`
 (default 360; see `--vblank-frequency` in [settings.md](settings.md) — presentation is paced by the

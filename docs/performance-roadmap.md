@@ -460,6 +460,61 @@ Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/runs-submit/` (the seven-config
 in-pass version and the pass-boundary version at the same interval),
 `_Runtime/_Diagnostics/replay/title-2/runs-submit/`.
 
+#### End-to-end, September 12, 2026
+
+The A/B the three levers above were waiting for, run in the game: one launch with every new setting
+off, one with `--gpu-indirect true --bda-async-protect true --gpu-submit-interval 16`, back to back
+in the same session, same save, same parked Nexus, five-minute warm-up until the pipeline cache
+stopped growing, 30 s sample with no profiler attached, closed through the window so the cache is
+written. Build: the working tree that became `a759712` (the window title says `f15ab28-dirty`).
+
+| run | FPS | ms a frame | GPU busy | GPU power | CPU cores |
+| --- | --- | --- | --- | --- | --- |
+| A, defaults | **3.93** | 254.4 | 17.6% | 83.9 W | 10.50 |
+| B, `--gpu-indirect true --bda-async-protect true --gpu-submit-interval 16` | **3.93** | 254.5 | 15.8% | 82.6 W | 11.30 |
+
+**No difference: 0.1 ms a frame of 254, B/A = 0.9995.** Replay predicted about 7.7 ms a frame in
+B's favour -- 3.2 (indirect dispatch) + 1.5 (async protect, projected from the syscall count) + 3.2
+(periodic submits) -- that is 86 ms down to 78. The flags were in effect: the console log lists the
+design P helper thread (`affinity: derived -> Thread_BdaProtect`) in B and not in A.
+
+**But the pair does not test that prediction, because the scene did not run at 86 ms.** It ran at
+254 ms a frame, three times the 86 ms the same protocol measured on the build of September 11
+([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Re-baselined on the build of September 11").
+Three things say where that factor of three is not:
+
+- **Not the binary's render path.** The same binary replays nexus-6 at **72.91 ms/loop gpu** median
+  (73.95 ms/loop, 14 drains, 10 248 syncs), which is the 71.80 / 73.74 this document records for
+  `--gpu-indirect false` on this build. Report in `.../day-2026-09-12/replay-check/`.
+- **Not the window or the compositor.** Minimising the game window and restoring it changed
+  nothing: 3.93 fps visible, 3.93 fps minimised, 3.93 fps restored, 118 frames in each 30 s.
+- **Not the scene, the save or the warm-up.** The screenshots are the parked Nexus at the archstone
+  in the framing of `scan-breakdown/gd-true-warm.png`, and both runs ended on a
+  `pipeline cache: saved ... (0 new pipelines)`.
+
+The one recorded difference from every previous game number is the **session type**: the September
+11 re-baseline and the September 12 scan breakdown were taken over Remote Desktop, these two on the
+local console session (`query session`: `console dudu 1 Active`). The protocol already says samples
+from the two are not comparable ([reaching-the-nexus.md](reaching-the-nexus.md), "Measuring"), and
+this is the first pair taken on the console. The boot differs the same way: the opening cinematic
+ran at 4 fps and took about thirteen minutes of wall clock to reach the point the navigation skips
+from, against about sixty seconds at 60 fps under Remote Desktop, so the navigation waits had to be
+stretched. Per second the process burns the same CPU as the re-baseline (10.5 to 11.3 cores against
+12.6) and less GPU (83 W against 123 W); it is the frames that are three times rarer.
+
+So the three levers are **unmeasured end-to-end**, not refuted. What this run settles is that the
+game on the console session is not the 86 ms frame the replay bench and every projection in this
+document are calibrated against, and the pair has to be repeated over Remote Desktop -- or the
+console/Remote Desktop gap itself explained -- before `--gpu-indirect`, `--bda-async-protect` and
+`--gpu-submit-interval` can be turned on for Demon's Souls.
+
+Artifacts: `_Runtime/_Diagnostics/replay/e2e-rebaseline/day-2026-09-12/` --
+`a-defaults.json` / `b-flags.json` (the samples), `*-console.log`, `*-phase.log` (the driven
+protocol, timestamped), `*-after-nav.png` and `*-warm.png` (the scene), `replay-check/` (the
+replay-bench sanity check). Scripts: `_Build/e2e-phase.ps1` drives one phase of a run against an
+already-running emulator, which is how these two were paced; the detached launcher of
+`_Build/scan-breakdown-run.ps1` does not survive the tool session that starts it.
+
 
 ### 2. Finish stage 1 of GPU-side descriptor fetch
 

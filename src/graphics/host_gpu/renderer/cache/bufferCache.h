@@ -46,6 +46,9 @@ public:
 	// drained and its last batch to have landed, so the scan that follows re-uploads every page
 	// it protected. One relaxed load when the setting is off.
 	void                   DrainAsyncProtect() { m_memory_tracker.DrainAsyncProtect(); }
+	[[nodiscard]] bool     AsyncProtectEnabled() const noexcept {
+		return m_memory_tracker.AsyncProtectEnabled();
+	}
 	// Frame replay (docs/frame-replay.md): re-marks a range as CPU-written, the state the game's
 	// page faults leave behind, so a replay loop exercises the same dirty-upload path.
 	void                   MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);

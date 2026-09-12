@@ -33,14 +33,18 @@ public:
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	// Design P (docs/bda-sync-design.md): the submission boundary waits here for the
-	// re-protection helper to have drained and its last batch to have landed.
-	void               DrainAsyncProtect() { m_buffer_cache.DrainAsyncProtect(); }
+	// re-protection helper to have drained and its last batch to have landed, then scans once so
+	// every landed page is uploaded again before the submission's first draw.
+	void               AsyncProtectBoundary();
 	void               RunGarbageCollector();
 
 private:
 	friend struct GpuResourceManagerTestAccess;
 	[[nodiscard]] bool BdaScanRequired(uint64_t buffer_generation,
 	                                   uint64_t mapped_generation) const noexcept;
+	// The scan body, with m_mapped_ranges_mutex held.
+	void               ScanBda(uint64_t buffer_generation, uint64_t mapped_generation,
+	                           bool record = true);
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;

@@ -1587,6 +1587,8 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 			async_per_loop.drains += field(&AsyncProtectCounters::drains);
 			async_per_loop.waits += field(&AsyncProtectCounters::waits);
 			async_per_loop.wait_ns += field(&AsyncProtectCounters::wait_ns);
+			async_per_loop.boundary_scans += field(&AsyncProtectCounters::boundary_scans);
+			async_per_loop.boundary_scan_ns += field(&AsyncProtectCounters::boundary_scan_ns);
 		}
 		writer_pre_wait_ns_per_loop += mean_of(frame_writer_pre_wait_ns[i]);
 		writer_wait_ns_per_loop += mean_of(frame_writer_wait_ns[i]);
@@ -1639,6 +1641,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		         static_cast<unsigned long long>(async_per_loop.waits),
 		         static_cast<unsigned long long>(async_per_loop.drains),
 		         static_cast<double>(async_per_loop.wait_ns) / 1000.0);
+		::printf("                 %llu forced scans at those boundaries, %.0f us a loop\n",
+		         static_cast<unsigned long long>(async_per_loop.boundary_scans),
+		         static_cast<double>(async_per_loop.boundary_scan_ns) / 1000.0);
 	}
 	::printf("  drains         %llu a loop of %llu GPU-range syncs (readbacks on the render thread)\n",
 	         static_cast<unsigned long long>(drains_per_loop),
@@ -1769,6 +1774,9 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 		report << "  \"async_boundary_drains\": " << async_per_loop.drains << ",\n";
 		report << "  \"async_boundary_waits\": " << async_per_loop.waits << ",\n";
 		report << "  \"async_boundary_wait_us\": " << async_per_loop.wait_ns / 1000 << ",\n";
+		report << "  \"async_boundary_scans\": " << async_per_loop.boundary_scans << ",\n";
+		report << "  \"async_boundary_scan_us\": " << async_per_loop.boundary_scan_ns / 1000
+		       << ",\n";
 		report << "  \"drains_per_loop\": " << drains_per_loop << ",\n";
 		report << "  \"syncs_per_loop\": " << syncs_per_loop << ",\n";
 		report << "  \"frame_drains\": [";

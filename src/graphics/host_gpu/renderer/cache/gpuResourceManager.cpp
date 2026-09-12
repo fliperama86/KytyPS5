@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/replay/frameCapture.h"
@@ -102,9 +103,40 @@ void GpuResourceManager::PrepareBda() {
 		Replay::RecordPrepareEvent(Replay::PrepareSample {});
 		return;
 	}
+	ScanBda(buffer_generation, mapped_generation);
+}
+
+// Design P (docs/bda-sync-design.md), the submission boundary: wait for the re-protection helper
+// to have drained, then scan once so every page it protected is uploaded again and clean before
+// the submission's first draw. The scan is forced rather than driven by a generation bump,
+// because a landing does not otherwise need a scan of its own -- a draw of this submission may
+// only read what the guest wrote before it was submitted, and anything written after a page's
+// upload is later than that. Called with the scheduler already recording.
+void GpuResourceManager::AsyncProtectBoundary() {
+	if (!m_buffer_cache.AsyncProtectEnabled()) {
+		return;
+	}
+	m_buffer_cache.DrainAsyncProtect();
+	const auto started = std::chrono::steady_clock::now();
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		ScanBda(m_buffer_cache.BdaGeneration(), m_mapped_generation, false);
+	}
+	RecordAsyncProtectBoundaryScan(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                              std::chrono::steady_clock::now() - started)
+	                              .count()));
+}
+
+// The scan itself, with m_mapped_ranges_mutex held. PrepareBda reaches it when a generation moved;
+// the submission boundary forces it.
+void GpuResourceManager::ScanBda(uint64_t buffer_generation, uint64_t mapped_generation,
+                                 bool record) {
 	// The scan is timed only while a capture or a replay is watching, so a normal run pays one
-	// relaxed load and no clock reads.
-	const bool watched = Replay::PrepareEventsWatched();
+	// relaxed load and no clock reads. A boundary scan is not recorded: the stream it would go
+	// into is the game's own preparation timeline, which a replay is measured against, and the
+	// boundary's scans have their own counters.
+	const bool watched = record && Replay::PrepareEventsWatched();
 	const auto started = watched ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const auto protect_calls_before = watched ? PageProtectThreadCallCount() : 0;
 	const auto protect_pages_before = watched ? PageProtectThreadPageCount() : 0;

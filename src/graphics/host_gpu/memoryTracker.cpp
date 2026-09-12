@@ -28,6 +28,8 @@ std::atomic_uint64_t g_extra_uploads {0};
 std::atomic_uint64_t g_drains {0};
 std::atomic_uint64_t g_waits {0};
 std::atomic_uint64_t g_wait_ns {0};
+std::atomic_uint64_t g_boundary_scans {0};
+std::atomic_uint64_t g_boundary_scan_ns {0};
 
 } // namespace
 
@@ -45,6 +47,8 @@ AsyncProtectCounters ReadAsyncProtectCounters() noexcept {
 	counters.drains               = g_drains.load(std::memory_order_relaxed);
 	counters.waits                = g_waits.load(std::memory_order_relaxed);
 	counters.wait_ns              = g_wait_ns.load(std::memory_order_relaxed);
+	counters.boundary_scans       = g_boundary_scans.load(std::memory_order_relaxed);
+	counters.boundary_scan_ns     = g_boundary_scan_ns.load(std::memory_order_relaxed);
 	return counters;
 }
 
@@ -61,6 +65,13 @@ void ResetAsyncProtectCounters() noexcept {
 	g_drains.store(0, std::memory_order_relaxed);
 	g_waits.store(0, std::memory_order_relaxed);
 	g_wait_ns.store(0, std::memory_order_relaxed);
+	g_boundary_scans.store(0, std::memory_order_relaxed);
+	g_boundary_scan_ns.store(0, std::memory_order_relaxed);
+}
+
+void RecordAsyncProtectBoundaryScan(uint64_t ns) noexcept {
+	g_boundary_scans.fetch_add(1, std::memory_order_relaxed);
+	g_boundary_scan_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 // The helper thread of design P. It owns nothing: the pages it protects live in the regions the

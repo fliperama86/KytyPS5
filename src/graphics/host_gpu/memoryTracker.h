@@ -36,10 +36,14 @@ struct AsyncProtectCounters {
 	uint64_t drains               = 0; // submission boundaries that asked for a drain
 	uint64_t waits                = 0; // of those, the ones that had to wait
 	uint64_t wait_ns              = 0;
+	uint64_t boundary_scans       = 0; // forced BDA scans at those boundaries
+	uint64_t boundary_scan_ns     = 0;
 };
 
 [[nodiscard]] AsyncProtectCounters ReadAsyncProtectCounters() noexcept;
 void                               ResetAsyncProtectCounters() noexcept;
+// What the forced scan at a submission boundary cost, counted by the resource manager.
+void                               RecordAsyncProtectBoundaryScan(uint64_t ns) noexcept;
 
 // The landed runs of one helper batch, handed to the buffer cache so it can put them back in the
 // BDA dirty set and move the generation once for the whole batch.

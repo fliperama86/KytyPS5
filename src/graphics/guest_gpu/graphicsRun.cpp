@@ -674,14 +674,6 @@ bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto& cp = GetProcessor(submission.queue_id);
 
-	// Design P (docs/bda-sync-design.md), the submission boundary. Draws of a submission may read
-	// only what the guest wrote before submitting it, so before any of them is recorded the
-	// asynchronous re-protection helper must have drained: every page it protected is then back in
-	// the BDA dirty set with the generation moved, and the submission's first scan -- or the first
-	// bind of the buffer that holds it -- uploads it a second time. A slice resumed after a
-	// WAIT_REG_MEM drains again, because the guest wrote whatever the wait was for in between.
-	// A no-op and one relaxed load with the setting off.
-	m_renderer.GetGpuResources().DrainAsyncProtect();
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -699,6 +691,16 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	cp.BufferInit();
+
+	// Design P (docs/bda-sync-design.md), the submission boundary. Draws of a submission may read
+	// only what the guest wrote before submitting it, so before any of them is recorded the
+	// asynchronous re-protection helper must have drained and the pages it protected must have
+	// been uploaded again. A slice resumed after a WAIT_REG_MEM passes here too, because the
+	// guest wrote whatever the wait was for in between. After BufferInit, which is what makes the
+	// scheduler ready to record the scan's copies. A no-op and one relaxed load with the setting
+	// off.
+	m_renderer.GetGpuResources().AsyncProtectBoundary();
+
 	bool complete = true;
 
 	switch (submission.type) {

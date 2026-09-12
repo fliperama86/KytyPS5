@@ -882,9 +882,12 @@ void BufferCache::OnAsyncProtectLanded(const GuestRange* landed, size_t count) {
 			}
 		}
 	}
-	// One bump for the batch: it is what forces the next PrepareBda to scan, and the submission
-	// boundary waits for this to have happened before the first draw that could read the pages.
-	BumpBdaGeneration();
+	// No generation bump. A landing does not need a scan of its own: any scan or bind that later
+	// covers a landed page uploads it again, and the submission boundary drains the helper and
+	// forces one scan, so every page is protected and clean before a submission's first draw.
+	// Writes between a page's upload and that boundary belong to no draw the submission may read
+	// them from, which is the console's own rule (docs/bda-sync-design.md, submission boundary).
+	// Bumping per landing cost 83 extra scans a loop and bought nothing.
 }
 
 void BufferCache::ForgetBdaRange(uint64_t vaddr, uint64_t size) {

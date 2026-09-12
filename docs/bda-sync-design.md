@@ -1,6 +1,7 @@
 # Copy-free BDA sync (roadmap item 2, first half)
 
-Status, September 12, 2026: design written, step 0 (writer imitation in replay) in progress.
+Status, September 12, 2026: design written; step 0 done (partial reproduction, see its result);
+step 0b (scan breakdown in the game) in progress.
 Companion to [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md) ("What stage 1 needs to pay
 off", point 2) and [performance-roadmap.md](performance-roadmap.md) item 2.
 
@@ -52,6 +53,22 @@ cost and every design below can be judged in seconds. If it does not, the next s
 contention with guest threads inside the tracker (`RegionManager::lock`) or the kernel calls
 under real guest load, and the measurement that settles it is sub-zones inside the scan
 (`memcpy`, protect, lock) recorded into the capture's prepare events by one game run.
+
+### Step 0 result, September 12
+
+The writer imitation ([frame-replay.md](frame-replay.md), "Writer imitation") raises a scan from
+4.0 us to 9.3 us with the writer on the guest CPUs and to 8.7 us with it on the render CPUs;
+twelve spinners on top take it to 12.1 us. Reports in
+`_Runtime/_Diagnostics/replay/nexus-6/runs-20260912-012758` and `runs-20260912-012958`.
+So fresh lines in another core's cache are real and worth about 5 us a scan, the die boundary
+adds under 1 us, and about 14 us of the game's 26.8 us are still unexplained. Two candidates
+the imitation does not cover: the guest writing the same page *while* the scan copies it (true
+sharing, which costs far more per line than a one-time fetch; the game's bump allocators keep
+writing the page the last draw dirtied), and the re-protection kernel calls or the tracker lock
+under real guest load. The decisive measurement is the breakdown of the scan inside the game:
+Tracy sub-zones for the tracker walk (lock and protect), the copy and the record, one warm run
+with `--gpu-descriptors true`. That is step 0b; the design choice below waits for it, because E
+only helps if the copy is where the time goes.
 
 ## Designs
 

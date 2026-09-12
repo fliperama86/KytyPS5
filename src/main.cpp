@@ -78,6 +78,13 @@ static void PrintUsage() {
 	         "                                       Default: false.\n");
 	::printf("  --gpu-indirect-draws <true|false>    The same for indirect draws. Measures\n"
 	         "                                       neutral in replay. Default: false.\n");
+	::printf("  --gpu-readback-producer-wait <t|f>   A readback the render thread takes waits\n"
+	         "                                       only for the submission that produced the\n"
+	         "                                       page, on its own command buffer, instead of\n"
+	         "                                       draining the whole queue. Default: false.\n");
+	::printf("  --gpu-readback-diagnostics <t|f>     Count and time the render thread's read\n"
+	         "                                       faults and record their producers.\n"
+	         "                                       Default: false.\n");
 	::printf("  --bda-async-protect <true|false>     Re-protect the pages a BDA scan uploads on\n"
 	         "                                       a helper thread instead of the render\n"
 	         "                                       thread, and upload each page once more\n"
@@ -377,6 +384,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu-indirect-draws") {
 			if (!ParseBool(value, options.config.gpu_indirect_draws_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-readback-producer-wait") {
+			if (!ParseBool(value, options.config.gpu_readback_producer_wait_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-readback-diagnostics") {
+			if (!ParseBool(value, options.config.gpu_readback_diagnostics_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

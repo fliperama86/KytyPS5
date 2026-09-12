@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
 #include <condition_variable>
 #include <mutex>
 
@@ -41,6 +42,15 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+
+	// Item 1b (docs/performance-roadmap.md): a readback recorded on its own command buffer and
+	// submitted on the graphics queue behind the producer's tick alone, instead of Finish()'s
+	// drain of everything the render thread has recorded since the last one. The caller owes the
+	// ordering argument: every write to the copied range must belong to a submission at or before
+	// wait_tick. It blocks until the copy has run, so nothing it records later can overtake it.
+	[[nodiscard]] bool ReadbackReady() const noexcept;
+	vk::CommandBuffer  BeginReadback();
+	void               SubmitReadbackAndWait(uint64_t wait_tick);
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -83,6 +93,7 @@ private:
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void CreateReadbackResources();
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
@@ -97,6 +108,18 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+
+	// Readback submissions (item 1b). Their own pool and their own timeline, so nothing the
+	// master timeline promises about m_command_pool's recycling is disturbed: a value signalled
+	// here says nothing about the graphics ticks. One readback is in flight at a time, because
+	// the render thread blocks on it.
+	static constexpr size_t                    ReadbackBuffers = 2;
+	vk::CommandPool                            m_readback_pool = nullptr;
+	std::array<vk::CommandBuffer, ReadbackBuffers> m_readback_commands {};
+	vk::Semaphore                              m_readback_semaphore = nullptr;
+	uint64_t                                   m_readback_value     = 0;
+	size_t                                     m_readback_index     = 0;
+	vk::CommandBuffer                          m_readback_open      = nullptr;
 };
 
 } // namespace Libs::Graphics

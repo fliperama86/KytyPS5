@@ -170,6 +170,15 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
                       uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
                       vk::AccessFlags destination_before, vk::AccessFlags source_after,
                       vk::AccessFlags destination_after) {
+	command.EndRendering();
+	CopyFrom(command.Handle(), source, source_offset, destination_offset, size, source_before,
+	         destination_before, source_after, destination_after);
+}
+
+void Buffer::CopyFrom(vk::CommandBuffer native, const Buffer& source, uint64_t source_offset,
+                      uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
+                      vk::AccessFlags destination_before, vk::AccessFlags source_after,
+                      vk::AccessFlags destination_after) {
 	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
 	    destination_offset > Size() || size > Size() - destination_offset) {
 		EXIT("Buffer: invalid copy range\n");
@@ -178,7 +187,6 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    destination_offset < source_offset + size) {
 		EXIT("Buffer: overlapping self-copy\n");
 	}
-	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {
 	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
 	    Barrier(destination_offset, size, destination_before, vk::AccessFlagBits::eTransferWrite),
@@ -188,7 +196,6 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	const auto native = command.Handle();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};

@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/readbackDiagnostics.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
@@ -1342,6 +1343,7 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	uint64_t late_events = 0;
 
 	for (uint32_t loop = 0; loop < loops; loop++) {
+		ReadbackDiag::SetLoop(loop + 1);
 		double loop_total = 0.0;
 		double gpu_total  = 0.0;
 		for (size_t index = 0; index < frame_count; index++) {
@@ -1897,6 +1899,10 @@ int RunReplay(const std::filesystem::path& dir, uint32_t loops, uint32_t frames_
 	} else {
 		::printf("  report         could not write %s\n", report_path.string().c_str());
 	}
+
+	// Item 1b (docs/performance-roadmap.md): the render thread read faults, one line and one
+	// JSON file beside the report. Inert without --gpu-readback-diagnostics.
+	ReadbackDiag::Dump(dir / "readback-faults.json");
 
 	// 6. Presented images: one per frame of the last loop, plus <path> itself for the last of
 	// them, which is what --replay-image wrote when a capture held a single frame.

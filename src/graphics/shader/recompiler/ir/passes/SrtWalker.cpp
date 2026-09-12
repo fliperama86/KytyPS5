@@ -4,6 +4,7 @@
 #if defined(TRACY_ENABLE)
 #include "common/profiler.h"
 #endif
+#include "graphics/host_gpu/renderer/cache/readbackDiagnostics.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -2540,8 +2541,21 @@ public:
 	void Run(uint32_t count) {
 		const auto* insts = m_program.Insts();
 		const auto* wide  = m_program.Wide();
+		// Item 1b (docs/performance-roadmap.md): with the readback diagnostics on, leave the
+		// current position where a read fault can find it. Off, it is one hoisted branch.
+		const bool  diagnose = ReadbackDiag::Enabled();
+		auto&       evaluation = ReadbackDiag::Current();
 		for (uint32_t index = 0; index < count; index++) {
 			const auto& inst  = insts[index];
+			if (diagnose) {
+				// The schedule is one array split at source_prefix: descriptor sources first,
+				// then the flat reads.
+				evaluation.kind = (inst.info & SrtPackedInst::Clean) != 0u
+				                      ? ReadbackDiag::RootKind::CleanRead
+				                  : index < m_program.source_prefix
+				                      ? ReadbackDiag::RootKind::Source
+				                      : ReadbackDiag::RootKind::FlatRead;
+			}
 			const auto  count_args = static_cast<uint32_t>(inst.info & SrtPackedInst::ArgMask);
 			uint8_t     failed     = 0;
 			for (uint32_t position = 0; position < count_args; position++) {
@@ -2663,6 +2677,9 @@ bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> s
 	if (g_chase_enabled.load(std::memory_order_relaxed)) {
 		RecordWalkerEvent();
 	}
+	if (ReadbackDiag::Enabled()) {
+		ReadbackDiag::Current().form = ReadbackDiag::EvalForm::Walker;
+	}
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
 	std::array<std::byte, 4096> evaluator_storage;
@@ -2765,6 +2782,11 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
 	KYTY_PROFILER_BLOCK("SrtEval::Prepare");
 #endif
 	const auto&        flat = program.flat;
+	if (ReadbackDiag::Enabled()) {
+		auto& evaluation = ReadbackDiag::Current();
+		evaluation.form  = ReadbackDiag::EvalForm::Flat;
+		evaluation.kind  = ReadbackDiag::RootKind::Condition;
+	}
 	FlatRegistersLease lease;
 	FlatMachine        machine(flat, runtime, lease.registers);
 
@@ -2812,6 +2834,9 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
 #if defined(TRACY_ENABLE)
 		KYTY_PROFILER_BLOCK("SrtEval::Sources");
 #endif
+		if (ReadbackDiag::Enabled()) {
+			ReadbackDiag::Current().kind = ReadbackDiag::RootKind::Source;
+		}
 		auto& evaluated = scratch.evaluated;
 		evaluated.clear();
 		evaluated.reserve(sources.size());
@@ -2842,6 +2867,9 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
 #if defined(TRACY_ENABLE)
 		KYTY_PROFILER_BLOCK("SrtEval::Slots");
 #endif
+		if (ReadbackDiag::Enabled()) {
+			ReadbackDiag::Current().kind = ReadbackDiag::RootKind::FlatRead;
+		}
 		auto& flattened = scratch.flattened;
 		flattened.clear();
 		if (evaluate_flat) {
@@ -2882,6 +2910,9 @@ bool EvaluateWithPackedProgram(const ResourcePlan& program, std::span<const uint
 		KYTY_PROFILER_BLOCK("SrtEval::Prepare");
 #endif
 		const auto&        packed = program.flat.packed;
+	if (ReadbackDiag::Enabled()) {
+		ReadbackDiag::Current().form = ReadbackDiag::EvalForm::Packed;
+	}
 	FlatRegistersLease lease;
 	PackedMachine      machine(packed, runtime, lease.registers);
 	auto&              active = scratch.active;
@@ -2982,6 +3013,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 #if defined(TRACY_ENABLE)
 	KYTY_PROFILER_BLOCK("EvaluateRuntimeSourcesImpl");
 #endif
+	// Item 1b (docs/performance-roadmap.md): name the evaluation a read fault lands inside.
+	const ReadbackDiag::EvaluationScope diagnostic_scope(program.shader_hash,
+	                                                     static_cast<uint32_t>(program.stage));
 	// Nested use cannot happen today (materialization calls this sequentially), but fall back to
 	// local buffers rather than aliasing the scratch if that ever changes.
 	static thread_local SourceScratch thread_scratch;

@@ -95,6 +95,14 @@ bool GpuIndirectDrawsEnabled() {
 	return g_config->gpu_indirect_draws_enabled;
 }
 
+bool GpuReadbackProducerWaitEnabled() {
+	return g_config->gpu_readback_producer_wait_enabled;
+}
+
+bool GpuReadbackDiagnosticsEnabled() {
+	return g_config->gpu_readback_diagnostics_enabled;
+}
+
 bool BdaAsyncProtectEnabled() {
 	return g_config->bda_async_protect_enabled;
 }

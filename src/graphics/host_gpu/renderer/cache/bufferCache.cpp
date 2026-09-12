@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/readbackDiagnostics.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -15,6 +16,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -146,7 +148,59 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 	return {begin, end - begin};
 }
 
-void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
+void BufferCache::RecordGpuWriteTick(uint64_t vaddr, uint64_t size, uint64_t tick) noexcept {
+	if (size == 0) {
+		return;
+	}
+	const auto first = vaddr >> GpuWriteBlockBits;
+	const auto last  = (vaddr + size - 1) >> GpuWriteBlockBits;
+	if (last - first >= GpuWriteBlockLimit) {
+		// Too wide to record one block at a time. Nothing below may then be believed to be the
+		// last writer unless it is at least as new as this.
+		m_wide_gpu_write_tick = std::max(m_wide_gpu_write_tick, tick);
+		return;
+	}
+	for (auto block = first; block <= last; block++) {
+		auto& slot = m_gpu_write_ticks[block & (GpuWriteSlots - 1)];
+		slot.block = block;
+		slot.tick  = tick;
+	}
+}
+
+uint64_t BufferCache::FindGpuWriteTick(std::span<const DownloadCopy> copies,
+                                       uint32_t* reason) const noexcept {
+	const auto fail = [reason](uint32_t why) {
+		if (reason != nullptr) {
+			*reason = why;
+		}
+		return uint64_t {0};
+	};
+	uint64_t newest = 0;
+	for (const auto& copy: copies) {
+		if (copy.size == 0) {
+			continue;
+		}
+		const auto first = copy.address >> GpuWriteBlockBits;
+		const auto last  = (copy.address + copy.size - 1) >> GpuWriteBlockBits;
+		if (last - first >= GpuWriteBlockLimit) {
+			return fail(1);
+		}
+		for (auto block = first; block <= last; block++) {
+			const auto& slot = m_gpu_write_ticks[block & (GpuWriteSlots - 1)];
+			if (slot.block != block) {
+				return fail(2);
+			}
+			newest = std::max(newest, slot.tick);
+		}
+	}
+	if (newest == 0) {
+		return fail(3);
+	}
+	return newest < m_wide_gpu_write_tick ? fail(4) : newest;
+}
+
+void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies,
+                                       uint64_t producer_tick) {
 	std::vector<DownloadCopy> batch;
 	batch.reserve(copies.size());
 	uint64_t                  packed_size = 0;
@@ -154,20 +208,58 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	const auto flush = [&] {
 		const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
 		EXIT_IF(mapped == nullptr);
-		uint64_t cursor = 0;
-		for (const auto& copy: batch) {
-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
-			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
-			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-			                  vk::AccessFlagBits::eHostRead);
-			cursor += AlignDownload(envelope_size);
+		// Item 1b (docs/performance-roadmap.md): the caller vouched for the producer, so the copy
+		// can go on its own command buffer, behind the producer's tick alone. The render thread
+		// blocks on that submission before it can hand the queue anything else, so nothing
+		// overtakes the copy, and the work recorded since the last drain stays in the open
+		// command buffer, unsubmitted -- which is the whole saving.
+		const bool own_submission = producer_tick != 0 && m_scheduler.ReadbackReady();
+		const auto wait_start     = ReadbackDiag::Enabled()
+		                                ? std::chrono::steady_clock::now()
+		                                : std::chrono::steady_clock::time_point {};
+		if (own_submission) {
+			const auto native = m_scheduler.BeginReadback();
+			uint64_t   offset = 0;
+			for (const auto& copy: batch) {
+				const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+				download.CopyFrom(native, *copy.buffer, source_begin, base_offset + offset,
+				                  envelope_size, vk::AccessFlagBits::eMemoryWrite,
+				                  vk::AccessFlags {},
+				                  vk::AccessFlagBits::eMemoryRead |
+				                      vk::AccessFlagBits::eMemoryWrite,
+				                  vk::AccessFlagBits::eHostRead);
+				offset += AlignDownload(envelope_size);
+			}
+			download.Commit();
+			m_scheduler.SubmitReadbackAndWait(producer_tick);
+			// The ordering Finish() gives, over the ticks this copy depends on: a deferred
+			// writeback registered at or before the producer lands before these bytes are read.
+			m_scheduler.WaitPriorityOperations(producer_tick);
+		} else {
+			uint64_t offset = 0;
+			for (const auto& copy: batch) {
+				const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+				download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin,
+				                  base_offset + offset, envelope_size,
+				                  vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+				                  vk::AccessFlagBits::eMemoryRead |
+				                      vk::AccessFlagBits::eMemoryWrite,
+				                  vk::AccessFlagBits::eHostRead);
+				offset += AlignDownload(envelope_size);
+			}
+			download.Commit();
+			const auto completion_tick = m_scheduler.CurrentTick();
+			m_scheduler.Finish();
+			m_scheduler.WaitPriorityOperations(completion_tick);
 		}
-		download.Commit();
-		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.Finish();
-		m_scheduler.WaitPriorityOperations(completion_tick);
-		cursor = 0;
+		if (ReadbackDiag::Enabled()) {
+			ReadbackDiag::NoteWait(static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(
+			        std::chrono::steady_clock::now() - wait_start)
+			        .count()));
+			ReadbackDiag::NoteOwnSubmission(own_submission);
+		}
+		uint64_t cursor = 0;
 		for (const auto& copy: batch) {
 			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
 			const auto offset = cursor + copy.source_offset - source_begin;
@@ -217,6 +309,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	ReadbackDiag::Enable(Config::GpuReadbackDiagnosticsEnabled());
+	m_track_gpu_write_ticks =
+	    Config::GpuReadbackProducerWaitEnabled() || Config::GpuReadbackDiagnosticsEnabled();
 	// Design P (docs/bda-sync-design.md), before the first region exists: the tracker stops
 	// re-protecting uploaded pages on the render thread and a helper thread does it instead.
 	if (Config::BdaAsyncProtectEnabled()) {
@@ -314,7 +409,31 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		    });
 	    });
 	if (!copies.empty()) {
-		DownloadBufferMemory(copies);
+		// Item 1b: the newest submission that wrote any of these bytes. The readback can leave
+		// the queue alone only when that submission has already retired -- then every write to
+		// the range is on the device, nothing recorded since can touch it (only ObtainBuffer with
+		// is_written claims a range, and it would have moved the tick), and the copy is correct
+		// the moment it runs.
+		uint32_t   reason   = 0;
+		const auto producer = m_track_gpu_write_ticks ? FindGpuWriteTick(copies, &reason) : 0;
+		const bool eligible = producer != 0 && producer < m_scheduler.CurrentTick() &&
+		                      m_scheduler.ReadbackReady() && m_scheduler.IsFree(producer);
+		const bool producer_wait = eligible && Config::GpuReadbackProducerWaitEnabled();
+		if (ReadbackDiag::Enabled()) {
+			uint64_t bytes = 0;
+			for (const auto& copy: copies) {
+				bytes += copy.size;
+				ReadbackDiag::NoteDownloadRange(copy.address, copy.size);
+			}
+			// The diagnostics keep an exact producer map of their own, so the two answers can be
+			// compared: this is what the table above would say with unbounded room.
+			const auto exact = ReadbackDiag::PendingProducerTick();
+			ReadbackDiag::NoteDownloadTotals(bytes, copies.size(), m_scheduler.CurrentTick(),
+			                                 GuestGpu::Progress(),
+			                                 exact != 0 && m_scheduler.IsFree(exact));
+			ReadbackDiag::NoteEligible(eligible, reason);
+		}
+		DownloadBufferMemory(copies, producer_wait ? producer : 0);
 		// The enumeration covered whole dirty pages and every exact interval on them.
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
@@ -554,6 +673,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		if (m_track_gpu_write_ticks) {
+			RecordGpuWriteTick(vaddr, size, m_scheduler.CurrentTick());
+		}
+		if (ReadbackDiag::Enabled()) {
+			// Item 1b: which submission and which point of the GPU thread's work last claimed
+			// this range, so a later read fault can name its producer.
+			ReadbackDiag::NoteGpuWrite(vaddr, size, m_scheduler.CurrentTick(),
+			                           GuestGpu::Progress());
+		}
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }

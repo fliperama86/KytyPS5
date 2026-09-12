@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -185,7 +186,10 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
+	// producer_tick != 0 asks for item 1b's path (docs/performance-roadmap.md): the copy goes on
+	// its own command buffer, submitted behind that tick alone, instead of draining everything
+	// the render thread has recorded since the last drain.
+	void DownloadBufferMemory(std::span<const DownloadCopy> copies, uint64_t producer_tick = 0);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 	// The helper thread's landing: the pages it protected go back in the BDA dirty set and the
 	// generation moves once for the whole batch, which is what makes the next scan upload them a
@@ -217,6 +221,29 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Item 1b (docs/performance-roadmap.md): which submission last handed each 64 KiB block to
+	// the GPU for writing. Direct-mapped and lossy on purpose -- a collision evicts the other
+	// block's entry, and a block with no entry disqualifies the readback, so a miss costs the
+	// fast path and never correctness. m_wide_gpu_write_tick is the newest tick of a write too
+	// large to record block by block; a producer older than it cannot be trusted to be the last
+	// writer, so the fast path requires the producer to be at or after it.
+	static constexpr size_t   GpuWriteBlockBits  = 16;
+	static constexpr size_t   GpuWriteSlots      = 16384;
+	static constexpr uint64_t GpuWriteBlockLimit = 8192;
+	struct GpuWriteSlot {
+		uint64_t block = UINT64_MAX;
+		uint64_t tick  = 0;
+	};
+	std::array<GpuWriteSlot, GpuWriteSlots> m_gpu_write_ticks {};
+	uint64_t                                m_wide_gpu_write_tick = 0;
+	// The table is kept only for the two settings that read it, so main pays nothing for it.
+	bool                                    m_track_gpu_write_ticks = false;
+	void     RecordGpuWriteTick(uint64_t vaddr, uint64_t size, uint64_t tick) noexcept;
+	// The newest submission that wrote any part of the range, or 0 when that is not knowable.
+	// reason, when the answer is 0: 1 a copy too wide to look up, 2 a block with no entry,
+	// 3 no block at all, 4 an unrecorded wide write is newer than what the table holds.
+	[[nodiscard]] uint64_t FindGpuWriteTick(std::span<const DownloadCopy> copies,
+	                                       uint32_t* reason = nullptr) const noexcept;
 	std::atomic_uint64_t m_bda_generation {0};
 	// Guest ranges dirtied since the last BDA preparation. Written from any guest thread that
 	// faults or invalidates memory, drained on the GPU thread.

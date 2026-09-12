@@ -81,6 +81,14 @@ struct ConfigOptions {
 	// The draw half of the same item. Separate because it measures neutral in replay: it removes
 	// the argument syncs but pays a buffer-cache lookup per draw instead.
 	bool                   gpu_indirect_draws_enabled = false;
+	// Item 1b of docs/performance-roadmap.md: a readback taken inside an SRT evaluation waits only
+	// for the submission that produced the page, on its own command buffer, instead of draining
+	// everything the render thread has recorded since the last drain.
+	bool                   gpu_readback_producer_wait_enabled = false;
+	// The characterisation behind that item: count the render thread's read faults, time their
+	// download and wait, and record what was being evaluated and which submission produced the
+	// page. Off in every measured run that is not the characterisation itself.
+	bool                   gpu_readback_diagnostics_enabled = false;
 	// Design P of docs/bda-sync-design.md: the memory tracker stops re-protecting the pages a BDA
 	// scan uploads on the render thread and hands them to a helper thread, which protects them in
 	// batches; the next scan uploads each landed page once more. Off, the tracker is unchanged.
@@ -152,6 +160,8 @@ bool                   GpuDescriptorsEnabled();
 bool                   GpuSrtReadsEnabled();
 bool                   GpuIndirectEnabled();
 bool                   GpuIndirectDrawsEnabled();
+bool                   GpuReadbackProducerWaitEnabled();
+bool                   GpuReadbackDiagnosticsEnabled();
 bool                   BdaAsyncProtectEnabled();
 BdaAsyncProtectAffinity GetBdaAsyncProtectAffinity();
 ShaderOptimizationType GetShaderOptimizationType();

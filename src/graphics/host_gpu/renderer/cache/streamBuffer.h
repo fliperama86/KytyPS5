@@ -67,6 +67,13 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
+	// The same copy on a bare command buffer, for a caller that records outside the scheduler's
+	// current one (docs/performance-roadmap.md, item 1b). The wrapper above ends the render pass
+	// first; a bare buffer has none.
+	void CopyFrom(vk::CommandBuffer native, const Buffer& source, uint64_t source_offset,
+	              uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
+	              vk::AccessFlags destination_before, vk::AccessFlags source_after,
+	              vk::AccessFlags destination_after);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.

@@ -662,6 +662,17 @@ between one evaluation of a program and the next -- or is not a wait a prefetch 
 here changes the lever the previous section named: the way to stop paying 1.2 us an event 20 739
 times a loop is to have fewer events, not faster ones.
 
+**Corrected by item 1b of [performance-roadmap.md](performance-roadmap.md), September 12, 2026.**
+The "1.2 us of first touch an event" this section and the one before it rest on is an average over
+every call, and the thing being averaged is a tail. The zone's median call is 321 ns in the game and
+70 ns in replay; 0.53% of the calls take over 5 us and carry 79.8% of the 30 ms a frame, and **every
+one of those is a read fault on a page the GPU wrote**, which sends the render thread into
+`BufferCache::ReadMemory` and a full device drain. There are about ninety of them a loop and they are
+22 to 27 ms of a 73 ms replay loop. That is why the three prefetch experiments came back empty: there
+was no first-touch latency for them to hide. It is also why skipping roots buys nothing -- not
+because the remaining roots share the cache line, but because one of the reads still faults. The
+characterisation, the fix that was built for it and the measurement that parks it are in item 1b.
+
 Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/runs-pf-base/` (the same-session baseline),
 `.../runs-pf-exp1/`, `.../runs-pf-exp2/`, `.../runs-pf-exp3-384/` (the 40-loop benches and their
 images), `.../runs-pf-exp3-smoke/` and `.../runs-pf-exp3-smoke256/` (the 32 MiB and 256 MiB

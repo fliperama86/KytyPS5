@@ -25,7 +25,7 @@ Where the 106 ms goes, by source file, self time:
 
 | File | ms/frame | share | what it is |
 | --- | --- | --- | --- |
-| SrtWalker.cpp | 28.1 | 26% | SRT evaluation on the CPU (`EvaluateRuntimeSourcesImpl`); 1.2 us of its 1.5 us an event is the first touch of the guest SRT pages ([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Packed flat program") |
+| SrtWalker.cpp | 28.1 | 26% | SRT evaluation on the CPU (`EvaluateRuntimeSourcesImpl`). Almost all of it is a tail: 0.53% of the calls carry 79.8% of the zone, and every one of them is a read fault on a GPU-written page that drains the device (item 1b below). The 1.2 us an event that "Packed flat program" in [gpu-descriptor-fetch.md](gpu-descriptor-fetch.md) measured is that tail averaged over every call, not a per-event memory latency |
 | renderDraw.cpp | 13.7 | 13% | per-draw recording: index buffer, shader refresh, depth target, draw |
 | pm4Handlers.cpp | 13.6 | 13% | PM4 packet handlers, indirect argument sync |
 | gpuResourceManager.cpp | 10.7 | 10% | BDA dirty-page sync (`SynchronizeBdaBuffers`), new with stage 1 |
@@ -174,6 +174,199 @@ Not measured: Vulkan validation. `VK_LAYER_KHRONOS_validation` is not installed 
 (`no validation layer: VK_LAYER_KHRONOS_validation` with `--printf-direction Console`), so
 `--vulkan-validation true` silently runs without it. A validation pass is still owed.
 
+### Item 1b: GPU readbacks inside the SRT evaluation
+
+Status, September 12, 2026: **characterised, fixed the only way the fix could work, measured
+neutral, and parked behind `--gpu-readback-producer-wait` (default off).** The cost is real and
+large -- 22 to 27 ms of the parked Nexus's 73 ms replay loop -- but it is the device executing the
+draw the render thread has just recorded, not a wait the readback's shape can shorten.
+
+**What the finding is.** `EvaluateRuntimeSourcesImpl` has a mean of 1.48 us a call and a median of
+321 ns. Its time is a tail, not a rate. In the game capture
+`_Runtime/_Diagnostics/replay/e2e-rebaseline/scan-breakdown/gd-true.tracy` (147 frames, 20 831
+calls a frame, 30.9 ms a frame):
+
+| per-call time | calls a frame | share of the calls | ms a frame | share of the zone |
+| --- | --- | --- | --- | --- |
+| over 5 us | 110.5 | 0.53% | 24.6 | **79.8%** |
+| over 100 us | 33.6 | 0.16% | 19.6 | 63.6% |
+| over 1 ms | 5.6 | 0.03% | 12.8 | 41.6% |
+
+The maximum is 11.5 ms. **100% of the calls over 100 us contain a `PageManager::ProtectCall` on the
+render thread, and that protect is 0.35% of their time** -- the protect is the marker, not the
+cost. Replay reproduces it: in `nexus-6/tracy-prefetch/pf-base-a.tracy` (29 steady-state loops)
+`SrtEval::Execute` is 23.4 ms a loop, 94.5% of it in the 87 calls a loop over 5 us, 36 over 100 us,
+5.6 over 1 ms; 100% of those over 100 us contain a render-thread protect at 0.3% of their time.
+
+So the evaluator is not slow. About ninety times a loop it reads a guest page the GPU wrote, the
+read faults (the page is no-access while GPU-dirty), and `GpuResourceManager::HandleFault`
+(gpuResourceManager.cpp) calls `BufferCache::ReadMemory` -> `ReadMemoryOnGpu` ->
+`DownloadBufferMemory` (bufferCache.cpp), which records the copy on the current command buffer,
+`Finish()`es it and waits: a full CPU-to-GPU drain. It is the mechanism item 1 removed for indirect
+arguments, at 90 a loop instead of 14.
+
+#### The characterisation
+
+`--gpu-readback-diagnostics` ([settings.md](settings.md)) counts and times every read fault the
+render thread takes, and records with each one the shader hash, stage and root kind the evaluator
+was on, the faulting address, the bytes the 512 KiB download window covers, the submission tick and
+the draw-and-dispatch clock (`GuestGpu::Progress`) that produced the page, whether that submission
+had retired (`CommandScheduler::IsFree`), and the wait. It writes `readback-faults.json` beside
+`replay-report.json`. nexus-6, 30 loops, `--gpu-descriptors false`, loop 1 excluded (29 loops,
+2 809 faults):
+
+| | |
+| --- | --- |
+| read faults a loop | **96.9**, all on the render thread |
+| time in `ReadMemory` for them | **26.9 ms a loop**, of which **26.2 ms** is the drain |
+| bytes downloaded | 15.0 MiB a loop; 155 KiB mean a fault, 293 KiB median |
+| distinct pages faulted | **26** (85 distinct faulting addresses) |
+| distinct producer submissions | 2 436 of 2 809 faults |
+
+**Were the producers complete?** No, mostly not:
+
+| producer at the moment of the read | faults a loop | ms a loop | mean | median |
+| --- | --- | --- | --- | --- |
+| already retired | 28.6 (29.5%) | 11.63 | 406 us | 136 us |
+| still pending | 68.2 (70.5%) | 15.31 | 224 us | 86 us |
+| unknown | 0 | | | |
+
+**1 972 of the 1 979 pending producers have `producer_tick == CurrentTick()`**: the draw or dispatch
+that wrote the page is still in the *open, unsubmitted* command buffer. The tick gap between
+producer and read is 0 for 70% of faults (p90 117, max 213), and the draw-and-dispatch clock gap is
+**1 for every decile up to the 70th** (p80 23, p90 341, max 18 903) -- one half-tick, the producer
+is the draw the render thread has just finished recording. The CPU dispatches a shader and reads
+what it wrote a moment later.
+
+That is the whole answer to "how much of the queue is between the producer and the read": nothing
+is *after* the producer, and the entire open command buffer -- about 230 draws, one loop's 22 368
+draws divided by its 97 faults -- is *before* it. A readback that waits for its producer waits for
+all of that, because a command buffer cannot signal in the middle.
+
+**Which shaders and which roots.** By root kind, per loop:
+
+| root kind | faults a loop | ms a loop | producers pending |
+| --- | --- | --- | --- |
+| flat read (`srt_reads`) | 79.9 | 15.73 | 1 885 of 2 316 |
+| descriptor source | 12.0 | 10.30 | 94 of 348 |
+| outside any evaluation | 5.0 | 0.91 | 0 of 145 |
+
+Top shaders by time, per loop:
+
+| shader | stage | faults a loop | ms a loop | producers pending |
+| --- | --- | --- | --- | --- |
+| `0x74e4490fe7af0970` | cs | 48.0 | 5.34 | 1 392 of 1 392 |
+| `0xdc9c7811548c9754` | vs | 7.0 | 3.49 | 94 of 203 |
+| `0x560c7a298b6a497b` | ps | 1.0 | 2.84 | 29 of 29 |
+| `0xd8d85e14931ab3d4` | cs | 1.0 | 2.33 | 29 of 29 |
+| `0xd669aa446e6b6137` | vs | 2.0 | 2.01 | 0 of 58 |
+| `0xebfe7348a8127d63` | cs | 1.0 | 1.38 | 0 of 29 |
+| `0x58d0dca35178894d` | vs | 1.0 | 1.29 | 0 of 29 |
+| `0xfbcf030a4c3f0725` | cs | 0.97 | 0.99 | 0 of 28 |
+| `0x5979d5395f497370` | cs | 1.0 | 0.96 | 0 of 29 |
+| (no evaluation) | - | 5.0 | 0.91 | 0 of 145 |
+
+One compute shader accounts for half the faults, always on a producer it has just dispatched, and
+is cheap each time (111 us); the expensive faults are the rarer ones whose window is a whole
+512 KiB.
+
+#### The fix, and why it does not pay
+
+`--gpu-readback-producer-wait` records the download copy on a **separate command buffer**, submitted
+on the graphics queue waiting on the master timeline at the producer's tick alone and signalling a
+**separate timeline semaphore** of its own (`CommandScheduler::BeginReadback` /
+`SubmitReadbackAndWait`), and the fault handler waits on that submission. The open command buffer
+is left open and unsubmitted, so the render thread stops waiting for the work it recorded since the
+last drain.
+
+The separate timeline matters: the master timeline's value is what recycles pooled command buffers,
+so a readback that signalled it out of order would let `CommandPool::Commit` hand out a buffer that
+is still recording or still running.
+
+Two hazards, and what covers them:
+
+- **The producer's writes must be visible to the copy.** The timeline wait on the producer's tick
+  is the dependency, and the copy's own `vkCmdPipelineBarrier` pair (`Buffer::CopyFrom`, now also
+  available on a bare command buffer) is the memory dependency.
+- **Later recorded work must not overwrite the source before the copy runs.** This is the case the
+  timeline wait does not cover, and in this capture it cannot arise. A range becomes GPU-owned in
+  exactly one place, `ObtainBuffer` with `is_written`, which moves the range's producer tick; so if
+  anything recorded after the producer could write these bytes, the producer tick would be that
+  later submission's and the gate would refuse. The render thread is the only submitter and it
+  blocks on the readback, so nothing can be handed to the queue between the copy's submission and
+  its completion. The path is refused outright unless the newest submission that wrote **every**
+  byte being copied is known and has already retired.
+
+Knowing the producer needs a map. The buffer cache keeps a direct-mapped table of 16 384 entries,
+one per 64 KiB block, written wherever `ObtainBuffer` claims a range for the GPU, plus one scalar
+for a write too wide to record block by block (over 512 MiB; none occur here). A block with no entry
+or an unrecorded wide write newer than the answer refuses the fast path -- a miss costs the fast
+path, never correctness. The table exists only while one of the two settings is on. A first version
+used a single "newest GPU write anywhere" scalar instead and was refused on 663 of the 830 eligible
+faults, which is what the refusal counters in the report are for.
+
+Measured, nexus-6, 40 loops, two repeats, `-Image`, medians of the per-run medians with loop 1
+excluded (`nexus-6/runs-rb-ab/`, images from `nexus-6/runs-rb-image/`):
+
+| `ms/loop gpu` | producer wait off | producer wait on |
+| --- | --- | --- |
+| `--gpu-descriptors false`, min | **71.87 / 71.51** | 71.59 / 71.87 |
+| `--gpu-descriptors false`, median | 74.00 / 73.62 | 74.20 / 73.86 |
+| `--gpu-descriptors true`, min | **75.30** | 75.51 / 75.52 |
+| `--gpu-descriptors true`, median | 78.38 | 78.41 / 79.01 |
+| image vs `reference.png` | R 9.8 G 7.8 B 4.1 | R 9.8 G 7.8 B 4.1 |
+
+**Neutral to 0.3 ms worse**, and the diagnostics say exactly why (`nexus-6/readback/`, 30 loops
+each):
+
+| nexus-6, 29 loops | off | on |
+| --- | --- | --- |
+| read faults a loop | 96.9 | 96.9 |
+| faults on a retired producer | 28.6 a loop, **11.63 ms** | 24.9 a loop, **3.26 ms** |
+| faults on a pending producer | 68.2 a loop, 15.31 ms | 72.0 a loop, **18.03 ms** |
+| own-submission path taken | 0 | 721 of 2 809 |
+
+The fast path does what it was built to do: the faults it takes cost 131 us instead of 406, **6.6 ms
+a loop less**. The loop does not move because that time comes straight back on the other side. Not
+draining leaves the open command buffer longer, and the next fault whose producer sits in it drains
+that longer buffer. The device's work per loop is unchanged, and the render thread is serialised
+against it either way -- about 26 ms of a 73 ms loop is spent waiting for a device that the CPU
+never lets run ahead.
+
+title-2, 40 loops, two repeats (`title-2/runs-rb/`): `ms/loop gpu` median 254.70 / 247.38 off
+against 248.00 / 247.49 on, minimum 11.30 / 11.92 against 11.17 / 11.40. Neutral there too.
+
+#### What this rules out, and what is left
+
+The hard stop in this item's brief fired, in a sharper form than it was written. The producers are
+pending for 70% of the faults, and it is not that most of the queue sits between the producer and
+the read -- nothing does. The producer *is* the last thing recorded, and the whole open command
+buffer sits before it. The wait is the device executing that buffer, and no arrangement of the
+readback's own submission can remove it.
+
+Three things this leaves, in order of how much they would be worth:
+
+- **Do not read it on the CPU at all.** The bytes being faulted on are SRT scalar reads and
+  descriptor sources -- 79.9 of the 96.9 faults a loop are flat reads. A shader that fetches its own
+  descriptors and its own flat slots never asks the CPU for them. That is stage 1b's and stage 3's
+  case, and this measurement is the first one that prices it in device time rather than in
+  evaluator time: 26 ms of a 73 ms loop, against the 0.8% stage 1b moved of the evaluator's own
+  zone. Note that stage 1b is *not* enough on its own -- `--gpu-descriptors true` still takes the
+  same 97 faults a loop, because the host keeps evaluating a program's remaining roots.
+- **Let the device run ahead.** The 26 ms is the device's own work, done in ninety synchronous
+  instalments. Submitting the open command buffer periodically instead of only at a drain would put
+  that work in flight while the render thread records, so a fault would wait for a small tail
+  instead of 230 draws. It does nothing for the median fault, whose producer is the immediately
+  preceding dispatch, but it is the only lever that touches the 70%.
+- **Coalesce the faults.** 96.9 faults a loop land on **26 distinct pages**, and the download
+  already widens to a 512 KiB window. A page read three or four times a loop is being re-dirtied
+  between reads, so widening further would not help; batching the reads a single evaluation makes
+  might.
+
+Artifacts: `_Runtime/_Diagnostics/replay/nexus-6/readback/` (the two characterisation runs and their
+`readback-faults-{off,on}.json`), `.../runs-rb-ab/` (the 40-loop bench), `.../runs-rb-image/` (the
+images and the `--gpu-descriptors true` pair), `_Runtime/_Diagnostics/replay/title-2/runs-rb/`.
+
 ### 2. Finish stage 1 of GPU-side descriptor fetch
 
 Status, September 12, 2026: **both halves are written and measured, neither pays in replay, and
@@ -300,6 +493,15 @@ place once the dispatch download no longer cleans the argument pages, and a Vulk
 which this machine cannot do because `VK_LAYER_KHRONOS_validation` is not installed. Nothing in
 this roadmap is pushed to the fork beyond 0db0ff6. Commits 5df1f8c and earlier on `main` hold
 stage 1 and its diagnostics.
+
+Item 1b, added the same day, changes what the biggest remaining number means. The 26% of the render
+thread in `SrtWalker.cpp` is not evaluation work at all: it is about ninety synchronous device
+drains a loop, taken when the evaluator reads a page the GPU has just written, and 26 ms of a 73 ms
+loop is the device doing work the render thread never lets it start early. The producer-only
+readback built for it is correct and measures neutral, because 70% of those drains wait for a draw
+the render thread has only just recorded. What is left is to stop the CPU reading those bytes
+(stages 1b and 3, now priced in device time) or to stop it recording a whole command buffer before
+submitting any of it.
 
 ## Measurement protocol, corrections
 

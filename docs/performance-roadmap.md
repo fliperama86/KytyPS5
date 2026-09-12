@@ -201,6 +201,12 @@ re-protection after each upload, a TLB shootdown across the guest's threads (5.4
 calls a scan); the copy is 4%. Design and plan: [bda-sync-design.md](bda-sync-design.md), design P
 (re-protection off the render thread).
 
+Design P is implemented behind `--bda-async-protect` (default off) and measured in replay
+([gpu-descriptor-fetch.md](gpu-descriptor-fetch.md), "Design P measured, September 12, 2026"): the
+render thread's upload path makes 0 protect calls with it on against 926 a loop off, the image is
+unchanged in both `--gpu-descriptors` settings, and the projected render-thread saving in the game
+is about 8 ms of a 103 ms frame. The end-to-end A/B has not been run yet.
+
 Expected: about 16 FPS in this scene (projection in the design document).
 
 ### 3. Stages 2 and 3: vertex fetch in-shader, bindless images and samplers

@@ -288,6 +288,88 @@ helper thread) would therefore buy about 1.2 µs of the 28.6; what the scan need
 re-protecting pages it is about to see dirty again, or to batch the re-protection of a whole scan
 into one call instead of 3.7.
 
+#### Design P measured, September 12, 2026
+
+Design P of [bda-sync-design.md](bda-sync-design.md) is implemented behind `--bda-async-protect`
+(default off, [settings.md](settings.md)): the upload path clears a page's CPU-dirty bit, leaves it
+writable (state U) and queues its region; a helper thread protects the batch, marks the pages
+landed and moves the BDA generation once; the next scan or bind that covers a landed page uploads
+it a second time; and every submission waits for the helper to have drained before its first draw.
+
+**Step 1, what the helper will see** (`_Runtime/_Diagnostics/replay/nexus-6/analyse-protect.py`
+over the capture's `dirty-events.bin` and `prepare-events.bin`; one warm frame, 4,039 CPU-dirty
+marks, 474 scans):
+
+| | 4 KiB tracker pages | 16 KiB guest pages |
+| --- | --- | --- |
+| distinct pages dirtied in the frame | **2,816** | 905 |
+| marks a page, mean | 1.43 | 4.46 |
+| marked once | 92.0% | 13.6% |
+| marked twice or three times | 4.8% | 19.2% |
+| marked four times | 0.7% | 57.6% (the four tracker pages of one guest page) |
+| marked more than twelve times | 0.9%, max 178 | 2.2%, max 180 |
+
+Grouping the marks by the scan that follows them gives 464 batches a frame, which is what one
+helper batch would be: **8.55 tracker pages and 3.19 contiguous runs a batch**, so one call per run
+covers 2.68 pages. The runs are short -- 81.9% are a single page, 95.5% are four pages or fewer,
+2.3% are longer than eight (max 1,025). And pages come back quickly: of 1,223 intervals between a
+page's successive marks, 5.8% fall inside the same batch, 30.5% one scan later and 33.7% two, so
+**two thirds of a re-protected page is dirty again within two scans**. That is the case for design
+P in one number: most of the protection the scan pays for is undone almost immediately.
+
+**Step 2, the replay bench.** nexus-6, 40 loops, two repeats of each configuration interleaved,
+`-Image`; reports in `_Runtime/_Diagnostics/replay/nexus-6/runs-p-final/`, the pre-change build's
+baseline in `runs-p-baseline/`, the helper-affinity A/B in `runs-p-affinity/`. Per loop:
+
+| | gd=true, off | gd=true, **on** | gd=false, off | gd=false, **on** |
+| --- | --- | --- | --- | --- |
+| render-thread protect calls, upload path | 926 (1,469 pages) | **0** | 316 (845 pages) | **0** |
+| of which in written uploads, not deferred | -- | 1 | -- | 2 |
+| helper protect calls (pages) | -- | 690 (3,214) | -- | 256 (2,249) |
+| pages a helper call | -- | 4.66 | -- | 8.80 |
+| helper batches | -- | 505 | -- | 159 |
+| pages landed / uploaded a second time | -- | 2,425 / 2,260 | -- | 1,877 / 1,883 |
+| submission-boundary drains / waits / µs | -- | 39 / 1 / 39 | -- | 39 / 1 / 42 |
+| BDA scans | 462 | 545 | 16 | 21 |
+| µs a scan | 4.12 | 7.05 | 44.6 | 77.2 |
+| `ms/loop gpu` median | 78.96 | 83.00 | 73.52 | 76.28 |
+| image vs reference | R 9.8 G 7.8 B 4.1 | **identical** | identical | identical |
+
+The render thread makes **no** `NtProtectVirtualMemory` call in the deferred upload path, which is
+what the design is for. One or two calls a loop remain in *written* uploads, which are not
+deferred: `ForEachUploadRange(is_written = true)` claims the range for the GPU in the same call and
+protects it at no-access either way, so deferring the CPU-side protection there would remove no
+kernel call and would leave the guest free to write bytes the GPU is about to own.
+
+The helper does **fewer** calls than the render thread did -- 690 against 926 with `gd=true` -- over
+more pages, because a batch coalesces across the buffers of several scans, which the render thread
+cannot do; with `gd=false` the batches are larger still (8.8 pages a call).
+
+What the design costs, and the replay measures fairly: 2,260 pages a loop uploaded a second time,
+and 83 more scans a loop (462 to 545) because each landed batch moves the generation. Together they
+take a scan from 4.12 to 7.05 µs and the loop from 78.96 to 83.00 ms. **In replay the setting is a
+loss**, exactly as [bda-sync-design.md](bda-sync-design.md) predicts: a protect call costs about
+1 µs there and 5.4 µs in the game, so the replay pays the design's price without collecting its
+saving.
+
+**The projection for the game.** The game's render thread makes 1,342 protect calls a frame inside
+BDA scans at 5.41 µs, 7.26 ms, and about 3 ms more in the per-bind syncs outside them: about
+**10.3 ms a frame of syscall latency** that design P moves to the helper. Against that it adds the
+extra uploads and extra scans the replay measures at **4.0 ms a loop** (`gd=true`), which the game
+pays as well and probably pays more, because its copies are of freshly written lines (5.4 µs a scan
+in the writer experiment, [frame-replay.md](frame-replay.md)). Net **about 6 ms a frame off the
+render thread**, 103.4 ms to roughly 97, against the design document's estimate of 95. For
+`gd=false` the same arithmetic over a per-bind share that is most of 3.98 ms gives about 2 ms.
+Only the end-to-end A/B settles it.
+
+Off, the build measures as the one before it: `gd=true` 78.11 against 78.19 ms, `gd=false` 74.07
+against 72.76, the second inside its own run-to-run spread of 1.1 ms and not visible in the scan
+path (16 scans, 316 protect calls, 845 pages, 0.72 ms of scan time, all identical).
+
+The helper runs on the guest CPU group, chosen by measurement: guest 83.25 ms/loop gpu against
+render 85.42, for the reason the replay writer is slower on `render` -- that group holds the render
+and presentation threads, and a helper there competes with them for the same logical processors.
+
 ### Stage 2: vertex fetch in-shader
 
 The vertex shader reads vertex data through BDA using the V#s from its own roots, fetch-shader

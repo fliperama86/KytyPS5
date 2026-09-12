@@ -727,6 +727,10 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
+	// --gpu-indirect: guest address of the argument block the device reads the counts from. The
+	// three fields above are zero then; Vulkan takes firstInstance, vertexOffset and firstVertex
+	// out of the same block.
+	uint64_t indirect_args  = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -741,6 +745,12 @@ struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
 	vk::DeviceSize offset = 0;
 	vk::IndexType  type   = vk::IndexType::eUint16;
+};
+
+// The device-resident copy of a GPU-written indirect argument block (--gpu-indirect).
+struct PreparedIndirectArgs {
+	vk::Buffer     buffer = nullptr;
+	vk::DeviceSize offset = 0;
 };
 
 static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer,
@@ -1099,7 +1109,8 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const ShaderVertexInputInfo& vs_input_info, const DrawCallInfo& draw,
-                               const DrawEmitInfo& emit) {
+                               const DrawEmitInfo&         emit,
+                               const PreparedIndirectArgs& indirect_args) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1108,6 +1119,18 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
+			if (emit.indirect_args != 0) {
+				// One command, read by the device. firstIndex, vertexOffset, firstInstance and
+				// both counts come from the block; the index buffer is bound over its whole
+				// INDEX_BUFFER_SIZE range, which is what firstIndex indexes into.
+				EXIT_IF(indirect_args.buffer == nullptr);
+				if (emit.indexed) {
+					vk_buffer.drawIndexedIndirect(indirect_args.buffer, indirect_args.offset, 1, 0);
+				} else {
+					vk_buffer.drawIndirect(indirect_args.buffer, indirect_args.offset, 1, 0);
+				}
+				break;
+			}
 			if (emit.indexed) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      emit.first_instance);
@@ -1117,6 +1140,9 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 			}
 			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
+			// Both legacy forms expand on the CPU from a known count; the command processor keeps
+			// them off the indirect path (CommandProcessor::IndirectDrawUsesGpuArgs).
+			EXIT_IF(emit.indirect_args != 0);
 			if (emit.indexed) {
 				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
 			}
@@ -1125,6 +1151,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 			vk_buffer.draw(4, draw.instance_count, emit.first_vertex, emit.first_instance);
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
+			EXIT_IF(emit.indirect_args != 0);
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
 			for (uint32_t i = 0; i < draw.index_count; i += 4) {
 				if (emit.indexed) {
@@ -1149,6 +1176,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	KYTY_PROFILER_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
+	// A mesh draw turns the index count into a workgroup count on the CPU, so it cannot read the
+	// count from the device. The command processor already refuses the combination on the NGG
+	// shader-stage bit; this is the assertion that says so.
+	EXIT_IF(mesh_active && emit.indirect_args != 0);
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vs_input_info.mesh;
@@ -1183,10 +1214,23 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                        state.ps_active);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
+	PreparedIndirectArgs  indirect_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.name, "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+	}
+	if (emit.indirect_args != 0) {
+		// Read-only: the range is GPU-written, so SynchronizeBuffer uploads nothing over it (only
+		// CPU-dirty bytes are ever uploaded) and the stream fast path is gated off for GPU-modified
+		// ranges. The producer barrier is the global one the writing dispatch already emits;
+		// vkCmdPipelineBarrier cannot be recorded here, inside a dynamic-rendering pass.
+		const uint64_t args_size =
+		    emit.indexed ? 5u * sizeof(uint32_t) : 4u * sizeof(uint32_t);
+		auto [args_buffer, args_offset] =
+		    m_context.GetBufferCache().ObtainBuffer(emit.indirect_args, args_size, false);
+		indirect_binding.buffer = args_buffer->Handle();
+		indirect_binding.offset = args_offset;
 	}
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1279,7 +1323,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetGraphics().RecordShaderCheckpoint(
 		    vk_buffer, state.ps_active ? state.ps_input_info.stage.program->shader_hash
 		                               : state.vs_input_info.stage.program->shader_hash);
-		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit, indirect_binding);
 	}
 
 	if (set_auto_debug) {
@@ -1418,6 +1462,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	emit.vertex_offset = vertex_offset;
 	emit.first_instance =
 	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
+	emit.indirect_args = args.indirect_args;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart, true, true, false);
@@ -1513,6 +1558,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset);
 	emit.first_instance =
 	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
+	emit.indirect_args = args.indirect_args;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false, false,

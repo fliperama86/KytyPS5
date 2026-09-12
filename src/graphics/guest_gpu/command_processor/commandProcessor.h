@@ -103,6 +103,10 @@ public:
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode, uint64_t indirect_args = 0);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
+	// --gpu-indirect: whether the device may read this draw's arguments itself instead of the
+	// render thread downloading them. Everything the CPU takes out of the block today has to
+	// be expressible in the Vulkan indirect command; see the definition for what is not.
+	[[nodiscard]] bool IndirectDrawUsesGpuArgs(bool indexed);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 

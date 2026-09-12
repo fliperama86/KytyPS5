@@ -728,6 +728,12 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	// Optional: only --gpu-indirect needs it, and only when a guest argument block carries a
+	// non-zero start_instance_location. Enabled when the device has it, nothing else changes.
+	device_features.drawIndirectFirstInstance =
+	    supported_features2.features.drawIndirectFirstInstance;
+	graphics.draw_indirect_first_instance_enabled =
+	    supported_features2.features.drawIndirectFirstInstance == VK_TRUE;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;

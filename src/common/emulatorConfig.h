@@ -66,6 +66,9 @@ struct ConfigOptions {
 	// Vulkan consumes indirect draw and dispatch arguments in place instead of the render thread
 	// reading them back from the GPU (docs/performance-roadmap.md, item 1).
 	bool                   gpu_indirect_enabled = false;
+	// The draw half of the same item. Separate because it measures neutral in replay: it removes
+	// the argument syncs but pays a buffer-cache lookup per draw instead.
+	bool                   gpu_indirect_draws_enabled = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	ShaderLogDirection     shader_log_direction        = ShaderLogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -126,6 +129,7 @@ bool                   ShaderLdsWaitcntBarrierEnabled();
 bool                   ShaderStorageImageBoundsCheckEnabled();
 bool                   GpuDescriptorsEnabled();
 bool                   GpuIndirectEnabled();
+bool                   GpuIndirectDrawsEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 ShaderLogDirection     GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();

@@ -34,7 +34,11 @@ VulkanMemoryBarrier MakeShaderWriteDependency() {
 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eColorAttachmentRead |
-	                        vk::AccessFlagBits::eColorAttachmentWrite;
+	                        vk::AccessFlagBits::eColorAttachmentWrite |
+	                        // A shader that writes another draw's or dispatch's arguments; the
+	                        // device reads them itself under --gpu-indirect, and a barrier cannot
+	                        // be recorded per draw inside a dynamic-rendering pass.
+	                        vk::AccessFlagBits::eIndirectCommandRead;
 	return barrier;
 }
 

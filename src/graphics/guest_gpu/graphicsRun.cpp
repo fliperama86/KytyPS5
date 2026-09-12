@@ -1004,12 +1004,97 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+bool CommandProcessor::IndirectDrawUsesGpuArgs(bool indexed) {
+	if (!Config::GpuIndirectDrawsEnabled()) {
+		return false;
+	}
+	CheckBuffer();
+	auto& buffer = CurrentBuffer();
+	// A guest argument block can carry a non-zero start_instance_location, and Vulkan needs the
+	// feature for that to be defined in an indirect command.
+	if (!buffer.GetGraphics().draw_indirect_first_instance_enabled) {
+		return false;
+	}
+	// NGG/mesh assembly (SHADER_STAGES bit 5, the same test Shader::PrepareProgram makes): the
+	// host derives the mesh workgroup count from the index count, and there is no indirect form.
+	if ((buffer.GetRegisters().GetShaderStages() & 0x20u) != 0) {
+		return false;
+	}
+	auto& ucfg = buffer.GetUserConfig();
+	switch (ucfg.GetPrimType()) {
+		case Prospero::PrimitiveType::kPointList:
+		case Prospero::PrimitiveType::kLineList:
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriList:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip:
+		case Prospero::PrimitiveType::kRectList: break;
+		// kQuadListLegacy emits one draw per quad and kRectListLegacy substitutes the vertex
+		// count, both from a count only the CPU can have.
+		default: return false;
+	}
+	if (!indexed) {
+		return true;
+	}
+	// The index buffer has to be bound over its whole declared range, because firstIndex now comes
+	// from the device and the INDEX_BUFFER_SIZE clamp cannot be applied on the CPU any more.
+	if (m_index_buffer_size == 0 || m_index_base_addr == 0) {
+		return false;
+	}
+	// 8-bit indices are widened to 16 on the CPU, index by index.
+	if (m_index_type_and_size != 0 && m_index_type_and_size != 1) {
+		return false;
+	}
+	// A custom primitive-reset index makes RenderExecutor::DrawIndex scan the index buffer before
+	// it can choose the pipeline; only the native marker avoids that scan.
+	const auto control = ucfg.GetPrimitiveResetControl();
+	if ((control & 0x1u) != 0) {
+		switch (ucfg.GetPrimType()) {
+			case Prospero::PrimitiveType::kLineStrip:
+			case Prospero::PrimitiveType::kTriFan:
+			case Prospero::PrimitiveType::kTriStrip: {
+				const uint32_t element_size = (m_index_type_and_size == 0 ? 2u : 4u);
+				const uint32_t index_mask   = UINT32_MAX >> ((4u - element_size) * 8u);
+				const auto     reset_index  = buffer.GetRegisters().GetPrimitiveResetIndex();
+				if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
+					break;
+				}
+				if ((reset_index & index_mask) != index_mask) {
+					return false;
+				}
+				break;
+			}
+			default: break;
+		}
+	}
+	return true;
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
-	const auto* args_addr =
-	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	const auto args_guest_addr = m_draw_indirect_args_base_addr + data_offset;
+	if (IndirectDrawUsesGpuArgs(indexed)) {
+		// Nothing is read back: the device takes the counts, the offsets and firstIndex out of the
+		// block. m_num_instances is deliberately left alone -- the CPU never learns this draw's
+		// instance count, so a later short-form draw keeps the last NUM_INSTANCES packet's value.
+		if (!indexed) {
+			DrawIndexAuto({.vertex_count   = 1,
+			               .instance_count = 1,
+			               .offset_source  = DrawOffsetSource::IndirectArgs,
+			               .indirect_args  = args_guest_addr});
+			return;
+		}
+		DrawIndex({.index_count    = m_index_buffer_size,
+		           .index_addr     = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count = 1,
+		           .offset_source  = DrawOffsetSource::IndirectArgs,
+		           .indirect_args  = args_guest_addr});
+		return;
+	}
+
+	const auto* args_addr = reinterpret_cast<const void*>(args_guest_addr);
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
 	        m_draw_indirect_args_base_addr + data_offset,
 	        indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs))) {

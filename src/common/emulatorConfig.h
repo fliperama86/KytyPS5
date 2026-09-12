@@ -80,6 +80,12 @@ struct ConfigOptions {
 	// VK_EXT_external_memory_host, so a descriptor or SRT read can never miss. The data table is
 	// unchanged. Off, nothing is imported and no shader carries the binding.
 	bool                   gpu_prologue_table_enabled = false;
+	// Step 2 of the same document: a compute program with side effects (a written or atomic
+	// buffer or image, or uses_dma) evaluates its read-only descriptor roots and its flattened
+	// SRT reads in the shader prologue like any other program, instead of being excluded from
+	// stage 1 as a whole. Needs gpu_descriptors_enabled and gpu_prologue_table_enabled: without
+	// the prologue table a root read can miss and a producer would store a zero descriptor.
+	bool                   gpu_fetch_side_effects_enabled = false;
 	// Vulkan consumes indirect draw and dispatch arguments in place instead of the render thread
 	// reading them back from the GPU (docs/performance-roadmap.md, item 1).
 	bool                   gpu_indirect_enabled = false;
@@ -143,6 +149,12 @@ struct ConfigOptions {
 	// Host threads that spin on the guest CPUs for the length of a replay, imitating the game's
 	// job-system workers, which busy-wait in guest code. 0 leaves the machine to the replay.
 	uint32_t               replay_spin_threads         = 0;
+	// How long a replayed loop may take before the replay calls the GPU thread hung, warm-up and
+	// measured loops alike. The defaults are 600 s for the warm-up, which compiles every pipeline
+	// the frame touches, and 2 s for a measured loop; a configuration whose loop is slower than
+	// that -- --gpu-fetch-side-effects, whose prologues are long -- needs this to be measured at
+	// all. 0 keeps the defaults.
+	uint32_t               replay_timeout_ms           = 0;
 	// The replay's memory writer: none, or one thread on the guest or the render CPU group that
 	// rewrites each dirty event's range immediately before the mark. See docs/bda-sync-design.md.
 	ReplayWriter           replay_writer               = ReplayWriter::None;
@@ -173,6 +185,7 @@ bool                   ShaderStorageImageBoundsCheckEnabled();
 bool                   GpuDescriptorsEnabled();
 bool                   GpuSrtReadsEnabled();
 bool                   GpuPrologueTableEnabled();
+bool                   GpuFetchSideEffectsEnabled();
 bool                   GpuIndirectEnabled();
 bool                   GpuIndirectDrawsEnabled();
 bool                   GpuReadbackProducerWaitEnabled();
@@ -215,6 +228,7 @@ uint32_t              GetReplayLoops();
 uint32_t              GetReplayFrames();
 bool                  ReplayDirtySetOnce();
 uint32_t              GetReplaySpinThreads();
+uint32_t              GetReplayTimeoutMs();
 ReplayWriter          GetReplayWriter();
 std::filesystem::path GetReplayImage();
 

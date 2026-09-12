@@ -610,13 +610,10 @@ private:
 	uint32_t                  m_true = 0;
 };
 
-} // namespace
-
-SrtLoweredRoot EmitSrtFlatRoot(ValueEmitContext& ctx, const IR::SrtFlatProgram& program,
-                               const IR::SrtFlatRoot& root, std::span<const uint32_t> results,
-                               const SrtLoweringInputs& inputs) {
+// One root on an emitter that may already hold the steps of the roots before it.
+SrtLoweredRoot RunRoot(RootEmitter& emitter, ValueEmitContext& ctx, const IR::SrtFlatRoot& root,
+                       std::span<const uint32_t> results) {
 	SrtLoweredRoot lowered;
-	RootEmitter    emitter(ctx, program, inputs);
 	lowered.count = static_cast<uint32_t>(std::min(results.size(), lowered.results.size()));
 	if (!emitter.Run(root)) {
 		lowered.supported = false;
@@ -636,6 +633,33 @@ SrtLoweredRoot EmitSrtFlatRoot(ValueEmitContext& ctx, const IR::SrtFlatProgram& 
 		lowered.results[index] = emitter.Value(results[index]);
 		lowered.valid          = emitter.And(lowered.valid, emitter.Condition(results[index]));
 	}
+	return lowered;
+}
+
+} // namespace
+
+void EmitSrtFlatRoots(ValueEmitContext& ctx, const IR::SrtFlatProgram& program,
+                      std::span<const SrtRootRequest> requests, const SrtLoweringInputs& inputs,
+                      std::span<SrtLoweredRoot> lowered) {
+	RootEmitter emitter(ctx, program, inputs);
+	for (size_t index = 0; index < requests.size() && index < lowered.size(); index++) {
+		const auto& request = requests[index];
+		if (request.root == nullptr) {
+			lowered[index]           = {};
+			lowered[index].supported = false;
+			lowered[index].valid     = ConstantBool(ctx.state, false);
+			continue;
+		}
+		lowered[index] = RunRoot(emitter, ctx, *request.root, request.results);
+	}
+}
+
+SrtLoweredRoot EmitSrtFlatRoot(ValueEmitContext& ctx, const IR::SrtFlatProgram& program,
+                               const IR::SrtFlatRoot& root, std::span<const uint32_t> results,
+                               const SrtLoweringInputs& inputs) {
+	SrtLoweredRoot             lowered;
+	const SrtRootRequest       request {&root, results};
+	EmitSrtFlatRoots(ctx, program, {&request, 1}, inputs, {&lowered, 1});
 	return lowered;
 }
 

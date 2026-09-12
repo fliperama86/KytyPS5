@@ -91,6 +91,13 @@ bool GpuPrologueTableEnabled() {
 	return g_config->gpu_prologue_table_enabled;
 }
 
+// Step 2 of docs/sync-points-design.md. Effective only with the descriptor fetch and the
+// prologue table, so a program's marking can never depend on this flag alone.
+bool GpuFetchSideEffectsEnabled() {
+	return g_config->gpu_descriptors_enabled && g_config->gpu_prologue_table_enabled &&
+	       g_config->gpu_fetch_side_effects_enabled;
+}
+
 bool GpuIndirectEnabled() {
 	return g_config->gpu_indirect_enabled;
 }
@@ -221,6 +228,10 @@ bool ReplayDirtySetOnce() {
 
 uint32_t GetReplaySpinThreads() {
 	return g_config->replay_spin_threads;
+}
+
+uint32_t GetReplayTimeoutMs() {
+	return g_config->replay_timeout_ms;
 }
 
 ReplayWriter GetReplayWriter() {

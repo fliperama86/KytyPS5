@@ -697,8 +697,14 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
-	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
+	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id ||
+	    state.program.info.gpu_fetch_side_effects) {
 		state.builder.RequireCapability(CapabilityGroupNonUniform);
+	}
+	if (state.program.info.gpu_fetch_side_effects) {
+		// Step 2 of docs/sync-points-design.md: the prologue's skip decision is voted across the
+		// subgroup so it cannot diverge inside one (spirvEmitterGpuFetch.cpp).
+		state.builder.RequireCapability(CapabilityGroupNonUniformVote);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformBallot);

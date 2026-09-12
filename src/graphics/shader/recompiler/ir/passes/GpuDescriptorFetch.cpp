@@ -9,8 +9,9 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 void MarkGpuFetchBuffers(Program& program) {
-	program.info.gpu_descriptors    = false;
-	program.info.gpu_prologue_table = false;
+	program.info.gpu_descriptors        = false;
+	program.info.gpu_prologue_table     = false;
+	program.info.gpu_fetch_side_effects = false;
 	program.info.gpu_read_slots.clear();
 	for (auto& buffer: program.info.buffers) {
 		buffer.gpu_fetch = false;
@@ -41,7 +42,16 @@ void MarkGpuFetchBuffers(Program& program) {
 	                        [](const BufferResource& b) { return b.written || b.atomic; }) ||
 	    std::ranges::any_of(program.info.images,
 	                        [](const ImageResource& i) { return i.written || i.atomic; });
-	if (side_effects) {
+	// Step 2 of docs/sync-points-design.md lifts that rule for compute programs: with the
+	// prologue page table on, a root read resolves through the mirror of whatever buffer covers
+	// the page and through imported guest memory otherwise, so the miss the rule exists for can
+	// only happen on a range the import refused or on nothing mapped at all -- and the prologue
+	// the emitter builds for such a program returns before its first side effect instead of
+	// storing what it derived from a zero. The resources with the side effects themselves keep
+	// their host binding either way; only read-only buffers are ever marked below.
+	const bool lift_side_effects =
+	    Config::GpuFetchSideEffectsEnabled() && program.stage == ShaderType::Compute;
+	if (side_effects && !lift_side_effects) {
 		return;
 	}
 	bool any = false;
@@ -84,6 +94,9 @@ void MarkGpuFetchBuffers(Program& program) {
 	// Step 1 of docs/sync-points-design.md: with the prologue table on, every root and
 	// flattened read this program evaluates resolves through it.
 	program.info.gpu_prologue_table = Config::GpuPrologueTableEnabled();
+	// Step 2: the safety net is part of the module, so it belongs to the program's identity like
+	// the table itself. Only a program that actually has side effects carries it.
+	program.info.gpu_fetch_side_effects = side_effects;
 	program.info.gpu_read_slots  = std::move(reads);
 	program.flat                 = std::move(plan.flat);
 }

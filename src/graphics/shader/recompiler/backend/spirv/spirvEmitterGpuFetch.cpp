@@ -17,7 +17,11 @@
 
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+
 #include <array>
+#include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -73,6 +77,10 @@ uint32_t AllOf(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
 
+uint32_t NotBool(EmitterState& state, uint32_t value) {
+	return Unary(state, OpLogicalNot, TypeBool(state), value);
+}
+
 // BuildResourceSpecialization normalises the packed stride before baking it: an unstrided
 // descriptor keeps neither the swizzle bit nor the index stride, and an unswizzled one keeps no
 // index stride. The compare has to normalise the same way or it reports a phantom mismatch.
@@ -91,30 +99,83 @@ uint32_t RuntimePackedStride(EmitterState& state, uint32_t stride, uint32_t swiz
 	return Binary(state, OpBitwiseAnd, TypeU32(state), packed, mask);
 }
 
-// Same shape as RecordBdaFault, on the feedback buffer and atomically: a lost update here would
-// hide a mismatch from the host, where a lost fault bit only delays a page by one more frame.
+bool CanRecordFeedback(const EmitterState& state) {
+	return state.descriptor_feedback_variable != 0u &&
+	       state.program.bindings.feedback_slot_dword != IR::BindingLayout::NoFeedbackSlot;
+}
+
+// Sets this program's bit in the DescriptorFeedback buffer. Same shape as RecordBdaFault, on the
+// feedback buffer and atomically: a lost update here would hide a mismatch from the host, where a
+// lost fault bit only delays a page by one more frame.
+void SetFeedbackBit(EmitterState& state) {
+	const auto slot = EmitShaderDataDwordLoad(state, state.program.bindings.feedback_slot_dword);
+	const auto word =
+	    Binary(state, OpShiftRightLogical, TypeU32(state), slot, ConstantU32(state, 5));
+	const auto bit =
+	    Binary(state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	           Binary(state, OpBitwiseAnd, TypeU32(state), slot, ConstantU32(state, 31)));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                           state.descriptor_feedback_variable, ConstantU32(state, 0), word});
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction({OpAtomicOr, TypeU32(state), previous, pointer,
+	                           ConstantU32(state, ScopeDevice),
+	                           ConstantU32(state, MemorySemanticsNone), bit});
+}
+
 void RecordFeedback(EmitterState& state, uint32_t condition) {
-	const auto slot_dword = state.program.bindings.feedback_slot_dword;
-	if (condition == 0u || state.descriptor_feedback_variable == 0u ||
-	    slot_dword == IR::BindingLayout::NoFeedbackSlot) {
+	if (condition == 0u || !CanRecordFeedback(state)) {
 		return;
 	}
-	EmitIfCondition(state, condition, [&]() {
-		const auto slot = EmitShaderDataDwordLoad(state, slot_dword);
-		const auto word =
-		    Binary(state, OpShiftRightLogical, TypeU32(state), slot, ConstantU32(state, 5));
-		const auto bit = Binary(
-		    state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
-		    Binary(state, OpBitwiseAnd, TypeU32(state), slot, ConstantU32(state, 31)));
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-		                           state.descriptor_feedback_variable, ConstantU32(state, 0),
-		                           word});
-		const auto previous = state.builder.AllocateId();
-		state.builder.AddFunction({OpAtomicOr, TypeU32(state), previous, pointer,
-		                           ConstantU32(state, ScopeDevice),
-		                           ConstantU32(state, MemorySemanticsNone), bit});
-	});
+	EmitIfCondition(state, condition, [&]() { SetFeedbackBit(state); });
+}
+
+// Step 2 of docs/sync-points-design.md: the dword past the prologue's own miss counter, so the
+// host can say how often the safety net fired. The fault buffer always has room for both when a
+// program carries the prologue table, which --gpu-fetch-side-effects requires.
+void CountSideEffectSkip(EmitterState& state) {
+	if (state.fault_buffer_variable == 0u) {
+		return;
+	}
+	constexpr uint32_t SkipCounterIndex =
+	    static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u) + 1u;
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                           state.fault_buffer_variable, ConstantU32(state, 0),
+	                           ConstantU32(state, SkipCounterIndex)});
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction({OpAtomicIAdd, TypeU32(state), previous, pointer,
+	                           ConstantU32(state, ScopeDevice),
+	                           ConstantU32(state, MemorySemanticsNone), ConstantU32(state, 1)});
+}
+
+// The safety net. A program with side effects whose prologue could not evaluate every root and
+// flattened read must not run: a zero descriptor it stores outlives the frame
+// (docs/investigations/gpu-descriptors-stage1-crash-2026-09-11.md). The entry point returns here,
+// before the body and therefore before the program's first side effect, having set the program's
+// feedback bit -- which puts the next dispatch of it on the CPU path, exactly as a specialization
+// mismatch does -- and counted itself. The page that could not be read has already recorded its
+// fault bit inside the page-table lookup, so the host maps it for the next frame.
+//
+// A root reads user data and guest memory at addresses derived from it, so its value is the same
+// in every invocation and the branch is uniform by construction; the subgroup vote makes that
+// explicit and keeps a divergence, if one were ever possible, on the conservative side (the whole
+// subgroup skips rather than half of it storing).
+void EmitSideEffectGuard(EmitterState& state, uint32_t invalid) {
+	const auto voted = state.builder.AllocateId();
+	state.builder.AddFunction({OpGroupNonUniformAny, TypeBool(state), voted,
+	                           ConstantU32(state, ScopeSubgroup), invalid});
+	const auto skip_label  = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction({OpBranchConditional, voted, skip_label, merge_label});
+	EmitLabel(state, skip_label);
+	if (CanRecordFeedback(state)) {
+		SetFeedbackBit(state);
+	}
+	CountSideEffectSkip(state);
+	state.builder.AddFunction({OpReturn});
+	EmitLabel(state, merge_label);
 }
 
 } // namespace
@@ -126,10 +187,31 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 	}
 	const auto& flat     = state.program.flat;
 	uint32_t    mismatch = 0;
-	// Stage 1b: the flat SRT reads the shader evaluates for itself. Lowered first so the uniform
-	// values dominate every use in the body, and independently of the descriptors: a program may
-	// have marked reads and no marked buffer.
+	// Step 2: a program with side effects collects the validity of everything its prologue
+	// evaluates, and skips the whole dispatch rather than deriving anything from a zero.
+	const bool guarded = state.program.info.gpu_fetch_side_effects;
+	uint32_t   invalid = 0;
+	const auto note_invalid = [&](uint32_t valid) {
+		if (guarded) {
+			invalid = AnyOf(state, invalid, NotBool(state, valid));
+		}
+	};
+	// Every root of the prologue is lowered in one pass on one emitter: the roots of a program
+	// walk the same SRT chain and differ only in their last steps, so a step another root already
+	// produced is reused. Lowering them one emitter each cost a quarter of a million SPIR-V words
+	// and seconds of driver compile time per program (docs/sync-points-design.md, step 2).
+	//
+	// Stage 1b's flat SRT reads come first so their uniform values dominate every use in the body,
+	// and independently of the descriptors: a program may have marked reads and no marked buffer.
 	const auto& read_slots = state.program.info.gpu_read_slots;
+	struct PrologueTarget {
+		uint32_t slot     = UINT32_MAX; // flat SRT read slot, or UINT32_MAX
+		uint32_t resource = UINT32_MAX; // buffer resource, or UINT32_MAX
+	};
+	std::vector<PrologueTarget>          targets;
+	std::vector<const IR::SrtFlatRoot*>  roots;
+	std::vector<std::array<uint32_t, 4>> wanted;
+	std::vector<uint32_t>                wanted_count;
 	if (!read_slots.empty()) {
 		state.gpu_read_values.assign(read_slots.size(), 0u);
 		for (uint32_t slot = 0; slot < read_slots.size(); slot++) {
@@ -140,18 +222,11 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::FlattenedSrt, slot,
 				                             "shader-fetched SRT read has no flat root");
 			}
-			const auto&                   root = flat.flat_reads[slot];
-			const std::array<uint32_t, 1> results {root.result};
-			const auto lowered = EmitSrtFlatRoot(ctx, flat, root, results, {});
-			if (!lowered.supported || lowered.count != results.size()) {
-				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::FlattenedSrt, slot,
-				                             "shader-fetched SRT read has no SPIR-V lowering");
-			}
-			// A root the shader could not walk reads as zero, exactly as an invalid descriptor
-			// root does; the unmapped page it failed on already set its fault bit.
-			state.gpu_read_values[slot] =
-			    Select(state, TypeU32(state), lowered.valid, Narrow(state, lowered.results[0]),
-			           ConstantU32(state, 0));
+			const auto& root = flat.flat_reads[slot];
+			targets.push_back({.slot = slot});
+			roots.push_back(&root);
+			wanted.push_back({root.result, 0u, 0u, 0u});
+			wanted_count.push_back(1u);
 		}
 	}
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); resource++) {
@@ -163,14 +238,45 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, resource,
 			                             "shader-fetched buffer has no flat descriptor root");
 		}
-		const auto&                   root = flat.sources[buffer.source];
-		const std::array<uint32_t, 4> results {root.results[0], root.results[1], root.results[2],
-		                                       root.results[3]};
-		const auto lowered = EmitSrtFlatRoot(ctx, flat, root, results, {});
-		if (!lowered.supported || lowered.count != results.size()) {
+		const auto& root = flat.sources[buffer.source];
+		targets.push_back({.resource = resource});
+		roots.push_back(&root);
+		wanted.push_back({root.results[0], root.results[1], root.results[2], root.results[3]});
+		wanted_count.push_back(4u);
+	}
+	std::vector<SrtRootRequest> requests(targets.size());
+	for (size_t index = 0; index < targets.size(); index++) {
+		requests[index] = {roots[index],
+		                   std::span<const uint32_t>(wanted[index].data(), wanted_count[index])};
+	}
+	std::vector<SrtLoweredRoot> lowered_roots(targets.size());
+	EmitSrtFlatRoots(ctx, flat, requests, {}, lowered_roots);
+
+	for (size_t index = 0; index < targets.size(); index++) {
+		const auto& target  = targets[index];
+		const auto& lowered = lowered_roots[index];
+		if (target.resource == UINT32_MAX) {
+			const auto slot = target.slot;
+			if (!lowered.supported || lowered.count != 1u) {
+				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::FlattenedSrt, slot,
+				                             "shader-fetched SRT read has no SPIR-V lowering");
+			}
+			// A root the shader could not walk reads as zero, exactly as an invalid descriptor
+			// root does; the unmapped page it failed on already set its fault bit. A guarded
+			// program never reaches the use: the prologue returns first.
+			note_invalid(lowered.valid);
+			state.gpu_read_values[slot] =
+			    Select(state, TypeU32(state), lowered.valid, Narrow(state, lowered.results[0]),
+			           ConstantU32(state, 0));
+			continue;
+		}
+		const auto  resource = target.resource;
+		const auto& buffer   = state.program.info.buffers[resource];
+		if (!lowered.supported || lowered.count != 4u) {
 			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, resource,
 			                             "shader-fetched descriptor root has no SPIR-V lowering");
 		}
+		note_invalid(lowered.valid);
 		std::array<uint32_t, 4> dword {};
 		for (uint32_t index = 0; index < dword.size(); index++) {
 			dword[index] = Narrow(state, lowered.results[index]);
@@ -234,6 +340,9 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 		// A root the shader could not evaluate says nothing about the specialization; the fault
 		// bit already tells the host to map the page.
 		mismatch = AnyOf(state, mismatch, AllOf(state, lowered.valid, differs));
+	}
+	if (guarded && invalid != 0u) {
+		EmitSideEffectGuard(state, invalid);
 	}
 	RecordFeedback(state, mismatch);
 }

@@ -50,6 +50,7 @@ enum : uint32_t {
 	CapabilityImageQuery                     = 50,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
+	CapabilityGroupNonUniformVote            = 62,
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilityShaderLayer                    = 69,
@@ -275,6 +276,7 @@ enum : uint32_t {
 	OpKill                         = 252,
 	OpReturn                       = 253,
 	OpReturnValue                  = 254,
+	OpGroupNonUniformAny           = 335,
 	OpGroupNonUniformBallot        = 339,
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
@@ -830,6 +832,23 @@ struct SrtLoweredRoot {
 SrtLoweredRoot EmitSrtFlatRoot(ValueEmitContext& ctx, const IR::SrtFlatProgram& program,
                                const IR::SrtFlatRoot& root, std::span<const uint32_t> results,
                                const SrtLoweringInputs& inputs);
+
+// One root of a shared lowering pass: the root and the result registers wanted from it.
+struct SrtRootRequest {
+	const IR::SrtFlatRoot*    root = nullptr;
+	std::span<const uint32_t> results;
+};
+
+// Lowers several roots of one flat program on a single emitter. Every root of a program walks the
+// same first pointers -- user data, then the SRT chain -- and FlatMachine evaluates each such step
+// once per run, so the lowering does too: a step another root already produced is reused instead
+// of re-emitted. One root per emitter turns a 250-root prologue into a quarter of a million SPIR-V
+// words and minutes of driver compile time; sharing keeps the module the size of the schedule.
+// `lowered` is filled in request order; a root that cannot be lowered gets supported = false,
+// exactly as EmitSrtFlatRoot leaves it.
+void EmitSrtFlatRoots(ValueEmitContext& ctx, const IR::SrtFlatProgram& program,
+                      std::span<const SrtRootRequest> requests, const SrtLoweringInputs& inputs,
+                      std::span<SrtLoweredRoot> lowered);
 
 // Evaluates every gpu_fetch buffer descriptor and every marked flat SRT read once in the
 // function prologue and records a specialization mismatch in the DescriptorFeedback buffer.

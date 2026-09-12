@@ -78,6 +78,14 @@ static void PrintUsage() {
 	         "                                       and read descriptor roots and flattened SRT\n"
 	         "                                       reads through it, so a prologue read never\n"
 	         "                                       misses. Default: false.\n");
+	::printf("  --gpu-fetch-side-effects <t|f>       Let a compute program with side effects\n"
+	         "                                       evaluate its read-only descriptor roots\n"
+	         "                                       and flattened SRT reads in the shader\n"
+	         "                                       prologue too, instead of staying on the\n"
+	         "                                       render thread as a whole. Only has an\n"
+	         "                                       effect with --gpu-descriptors true and\n"
+	         "                                       --gpu-prologue-table true.\n"
+	         "                                       Default: false.\n");
 	::printf("  --gpu-indirect <true|false>          Let Vulkan consume indirect dispatch\n"
 	         "                                       arguments in place instead of reading\n"
 	         "                                       them back on the render thread.\n"
@@ -138,6 +146,9 @@ static void PrintUsage() {
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 	::printf("  --replay <dir>                       Replay a captured frame from <dir>\n"
 	         "                                       without a game; docs/frame-replay.md.\n");
+	::printf("  --replay-timeout <ms>                How long a replayed loop may take before\n"
+	         "                                       the replay calls the GPU thread hung.\n"
+	         "                                       Default: 600000 warm-up, 2000 measured.\n");
 	::printf("  --replay-loops <num>                 Replay loops. Default: %u.\n",
 	         Config::DEFAULT_REPLAY_LOOPS);
 	::printf("  --replay-frames <num>                Frames of the capture one loop replays.\n"
@@ -396,6 +407,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-fetch-side-effects") {
+			if (!ParseBool(value, options.config.gpu_fetch_side_effects_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--gpu-indirect") {
 			if (!ParseBool(value, options.config.gpu_indirect_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -528,6 +544,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid replay loop count: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--replay-timeout") {
+			uint32_t timeout  = 0;
+			auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), timeout);
+			if (error != std::errc {} || end != value.data() + value.size()) {
+				::printf("invalid warm-up timeout for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.replay_timeout_ms = timeout;
 		} else if (arg == "--replay-frames") {
 			if (!ParseFrameCount(value, options.config.replay_frames)) {
 				::printf("invalid frame count for %s: %s\n", arg.c_str(), value.c_str());

@@ -458,6 +458,13 @@ struct ShaderInfo {
 	// descriptor set does not. Set with gpu_descriptors while --gpu-prologue-table is on; the
 	// emitted module differs, so it is part of the program's identity.
 	bool                             gpu_prologue_table = false;
+	// Step 2 of docs/sync-points-design.md: this program has side effects (a written or atomic
+	// buffer or image, or uses_dma) and was marked anyway, because --gpu-fetch-side-effects is on
+	// and the prologue table gives every mapped page an entry. The emitted prologue then carries
+	// the safety net: if any root or flattened read it evaluates is still invalid, the entry
+	// point returns before the program's first side effect and reports the program through
+	// DescriptorFeedback, so a producer can never store a descriptor it derived from a zero.
+	bool                             gpu_fetch_side_effects = false;
 	// Stage 1b (docs/gpu-descriptor-fetch.md): one byte per flat SRT slot, non-zero where the
 	// shader evaluates the read itself in its prologue instead of loading it from the
 	// FlattenedSrt binding. Empty unless --gpu-srt-reads marked something.

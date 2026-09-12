@@ -114,11 +114,16 @@ bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint
 
 // Evaluates potentially reachable descriptor sources and the flattened immediate SRT with one
 // memoized scalar walk. Inactive descriptors are zero; on failure no destination is changed.
+//
+// `skip_sources` and `skip_flat_slots` name the descriptor sources and the flat SRT slots the
+// shader evaluates for itself (docs/gpu-descriptor-fetch.md, stages 1 and 1b). Both are left zero
+// in the results; nothing on the host reads them.
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
                             std::vector<uint8_t>& active_sources,
-                            std::span<const uint8_t> skip_sources = {});
+                            std::span<const uint8_t> skip_sources    = {},
+                            std::span<const uint8_t> skip_flat_slots = {});
 
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
              std::vector<uint32_t>& flat);

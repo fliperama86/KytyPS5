@@ -646,7 +646,9 @@ std::vector<uint32_t> EmitSrtFlatProgramTestModule(const IR::Program& program,
                                                    const IR::SrtFlatProgram& flat,
                                                    std::span<const uint32_t> dword_counts,
                                                    const SrtLoweringInputs&  inputs,
-                                                   uint32_t                  source_stride) {
+                                                   uint32_t                  source_stride,
+                                                   uint32_t                  read_origin,
+                                                   uint32_t                  read_stride) {
 	EmitterState state(program, input_info);
 	state.stage      = program.stage;
 	state.lane_count = 1;
@@ -691,6 +693,23 @@ std::vector<uint32_t> EmitSrtFlatProgramTestModule(const IR::Program& program,
 		store(base + 8u, Select(state, TypeU32(state), lowered.valid, ConstantU32(state, 1),
 		                        ConstantU32(state, 0)));
 		store(base + 9u, ConstantU32(state, lowered.supported ? 1u : 0u));
+	}
+
+	// Stage 1b: the same treatment for the flat SRT read roots, whose single result is what
+	// EmitGpuFetchDescriptors parks for ReadConst. An invalid root reads zero, as it does there.
+	for (uint32_t slot = 0; read_stride != 0u && slot < flat.flat_reads.size(); slot++) {
+		const auto&                   root = flat.flat_reads[slot];
+		const std::array<uint32_t, 1> registers {root.result};
+		const auto lowered = EmitSrtFlatRoot(ctx, flat, root, registers, inputs);
+		const auto base    = read_origin + slot * read_stride;
+		const auto value   = lowered.count == 1u
+		                         ? Select(state, TypeU32(state), lowered.valid,
+		                                  Narrow(state, lowered.results[0]), ConstantU32(state, 0))
+		                         : ConstantU32(state, 0);
+		store(base, value);
+		store(base + 1u, Select(state, TypeU32(state), lowered.valid, ConstantU32(state, 1),
+		                        ConstantU32(state, 0)));
+		store(base + 2u, ConstantU32(state, lowered.supported ? 1u : 0u));
 	}
 
 	state.builder.AddFunction({OpReturn});

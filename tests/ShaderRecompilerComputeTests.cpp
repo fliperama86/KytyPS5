@@ -14724,6 +14724,11 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
 // (CompileSrtPlan's flat program, cross-checked against the IR walker) and once through the
 // SPIR-V lowering of the same flat program, then compares the eight dwords bit for bit.
 //
+// The same for the plan's flat SRT read slots (stage 1b of docs/gpu-descriptor-fetch.md): the CPU
+// reference is EvaluateRuntimeSources with the two deliberately invalid slots skipped through the
+// same skip_flat_slots parameter the renderer uses, and the shader must produce that word for
+// every other slot and a zero with a clear validity bool for the skipped ones.
+//
 // Guest memory is one page at a low fake guest address mapped into the BDA page table, so the
 // CPU side must read it through the evaluator's read_memory callback: the page table only covers
 // 40 bits and host pointers sit far above that, so the direct-dereference path production uses
@@ -14745,6 +14750,16 @@ void CheckSrtFlatProgramSpirvLowering(VulkanHarness *vulkan) {
           built.case_names.size() * SrtSynthetic::SourceStride <=
               SrtSynthetic::OutputDwords,
           "the synthetic plan needs more output space than the backing page");
+  Require(name, "flat program",
+          built.plan.flat.flat_reads.size() == built.plan.srt_reads.size() &&
+              built.read_names.size() == built.plan.srt_reads.size() &&
+              !built.read_names.empty(),
+          "the flat program has the wrong SRT read slot count");
+  Require(name, "flat program",
+          SrtSynthetic::ReadOrigin +
+                  built.read_names.size() * SrtSynthetic::ReadStride <=
+              SrtSynthetic::OutputDwords,
+          "the synthetic plan's read slots need more output space than the backing page");
 
   // ---- CPU reference ------------------------------------------------------
   const SrtIR::SrtRuntime runtime{
@@ -14776,6 +14791,57 @@ void CheckSrtFlatProgramSpirvLowering(VulkanHarness *vulkan) {
     cpu[index].ok = flat_ok;
     cpu[index].dwords = flat_value.dwords;
     cpu[index].count = built.dword_counts[index];
+  }
+
+  // The flat SRT reads, evaluated exactly as the renderer does: one call, the slots the shader
+  // owns skipped. Here the skipped set is the two roots that cannot evaluate at all, so a
+  // transactional failure cannot hide the rest.
+  std::vector<u32> cpu_reads;
+  {
+    std::vector<SrtIR::DescriptorValue> ignored;
+    std::vector<uint8_t> active;
+    const bool ok = SrtIR::EvaluateRuntimeSources(
+        built.plan, {}, runtime, ignored, cpu_reads, built.plan.clean_flat_slots, active, {},
+        built.read_invalid);
+    Require(name, "flat reads", ok && cpu_reads.size() == built.plan.srt_reads.size(),
+            "the CPU evaluator failed the synthetic plan's SRT read slots");
+    for (u32 slot = 0; slot < built.read_invalid.size(); slot++) {
+      if (built.read_invalid[slot] == 0u) {
+        continue;
+      }
+      // A skipped slot must stay zero, and the same read must genuinely fail when asked for.
+      std::vector<SrtIR::DescriptorValue> unused;
+      std::vector<uint8_t> unused_active;
+      std::vector<u32> probe;
+      std::vector<uint8_t> only(built.read_invalid.size(), 1u);
+      only[slot] = 0u;
+      Require(name, "flat reads", cpu_reads[slot] == 0u,
+              built.read_names[slot] + ": a skipped slot was not left zero");
+      Require(name, "flat reads",
+              !SrtIR::EvaluateRuntimeSources(built.plan, {}, runtime, unused, probe,
+                                             built.plan.clean_flat_slots, unused_active, {},
+                                             only),
+              built.read_names[slot] + ": the CPU evaluator accepted an invalid root");
+    }
+  }
+
+  // The binding decision the lowering pays for: the FlattenedSrt descriptor goes away only when
+  // every slot is lowered and no indirect image search shares the buffer.
+  {
+    SrtIR::Program probe;
+    probe.srt_reads.assign(built.plan.srt_reads.size(), SrtIR::SrtRead{});
+    Require(name, "flattened binding", SrtIR::UsesFlattenedRuntime(probe),
+            "a plan with no lowered slot dropped the flattened SRT binding");
+    probe.info.gpu_read_slots.assign(probe.srt_reads.size(), 1u);
+    Require(name, "flattened binding", !SrtIR::UsesFlattenedRuntime(probe),
+            "a plan with every slot lowered kept the flattened SRT binding");
+    probe.info.gpu_read_slots.back() = 0u;
+    Require(name, "flattened binding", SrtIR::UsesFlattenedRuntime(probe),
+            "one host-evaluated slot did not keep the flattened SRT binding");
+    probe.info.gpu_read_slots.back() = 1u;
+    probe.info.images.emplace_back().indirect_search_iterations = 3u;
+    Require(name, "flattened binding", SrtIR::UsesFlattenedRuntime(probe),
+            "an indirect image search did not keep the flattened SRT binding");
   }
 
   // ---- a stub shader, only to obtain a matching binding layout ------------
@@ -14823,7 +14889,7 @@ void CheckSrtFlatProgramSpirvLowering(VulkanHarness *vulkan) {
   inputs.shader_base = SrtSynthetic::ShaderBase;
   compiled.spirv = SpirvEmitter::EmitSrtFlatProgramTestModule(
       compiled.program, input_info, built.plan.flat, built.dword_counts, inputs,
-      SrtSynthetic::SourceStride);
+      SrtSynthetic::SourceStride, SrtSynthetic::ReadOrigin, SrtSynthetic::ReadStride);
   Require(name, "SPIR-V emit", !compiled.spirv.empty(),
           "the SRT lowering produced an empty module");
   ValidateSpirv(name, compiled.spirv);
@@ -14866,6 +14932,28 @@ void CheckSrtFlatProgramSpirvLowering(VulkanHarness *vulkan) {
                 matched ? "ok" : "FAIL",
                 cpu[index].ok ? "values" : "both reject");
   }
+  for (u32 slot = 0; slot < built.read_names.size(); slot++) {
+    const auto base = SrtSynthetic::ReadOrigin + slot * SrtSynthetic::ReadStride;
+    const auto &title = built.read_names[slot];
+    Require(name, "read lowering", actual[base + 2u] != 0u,
+            title + ": the SPIR-V lowering rejected a step of this read root");
+    const bool invalid = built.read_invalid[slot] != 0u;
+    const bool gpu_ok = actual[base + 1u] != 0u;
+    if (gpu_ok == invalid) {
+      differences.push_back(title + ": CPU " + (invalid ? "failed" : "produced a value") +
+                            " but the shader " +
+                            (gpu_ok ? "produced a value" : "failed"));
+      std::printf("[srt]     %-30s FAIL (validity)\n", title.c_str());
+      continue;
+    }
+    const auto expected = invalid ? 0u : cpu_reads[slot];
+    const bool matched = actual[base] == expected;
+    if (!matched) {
+      differences.push_back(title + ": cpu=" + Hex(expected) + " gpu=" + Hex(actual[base]));
+    }
+    std::printf("[srt]     %-30s %s (%s)\n", title.c_str(), matched ? "ok" : "FAIL",
+                invalid ? "both reject, zero" : "value");
+  }
   if (!differences.empty()) {
     std::string joined;
     for (const auto &difference : differences) {
@@ -14873,7 +14961,8 @@ void CheckSrtFlatProgramSpirvLowering(VulkanHarness *vulkan) {
     }
     Fail(name, "comparison", joined);
   }
-  std::printf("[srt]     %-30s ok (%zu sources)\n", name, cpu.size());
+  std::printf("[srt]     %-30s ok (%zu sources, %zu read slots)\n", name, cpu.size(),
+              built.read_names.size());
 }
 
 // Shader-side buffer descriptor fetch (docs/gpu-descriptor-fetch.md, stage 1).
@@ -15029,6 +15118,14 @@ bool HasBinding(const CompiledShader &compiled,
          nullptr;
 }
 
+u32 LoweredReadSlots(const CompiledShader &compiled) {
+  u32 count = 0;
+  for (const auto slot : compiled.program.info.gpu_read_slots) {
+    count += slot != 0u ? 1u : 0u;
+  }
+  return count;
+}
+
 u32 FetchedBuffers(const CompiledShader &compiled) {
   u32 count = 0;
   for (const auto &buffer : compiled.program.info.buffers) {
@@ -15120,6 +15217,10 @@ void CheckGpuDescriptorFetch(VulkanHarness *vulkan) {
             "a matching descriptor reported a specialization mismatch");
     Require(name, "faults", !GpuFetch::AnyBitSet(vulkan->ReadFaultBits(name, 8)),
             "a mapped descriptor recorded a page fault");
+    Require(name, "bindings", GpuFetch::LoweredReadSlots(compiled) == 0u,
+            "a flat SRT read was lowered while --gpu-srt-reads is off");
+    Require(name, "bindings", GpuFetch::HasBinding(compiled, Kind::FlattenedSrt),
+            "the flattened SRT binding went away while --gpu-srt-reads is off");
     std::printf("[gpufetch] %-30s ok\n", name);
   }
 

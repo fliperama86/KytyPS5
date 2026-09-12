@@ -346,6 +346,7 @@ SrtStats::StageEvent StatsStageEvent(const char*                                
 			event.flat_reads++;
 		}
 	}
+	event.flat_read_slots   = static_cast<uint32_t>(plan.srt_reads.size());
 	event.buffer_layout_key = StatsBufferLayoutKey(spec);
 	event.uses_dma          = plan.info.uses_dma;
 	// A stage whose user data did not fit the 32-dword push block reaches its offsets through a
@@ -380,7 +381,8 @@ struct PipelineCache::ProgramCache {
 		}
 
 		// Takes the GPU-fetch shape from a freshly compiled module. Every permutation of an entry
-		// shares it: gpu_fetch follows the resource plan, not the specialization.
+		// shares it: gpu_fetch and the lowered SRT read slots follow the resource plan, not the
+		// specialization.
 		void AdoptGpuFetch(const ShaderRecompiler::IR::ShaderInfo& info) {
 			if (!info.gpu_descriptors) {
 				return;
@@ -390,6 +392,11 @@ struct PipelineCache::ProgramCache {
 			for (uint32_t i = 0; i < info.buffers.size(); i++) {
 				gpu_fetch_buffers[i] = info.buffers[i].gpu_fetch ? 1u : 0u;
 			}
+			gpu_read_slots     = info.gpu_read_slots;
+			gpu_reads_lowered  = 0;
+			for (const auto slot: gpu_read_slots) {
+				gpu_reads_lowered += slot != 0u ? 1u : 0u;
+			}
 		}
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
@@ -398,6 +405,10 @@ struct PipelineCache::ProgramCache {
 		// GPU-side descriptor fetch state (docs/gpu-descriptor-fetch.md, stage 1). All of it is
 		// inert while the plan marks no buffer gpu_fetch, which is every plan with the setting off.
 		std::vector<uint8_t>                        gpu_fetch_buffers;
+		// Stage 1b: one byte per flat SRT slot, non-zero where the shader evaluates the read
+		// itself. Empty unless --gpu-srt-reads marked something for this program.
+		std::vector<uint8_t>                        gpu_read_slots;
+		uint32_t                                    gpu_reads_lowered = 0;
 		ShaderRecompiler::IR::ResourceSpecialization last_specialization;
 		uint32_t feedback_slot = ShaderRecompiler::IR::BindingLayout::NoFeedbackSlot;
 		uint32_t mismatches    = 0;
@@ -484,9 +495,10 @@ struct PipelineCache::ProgramCache {
 	                 const ShaderRecompiler::IR::ResourcePlan&           plan,
 	                 const ShaderRecompiler::IR::BindingLayout&          bindings,
 	                 const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                 bool gpu_fetch) {
+	                 bool gpu_fetch, uint32_t gpu_read_slots = 0) {
 		auto event = StatsStageEvent(stage_name, plan, bindings, specialization);
-		event.gpu_fetch = gpu_fetch;
+		event.gpu_fetch      = gpu_fetch;
+		event.gpu_read_slots = gpu_read_slots;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			event.vertex_layout_key = StatsVertexLayoutKey(input_info);
 			event.has_vertex_layout = true;
@@ -592,15 +604,19 @@ struct PipelineCache::ProgramCache {
 			const bool gpu_capable = source.gpu_descriptors && Config::GpuDescriptorsEnabled();
 			gpu_path = gpu_capable && source.has_last_specialization && !source.cpu_next &&
 			           !source.pinned_cpu;
+			// The slot mask applies on either path: a module compiled with in-shader reads never
+			// loads those slots from the buffer, so the CPU never has to produce them.
 			const ShaderRecompiler::IR::GpuFetchOverride override {
 			    .buffers        = source.gpu_fetch_buffers,
-			    .specialization = &source.last_specialization,
+			    .flat_slots     = source.gpu_read_slots,
+			    .specialization = gpu_path ? &source.last_specialization : nullptr,
 			};
+			const bool overridden = gpu_path || !source.gpu_read_slots.empty();
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
 				bool ok = ShaderRecompiler::IR::MaterializeResources(
 				    source.resource_plan, runtime, resources, specialization, &report,
-				    gpu_path ? &override : nullptr);
+				    overridden ? &override : nullptr);
 				if (!ok && gpu_path) {
 					// Stage 1 bring-up: find out whether the failure is caused by the skipped
 					// roots. A CPU retry that succeeds means it is; one that fails means the
@@ -645,7 +661,7 @@ struct PipelineCache::ProgramCache {
 				if (SrtStats::Enabled()) {
 					RecordStageStats(stage_name, input_info, entry->second.resource_plan,
 					                 permutation->program.bindings, permutation->specialization,
-					                 gpu_path);
+					                 gpu_path, source.gpu_reads_lowered);
 				}
 				input_info.stage = {.program       = &permutation->program,
 				                    .resources     = std::move(resources),
@@ -738,7 +754,15 @@ struct PipelineCache::ProgramCache {
 		source_entry.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
 		const auto& permutation = source_entry.permutations.back();
+		const auto read_slots_before = source_entry.gpu_read_slots.size();
 		source_entry.AdoptGpuFetch(permutation.program.info);
+		if (SrtStats::Enabled() && read_slots_before == 0 &&
+		    !source_entry.gpu_read_slots.empty()) {
+			SrtStats::RecordGpuReadProgram(
+			    source_entry.gpu_reads_lowered,
+			    static_cast<uint32_t>(source_entry.gpu_read_slots.size()) -
+			        source_entry.gpu_reads_lowered);
+		}
 		if (source_entry.gpu_descriptors &&
 		    source_entry.feedback_slot == ShaderRecompiler::IR::BindingLayout::NoFeedbackSlot) {
 			AssignFeedbackSlot(source_entry);
@@ -748,7 +772,8 @@ struct PipelineCache::ProgramCache {
 		}
 		if (SrtStats::Enabled()) {
 			RecordStageStats(stage_name, input_info, source_entry.resource_plan,
-			                 permutation.program.bindings, permutation.specialization, false);
+			                 permutation.program.bindings, permutation.specialization, false,
+			                 source_entry.gpu_reads_lowered);
 		}
 		input_info.stage = {.program       = &permutation.program,
 		                    .resources     = std::move(resources),

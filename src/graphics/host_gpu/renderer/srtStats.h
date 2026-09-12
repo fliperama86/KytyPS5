@@ -35,7 +35,11 @@ struct StageEvent {
 	uint32_t    sampler_sources        = 0;
 	uint32_t    indirect_image_sources = 0;
 	uint32_t    flat_insts             = 0;
+	// Memory reads in the flat program, and the plan's flat SRT slot count with the share of it
+	// the shader evaluates in its own prologue (stage 1b).
 	uint32_t    flat_reads             = 0;
+	uint32_t    flat_read_slots        = 0;
+	uint32_t    gpu_read_slots         = 0;
 	// Identity of the tuple over every buffer resource of the specialized
 	// (packed_stride, descriptor_format, descriptor_swizzle).
 	uint64_t buffer_layout_key = 0;
@@ -68,6 +72,9 @@ enum class GpuDescriptorEvent : uint32_t {
 void BeginEvent(bool dispatch);
 void RecordStage(const StageEvent& event);
 void RecordGpuDescriptor(GpuDescriptorEvent event);
+// One program whose module lowered flat SRT reads, with the split of its slots. Called once, when
+// the program cache adopts the mask from a freshly compiled module (stage 1b).
+void RecordGpuReadProgram(uint32_t lowered, uint32_t cpu);
 void EndEvent();
 void RecordGraphicsPipeline(const void* pipeline);
 void EndFrame();

@@ -149,12 +149,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (program.info.gpu_descriptors) {
 		AddBinding(next, DescriptorBindingKind::DescriptorFeedback);
 	}
-	const bool uses_flattened_runtime =
-	    !program.srt_reads.empty() ||
-	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_search_iterations != 0u;
-	    });
-	if (uses_flattened_runtime) {
+	if (UsesFlattenedRuntime(program)) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 

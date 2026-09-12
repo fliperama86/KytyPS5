@@ -577,7 +577,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 
 static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& runtime,
                                 MaterializedSnapshot& snapshot, MaterializeReport* report,
-                                std::span<const uint8_t> skip_sources) {
+                                std::span<const uint8_t> skip_sources,
+                                std::span<const uint8_t> skip_flat_slots) {
 #if defined(TRACY_ENABLE)
 	KYTY_PROFILER_BLOCK("MaterializeSnapshot");
 #endif
@@ -599,7 +600,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	std::vector<uint8_t>         active_sources;
 	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
 	                            flattened_srt, program.clean_flat_slots, active_sources,
-	                            skip_sources)) {
+	                            skip_sources, skip_flat_slots)) {
 		if (report != nullptr) {
 			const auto& failure        = LastSrtFailure();
 			report->failure_detail     = FormatSrtFailure(failure);
@@ -1367,7 +1368,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
-	if (!MaterializeSnapshot(program, runtime, materialized, report, skip_sources)) {
+	// Stage 1b: the marked flat SRT slots are skipped whether or not this draw keeps the baked
+	// specialization, because the module never reads them from the buffer on either path.
+	const std::span<const uint8_t> skip_flat_slots =
+	    gpu_fetch != nullptr ? gpu_fetch->flat_slots : std::span<const uint8_t> {};
+	if (!MaterializeSnapshot(program, runtime, materialized, report, skip_sources,
+	                         skip_flat_slots)) {
 		return false;
 	}
 	if (!BuildResourceSpecialization(program, std::move(materialized), snapshot, specialization,

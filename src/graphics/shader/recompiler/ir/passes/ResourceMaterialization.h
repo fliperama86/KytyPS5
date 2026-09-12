@@ -72,7 +72,12 @@ struct MaterializeReport {
 struct GpuFetchOverride {
 	// One byte per entry in ResourcePlan::info.buffers, non-zero for a gpu_fetch resource.
 	std::span<const uint8_t> buffers;
-	// Tuples of the program's last CPU materialization. Must cover every marked buffer.
+	// One byte per flat SRT slot, non-zero where the shader evaluates the read itself (stage 1b).
+	// Those slots stay zero in the snapshot on either path: a module compiled with in-shader reads
+	// never loads them from the FlattenedSrt binding, and nothing on the host reads them either.
+	std::span<const uint8_t> flat_slots;
+	// Tuples of the program's last CPU materialization. Must cover every marked buffer. Null on a
+	// draw that still materializes its descriptors on the CPU, which leaves `buffers` inert.
 	const ResourceSpecialization* specialization = nullptr;
 };
 

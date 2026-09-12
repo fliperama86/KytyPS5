@@ -384,6 +384,9 @@ struct EmitterState {
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         descriptor_feedback_variable = 0;
 	std::array<GpuFetchBuffer, IR::ShaderInfo::MaxBuffers> gpu_fetch_buffers {};
+	// Stage 1b: one u32 id per flat SRT slot, the value EmitGpuFetchDescriptors lowered in the
+	// prologue. Zero where the slot still comes from the FlattenedSrt binding.
+	std::vector<uint32_t>                            gpu_read_values;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
@@ -824,18 +827,24 @@ SrtLoweredRoot EmitSrtFlatRoot(ValueEmitContext& ctx, const IR::SrtFlatProgram& 
                                const IR::SrtFlatRoot& root, std::span<const uint32_t> results,
                                const SrtLoweringInputs& inputs);
 
-// Evaluates every gpu_fetch buffer descriptor once in the function prologue and records a
-// specialization mismatch in the DescriptorFeedback buffer. A no-op without gpu_descriptors.
+// Evaluates every gpu_fetch buffer descriptor and every marked flat SRT read once in the
+// function prologue and records a specialization mismatch in the DescriptorFeedback buffer.
+// A no-op without gpu_descriptors.
 void EmitGpuFetchDescriptors(ValueEmitContext& ctx);
 
 // Test-only standalone compute module: runs every descriptor-source root and stores each source's
-// dwords, its validity word and its "lowered" word into storage buffer 0 at `source_stride`.
+// dwords, its validity word and its "lowered" word into storage buffer 0 at `source_stride`, then
+// runs every flat SRT read root and stores its value, validity and "lowered" word at
+// `read_origin` + slot * `read_stride`. The read half is the stage 1b lowering under test
+// (docs/gpu-descriptor-fetch.md); a zero `read_stride` skips it.
 std::vector<uint32_t> EmitSrtFlatProgramTestModule(const IR::Program& program,
                                                    ShaderStageInputInfo      input_info,
                                                    const IR::SrtFlatProgram& flat,
                                                    std::span<const uint32_t> dword_counts,
                                                    const SrtLoweringInputs&  inputs,
-                                                   uint32_t                  source_stride);
+                                                   uint32_t                  source_stride,
+                                                   uint32_t                  read_origin = 0,
+                                                   uint32_t                  read_stride = 0);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

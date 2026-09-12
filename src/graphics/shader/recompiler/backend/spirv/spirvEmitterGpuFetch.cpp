@@ -1,9 +1,12 @@
-// Shader-side buffer descriptor fetch (docs/gpu-descriptor-fetch.md, stage 1).
+// Shader-side buffer descriptor fetch (docs/gpu-descriptor-fetch.md, stages 1 and 1b).
 //
 // MarkGpuFetchBuffers (ir/passes/GpuDescriptorFetch.cpp) picks the buffer resources whose SRT root
-// the shader can evaluate itself. This file emits that evaluation once in the function prologue:
-// every gpu_fetch root is lowered with EmitSrtFlatRoot, its four dwords are decoded as a V#, and
-// the resulting base and GCN range are parked in EmitterState::gpu_fetch_buffers, where
+// the shader can evaluate itself, and the flat SRT read slots it can evaluate instead of loading
+// them from the FlattenedSrt binding. This file emits that evaluation once in the function
+// prologue. Each marked read slot is lowered with EmitSrtFlatRoot and parked in
+// EmitterState::gpu_read_values, where the ReadConst case of spirvEmitterMemory.cpp picks it up.
+// Each gpu_fetch descriptor root is lowered the same way, its four dwords are decoded as a V#,
+// and the resulting base and GCN range are parked in EmitterState::gpu_fetch_buffers, where
 // PrepareStorageBufferResourceAccess picks them up in place of the bound descriptor.
 //
 // The decode mirrors the host exactly: ShaderBufferResource in graphics/shader/shaderBindings.h
@@ -123,6 +126,34 @@ void EmitGpuFetchDescriptors(ValueEmitContext& ctx) {
 	}
 	const auto& flat     = state.program.flat;
 	uint32_t    mismatch = 0;
+	// Stage 1b: the flat SRT reads the shader evaluates for itself. Lowered first so the uniform
+	// values dominate every use in the body, and independently of the descriptors: a program may
+	// have marked reads and no marked buffer.
+	const auto& read_slots = state.program.info.gpu_read_slots;
+	if (!read_slots.empty()) {
+		state.gpu_read_values.assign(read_slots.size(), 0u);
+		for (uint32_t slot = 0; slot < read_slots.size(); slot++) {
+			if (read_slots[slot] == 0u) {
+				continue;
+			}
+			if (slot >= flat.flat_reads.size()) {
+				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::FlattenedSrt, slot,
+				                             "shader-fetched SRT read has no flat root");
+			}
+			const auto&                   root = flat.flat_reads[slot];
+			const std::array<uint32_t, 1> results {root.result};
+			const auto lowered = EmitSrtFlatRoot(ctx, flat, root, results, {});
+			if (!lowered.supported || lowered.count != results.size()) {
+				ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::FlattenedSrt, slot,
+				                             "shader-fetched SRT read has no SPIR-V lowering");
+			}
+			// A root the shader could not walk reads as zero, exactly as an invalid descriptor
+			// root does; the unmapped page it failed on already set its fault bit.
+			state.gpu_read_values[slot] =
+			    Select(state, TypeU32(state), lowered.valid, Narrow(state, lowered.results[0]),
+			           ConstantU32(state, 0));
+		}
+	}
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); resource++) {
 		const auto& buffer = state.program.info.buffers[resource];
 		if (!buffer.gpu_fetch) {

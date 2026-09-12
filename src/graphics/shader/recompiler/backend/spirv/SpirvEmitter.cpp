@@ -81,12 +81,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (program.info.gpu_descriptors) {
 		Expect(Kind::DescriptorFeedback);
 	}
-	const bool uses_flattened_runtime =
-	    !program.srt_reads.empty() ||
-	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
-	     });
-	if (uses_flattened_runtime) {
+	if (IR::UsesFlattenedRuntime(program)) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {

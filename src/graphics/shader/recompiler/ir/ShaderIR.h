@@ -452,6 +452,10 @@ struct ShaderInfo {
 	// Any buffer resource has gpu_fetch. Implies the BdaPagetable, FaultBuffer and
 	// DescriptorFeedback bindings, the physical addressing model and a PrepareBda before use.
 	bool                             gpu_descriptors    = false;
+	// Stage 1b (docs/gpu-descriptor-fetch.md): one byte per flat SRT slot, non-zero where the
+	// shader evaluates the read itself in its prologue instead of loading it from the
+	// FlattenedSrt binding. Empty unless --gpu-srt-reads marked something.
+	std::vector<uint8_t>             gpu_read_slots;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

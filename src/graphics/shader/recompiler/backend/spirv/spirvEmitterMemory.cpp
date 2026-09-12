@@ -1104,6 +1104,15 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ReadConst) {
+		// Stage 1b (docs/gpu-descriptor-fetch.md): a slot the prologue evaluated for itself never
+		// reaches the FlattenedSrt binding, which the layout may have dropped entirely.
+		const auto slot = inst.NumArgs() == 2 ? inst.Arg(1).Resolve() : IR::Value {};
+		if (slot.IsImmediate() && slot.GetType() == IR::Type::U32 &&
+		    slot.U32() < state.gpu_read_values.size() &&
+		    state.gpu_read_values[slot.U32()] != 0) {
+			ctx.Define(inst, state.gpu_read_values[slot.U32()]);
+			return true;
+		}
 		if (state.flattened_srt_variable == 0) {
 			ctx.Fail(inst, "requires the flattened SRT descriptor");
 			return true;

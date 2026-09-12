@@ -83,6 +83,10 @@ bool GpuDescriptorsEnabled() {
 	return g_config->gpu_descriptors_enabled;
 }
 
+bool GpuSrtReadsEnabled() {
+	return g_config->gpu_descriptors_enabled && g_config->gpu_srt_reads_enabled;
+}
+
 bool GpuIndirectEnabled() {
 	return g_config->gpu_indirect_enabled;
 }

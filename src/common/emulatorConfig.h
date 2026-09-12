@@ -72,6 +72,9 @@ struct ConfigOptions {
 	bool                   shader_storage_image_bounds_check_enabled = true;
 	// Shaders evaluate eligible buffer descriptors in-shader (docs/gpu-descriptor-fetch.md).
 	bool                   gpu_descriptors_enabled = false;
+	// Stage 1b of the same document: the flattened SRT scalar reads are lowered into the shader
+	// prologue too, so the render thread stops evaluating them. Needs gpu_descriptors_enabled.
+	bool                   gpu_srt_reads_enabled = false;
 	// Vulkan consumes indirect draw and dispatch arguments in place instead of the render thread
 	// reading them back from the GPU (docs/performance-roadmap.md, item 1).
 	bool                   gpu_indirect_enabled = false;
@@ -146,6 +149,7 @@ bool                   ShaderValidationEnabled();
 bool                   ShaderLdsWaitcntBarrierEnabled();
 bool                   ShaderStorageImageBoundsCheckEnabled();
 bool                   GpuDescriptorsEnabled();
+bool                   GpuSrtReadsEnabled();
 bool                   GpuIndirectEnabled();
 bool                   GpuIndirectDrawsEnabled();
 bool                   BdaAsyncProtectEnabled();

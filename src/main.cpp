@@ -68,6 +68,10 @@ static void PrintUsage() {
 	::printf("  --gpu-descriptors <t|f>              Evaluate eligible buffer descriptors in the\n"
 	         "                                       shader instead of on the render thread.\n"
 	         "                                       Experimental. Default: false.\n");
+	::printf("  --gpu-srt-reads <t|f>                Also evaluate the flattened SRT scalar\n"
+	         "                                       reads in the shader. Only has an effect\n"
+	         "                                       with --gpu-descriptors true.\n"
+	         "                                       Default: false.\n");
 	::printf("  --gpu-indirect <true|false>          Let Vulkan consume indirect dispatch\n"
 	         "                                       arguments in place instead of reading\n"
 	         "                                       them back on the render thread.\n"
@@ -358,6 +362,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu-descriptors") {
 			if (!ParseBool(value, options.config.gpu_descriptors_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--gpu-srt-reads") {
+			if (!ParseBool(value, options.config.gpu_srt_reads_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

@@ -2174,7 +2174,8 @@ struct FlatRegistersLease {
 bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> sources,
                         const SrtRuntime& runtime, bool evaluate_flat,
                         std::span<const uint8_t> clean_flat_slots,
-                        std::span<const uint8_t> skip_sources, SourceScratch& scratch) {
+                        std::span<const uint8_t> skip_sources,
+                        std::span<const uint8_t> skip_flat_slots, SourceScratch& scratch) {
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
 	std::array<std::byte, 4096> evaluator_storage;
@@ -2246,6 +2247,11 @@ bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> s
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
+			// A slot the shader evaluates itself is left zeroed; nothing on the host reads it.
+			if (read.flat_offset < skip_flat_slots.size() &&
+			    skip_flat_slots[read.flat_offset] != 0u) {
+				continue;
+			}
 			const bool clean    = read.flat_offset < clean_flat_slots.size() &&
 			                      clean_flat_slots[read.flat_offset] != 0u;
 			auto&      selected = clean ? clean_evaluator : evaluator;
@@ -2264,7 +2270,8 @@ bool EvaluateWithWalker(const ResourcePlan& program, std::span<const uint32_t> s
 bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32_t> sources,
                              const SrtRuntime& runtime, bool evaluate_flat,
                              std::span<const uint8_t> clean_flat_slots,
-                             std::span<const uint8_t> skip_sources, SourceScratch& scratch) {
+                             std::span<const uint8_t> skip_sources,
+                             std::span<const uint8_t> skip_flat_slots, SourceScratch& scratch) {
 	const auto&        flat = program.flat;
 	FlatRegistersLease lease;
 	FlatMachine        machine(flat, runtime, lease.registers);
@@ -2336,7 +2343,12 @@ bool EvaluateWithFlatProgram(const ResourcePlan& program, std::span<const uint32
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (size_t index = 0; index < program.srt_reads.size(); index++) {
-			const auto& read  = program.srt_reads[index];
+			const auto& read = program.srt_reads[index];
+			// A slot the shader evaluates itself is left zeroed; nothing on the host reads it.
+			if (read.flat_offset < skip_flat_slots.size() &&
+			    skip_flat_slots[read.flat_offset] != 0u) {
+				continue;
+			}
 			const bool  clean = read.flat_offset < clean_flat_slots.size() &&
 			                   clean_flat_slots[read.flat_offset] != 0u;
 			const auto& root = clean ? flat.clean_flat_reads[index] : flat.flat_reads[index];
@@ -2354,8 +2366,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
                                 std::span<const uint8_t> clean_flat_slots,
-                                std::vector<uint8_t>& active_sources,
-                                std::span<const uint8_t> skip_sources) {
+                                std::vector<uint8_t>&    active_sources,
+                                std::span<const uint8_t> skip_sources,
+                                std::span<const uint8_t> skip_flat_slots = {}) {
 #if defined(TRACY_ENABLE)
 	KYTY_PROFILER_BLOCK("EvaluateRuntimeSourcesImpl");
 #endif
@@ -2383,9 +2396,9 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	const bool evaluated =
 	    FlatPlanUsable(program, clean_flat_slots)
 	        ? EvaluateWithFlatProgram(program, sources, runtime, evaluate_flat, clean_flat_slots,
-                                  skip_sources, scratch)
+                                  skip_sources, skip_flat_slots, scratch)
 	        : EvaluateWithWalker(program, sources, runtime, evaluate_flat, clean_flat_slots,
-                             skip_sources, scratch);
+                             skip_sources, skip_flat_slots, scratch);
 	if (!evaluated) {
 		return false;
 	}
@@ -2541,10 +2554,12 @@ bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint
 bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
-                            std::vector<uint8_t>& active_sources,
-                            std::span<const uint8_t> skip_sources) {
+                            std::vector<uint8_t>&    active_sources,
+                            std::span<const uint8_t> skip_sources,
+                            std::span<const uint8_t> skip_flat_slots) {
 	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true,
-	                                  clean_flat_slots, active_sources, skip_sources);
+	                                  clean_flat_slots, active_sources, skip_sources,
+	                                  skip_flat_slots);
 }
 
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat) {

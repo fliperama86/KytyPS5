@@ -48,10 +48,12 @@ inline constexpr uint32_t SlotChainOne = 256; // address pair -> SlotChainTwo
 inline constexpr uint32_t SlotChainTwo = 512; // address pair -> SlotPayloadC
 inline constexpr uint32_t SlotPayloadC = 768; // 8 words
 
-// Output layout: one slice per descriptor source.
+// Output layout: one slice per descriptor source, then one slice per flat SRT read slot.
 inline constexpr uint32_t SourceStride  = 16u;
 inline constexpr uint32_t ValidWordSlot = 8u;  // 1 when the shader root produced values
 inline constexpr uint32_t LoweredSlot   = 9u;  // 1 when every step of the root had a lowering
+inline constexpr uint32_t ReadOrigin    = 1024u;
+inline constexpr uint32_t ReadStride    = 4u;  // value, validity, lowered
 
 // GetShaderBase is a per-draw constant; the shader lowering takes the same value as a literal.
 inline constexpr uint64_t ShaderBase = 0x0123456789abcdefull;
@@ -62,6 +64,11 @@ struct SyntheticPlan {
 	std::array<uint32_t, 64>   user_data {};
 	std::vector<std::string>   case_names;
 	std::vector<uint32_t>      dword_counts;
+	// One entry per flat SRT read slot (stage 1b of docs/gpu-descriptor-fetch.md).
+	std::vector<std::string>   read_names;
+	// Non-zero where the root cannot be evaluated at all: the CPU evaluator fails the slot and the
+	// shader reads zero with its validity bool clear.
+	std::vector<uint8_t>       read_invalid;
 };
 
 namespace detail {
@@ -423,6 +430,32 @@ inline SyntheticPlan BuildSyntheticPlan() {
 		             b.Imm(0u)),
 		};
 		add_source("user-data-and-shader-base", dwords);
+	}
+
+	// Flat SRT read slots. BuildSrtPlan gives every immediate ReadConst a dense slot; these are
+	// built by hand the same way, slot index == flat offset, and are the stage 1b test cases.
+	{
+		const auto add_read = [&](const char* name, SIR::Value value, bool invalid) {
+			const auto slot = static_cast<uint32_t>(program.srt_reads.size());
+			program.srt_reads.push_back({value, slot});
+			built.read_names.emplace_back(name);
+			built.read_invalid.push_back(invalid ? 1u : 0u);
+		};
+		const auto level1 = b.Chase(root, SlotChainPtr);
+		const auto level2 = b.Chase(level1, 0);
+		const auto level3 = b.Chase(level2, 0);
+		add_read("read-chain-3-deep", b.Load(level3, 4u), false);
+		add_read("read-user-data", b.UserData(2), false);
+		add_read("read-buffer-in-range", b.LoadBuffer(in_buf, (SlotPayloadB + 2u) * 4u), false);
+		add_read("read-alu-mix",
+		         b.Binary(Op::BitwiseXor32,
+		                  b.Binary(Op::IAdd32, b.Load(level3, 0u), b.UserData(3)),
+		                  b.Binary(Op::ShiftRightLogical32, b.Load(root, SlotPayloadA * 4u),
+		                           b.Imm(3u))),
+		         false);
+		add_read("read-buffer-out-of-range",
+		         b.LoadBuffer(out_buf, (SlotPayloadA + 8u) * 4u), true);
+		add_read("read-unmapped-page", b.Load(b.Chase(root, SlotBadPtr), 0u), true);
 	}
 
 	built.plan = SIR::ExtractResourcePlan(program);

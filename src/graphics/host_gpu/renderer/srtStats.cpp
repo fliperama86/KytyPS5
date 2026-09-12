@@ -56,6 +56,8 @@ struct ShaderRecord {
 	uint64_t    push_overflow          = 0;
 	uint32_t    flat_insts             = 0;
 	uint32_t    flat_reads             = 0;
+	uint32_t    flat_read_slots        = 0;
+	uint32_t    gpu_read_slots         = 0;
 	bool        uses_dma               = false;
 
 	std::unordered_set<uint64_t> buffer_layouts;
@@ -78,11 +80,18 @@ struct Accumulator {
 struct GpuDescriptorCounters {
 	uint64_t gpu_fetch_draws      = 0;
 	uint64_t gpu_fetch_dispatches = 0;
+	// Stage 1b: programs whose module lowered flat SRT reads, and the split of their slots.
+	uint64_t read_programs     = 0;
+	uint64_t read_slots_shader = 0;
+	uint64_t read_slots_cpu    = 0;
 	std::array<uint64_t, static_cast<size_t>(GpuDescriptorEvent::Count)> events {};
 
 	void Add(const GpuDescriptorCounters& other) {
 		gpu_fetch_draws += other.gpu_fetch_draws;
 		gpu_fetch_dispatches += other.gpu_fetch_dispatches;
+		read_programs += other.read_programs;
+		read_slots_shader += other.read_slots_shader;
+		read_slots_cpu += other.read_slots_cpu;
 		for (size_t i = 0; i < events.size(); i++) {
 			events[i] += other.events[i];
 		}
@@ -91,7 +100,7 @@ struct GpuDescriptorCounters {
 		return events[static_cast<size_t>(event)];
 	}
 	[[nodiscard]] bool Empty() const {
-		return gpu_fetch_draws == 0 && gpu_fetch_dispatches == 0 &&
+		return gpu_fetch_draws == 0 && gpu_fetch_dispatches == 0 && read_programs == 0 &&
 		       std::all_of(events.begin(), events.end(), [](uint64_t v) { return v == 0; });
 	}
 };
@@ -134,6 +143,8 @@ struct Collector {
 	uint32_t flat_insts_max = 0;
 	uint64_t flat_reads_sum = 0;
 	uint32_t flat_reads_max = 0;
+	uint64_t flat_read_slots_sum = 0;
+	uint64_t gpu_read_slots_sum  = 0;
 
 	// GPU-side descriptor fetch: totals for the run, and for the frames since the last line.
 	GpuDescriptorCounters gpu_descriptors;
@@ -236,13 +247,14 @@ void PrintGpuDescriptorsLocked(Collector& collector) {
 	auto line = [](const char* scope, const GpuDescriptorCounters& counters) {
 		return fmt::format(
 		    "{} draws={} dispatches={} cpu_first={} cpu_feedback={} cpu_pinned={} bits={} "
-		    "pinned={}",
+		    "pinned={} read_programs={} reads_shader={} reads_cpu={}",
 		    scope, counters.gpu_fetch_draws, counters.gpu_fetch_dispatches,
 		    counters.Event(GpuDescriptorEvent::CpuFirst),
 		    counters.Event(GpuDescriptorEvent::CpuFeedback),
 		    counters.Event(GpuDescriptorEvent::CpuPinned),
 		    counters.Event(GpuDescriptorEvent::FeedbackBit),
-		    counters.Event(GpuDescriptorEvent::ProgramPinned));
+		    counters.Event(GpuDescriptorEvent::ProgramPinned), counters.read_programs,
+		    counters.read_slots_shader, counters.read_slots_cpu);
 	};
 	std::printf("SrtStats gpu-descriptors frame %" PRIu64 ": %s | %s\n", collector.frames,
 	            line("run", run).c_str(),
@@ -315,6 +327,8 @@ void WriteLocked(Collector& collector) {
 	out += fmt::format("\t\t\"flat_insts_max\": {},\n", collector.flat_insts_max);
 	out += fmt::format("\t\t\"flat_reads_sum\": {},\n", collector.flat_reads_sum);
 	out += fmt::format("\t\t\"flat_reads_max\": {},\n", collector.flat_reads_max);
+	out += fmt::format("\t\t\"flat_read_slots_sum\": {},\n", collector.flat_read_slots_sum);
+	out += fmt::format("\t\t\"gpu_read_slots_sum\": {},\n", collector.gpu_read_slots_sum);
 	const auto& gpu = collector.gpu_descriptors;
 	out += fmt::format("\t\t\"gpu_fetch_draws\": {},\n", gpu.gpu_fetch_draws);
 	out += fmt::format("\t\t\"gpu_fetch_dispatches\": {},\n", gpu.gpu_fetch_dispatches);
@@ -328,6 +342,9 @@ void WriteLocked(Collector& collector) {
 	                   gpu.Event(GpuDescriptorEvent::FeedbackBit));
 	out += fmt::format("\t\t\"gpu_fetch_programs_pinned\": {},\n",
 	                   gpu.Event(GpuDescriptorEvent::ProgramPinned));
+	out += fmt::format("\t\t\"gpu_read_programs\": {},\n", gpu.read_programs);
+	out += fmt::format("\t\t\"gpu_read_slots_shader\": {},\n", gpu.read_slots_shader);
+	out += fmt::format("\t\t\"gpu_read_slots_cpu\": {},\n", gpu.read_slots_cpu);
 	AppendHistogram(out, "sources_per_event_histogram", collector.sources_histogram, ",");
 	AppendHistogram(out, "distinct_buffer_layouts_histogram", buffer_layout_histogram, ",");
 	AppendHistogram(out, "distinct_vertex_layouts_histogram", vertex_layout_histogram, ",");
@@ -343,12 +360,14 @@ void WriteLocked(Collector& collector) {
 		    "\"descriptor_sources\": {}, \"buffer_sources\": {}, \"scalar_buffer_sources\": {}, "
 		    "\"image_sources\": {}, \"sampler_sources\": {}, \"indirect_image_sources\": {}, "
 		    "\"uses_dma\": {}, \"push_overflow\": {}, \"distinct_buffer_layouts\": {}, "
-		    "\"distinct_vertex_layouts\": {}, \"flat_insts\": {}, \"flat_reads\": {}}}{}\n",
+		    "\"distinct_vertex_layouts\": {}, \"flat_insts\": {}, \"flat_reads\": {}, "
+		    "\"flat_read_slots\": {}, \"gpu_read_slots\": {}}}{}\n",
 		    record.hash, record.stage, record.events, record.descriptor_sources,
 		    record.buffer_sources, record.scalar_buffer_sources, record.image_sources,
 		    record.sampler_sources, record.indirect_image_sources,
 		    record.uses_dma ? "true" : "false", record.push_overflow, record.buffer_layouts.size(),
 		    record.vertex_layouts.size(), record.flat_insts, record.flat_reads,
+		    record.flat_read_slots, record.gpu_read_slots,
 		    i + 1 == ordered.size() ? "" : ",");
 	}
 	out += "\t]\n";
@@ -419,6 +438,8 @@ void RecordStage(const StageEvent& event) {
 	collector.flat_insts_max = std::max(collector.flat_insts_max, event.flat_insts);
 	collector.flat_reads_sum += event.flat_reads;
 	collector.flat_reads_max = std::max(collector.flat_reads_max, event.flat_reads);
+	collector.flat_read_slots_sum += event.flat_read_slots;
+	collector.gpu_read_slots_sum += event.gpu_read_slots;
 
 	const uint64_t key    = ShaderKey(event.stage_name, event.shader_hash);
 	auto&          record = collector.shaders[key];
@@ -436,6 +457,8 @@ void RecordStage(const StageEvent& event) {
 	record.push_overflow += event.push_overflow ? 1u : 0u;
 	record.flat_insts = std::max(record.flat_insts, event.flat_insts);
 	record.flat_reads = std::max(record.flat_reads, event.flat_reads);
+	record.flat_read_slots = std::max(record.flat_read_slots, event.flat_read_slots);
+	record.gpu_read_slots  = std::max(record.gpu_read_slots, event.gpu_read_slots);
 	record.uses_dma   = record.uses_dma || event.uses_dma;
 	record.buffer_layouts.insert(event.buffer_layout_key);
 	if (event.has_vertex_layout) {
@@ -443,6 +466,19 @@ void RecordStage(const StageEvent& event) {
 	}
 
 	collector.frame_shaders.insert(key);
+}
+
+void RecordGpuReadProgram(uint32_t lowered, uint32_t cpu) {
+	if (!Detail::enabled) {
+		return;
+	}
+	auto&                                 collector = Instance();
+	std::lock_guard<std::recursive_mutex> lock(collector.mutex);
+	for (auto* counters: {&collector.gpu_descriptors, &collector.gpu_descriptors_window}) {
+		counters->read_programs++;
+		counters->read_slots_shader += lowered;
+		counters->read_slots_cpu += cpu;
+	}
 }
 
 void RecordGpuDescriptor(GpuDescriptorEvent event) {

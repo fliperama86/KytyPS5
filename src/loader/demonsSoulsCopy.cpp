@@ -32,7 +32,11 @@ void Install(Program* program) {
 	// Hash the complete audited shared memmove/bcopy body, not just the prologue.
 	// This entry follows the guest's argument/stack checks and has one saved RBP.
 	// Changed module versions, relocations, or platform loader patches fail closed.
-	if (XXH3_64bits(bytes, verify_size) != 0xe654325b8be848a9ull) return;
+	if (XXH3_64bits(bytes, verify_size) != 0xe654325b8be848a9ull) {
+		LOGF("Demon's Souls copy: libc memmove hash differs; retaining guest code
+");
+		return;
+	}
 	std::memcpy(original.data(), bytes, original.size());
 	patch = Tailcall(reinterpret_cast<uint64_t>(&CoherentMove));
 	std::memcpy(reinterpret_cast<void*>(address), patch.data(), patch.size());

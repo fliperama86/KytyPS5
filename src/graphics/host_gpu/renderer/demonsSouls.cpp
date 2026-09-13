@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 
+#include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -15,9 +16,13 @@ bool IsSupportedGame() {
 	// Called by the dispatch path after game metadata has been loaded.
 	static const bool supported = [] {
 		std::string title, version;
-		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title) &&
-		       Loader::SystemContentParamSfoGetString("APP_VER", &version) &&
-		       IsSupportedVersion(title, version);
+		const bool  active = Loader::SystemContentParamSfoGetString("TITLE_ID", &title) &&
+		                    Loader::SystemContentParamSfoGetString("APP_VER", &version) &&
+		                    IsSupportedVersion(title, version);
+		LOGF("Demon's Souls profile: %s for %s %s
+", active ? "active" : "inactive",
+		     title.c_str(), version.c_str());
+		return active;
 	}();
 	return supported;
 }

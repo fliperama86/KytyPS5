@@ -8,6 +8,7 @@
 #include "loader/systemContent.h"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -16,7 +17,10 @@ bool IsSupportedGame() {
 	// Called by the dispatch path after game metadata has been loaded.
 	static const bool supported = [] {
 		std::string title, version;
-		const bool  active = Loader::SystemContentParamSfoGetString("TITLE_ID", &title) &&
+		// KYTY_DES_PROFILE=0 switches the profile off for A/B runs of one binary.
+		const char* override_env = std::getenv("KYTY_DES_PROFILE");
+		const bool  forced_off   = override_env != nullptr && std::strcmp(override_env, "0") == 0;
+		const bool  active = !forced_off && Loader::SystemContentParamSfoGetString("TITLE_ID", &title) &&
 		                    Loader::SystemContentParamSfoGetString("APP_VER", &version) &&
 		                    IsSupportedVersion(title, version);
 		LOGF("Demon's Souls profile: %s for %s %s\n", active ? "active" : "inactive",

@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -643,6 +644,19 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		feedback_layout.pNext  = &feedback_dynamic;
 		supported_features2.pNext = &feedback_layout;
 	}
+	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
+	const bool diagnostics_extension =
+	    HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+	if (diagnostics_extension) {
+		diagnostics_features.pNext = supported_features2.pNext;
+		supported_features2.pNext = &diagnostics_features;
+	}
+	const bool fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	if (fault_extension) {
+		fault_features.pNext = supported_features2.pNext;
+		supported_features2.pNext = &fault_features;
+	}
 	const bool provoking_extension =
 	    HasExtension(device_extensions, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
 	vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex {};
@@ -652,6 +666,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
+	graphics.device_fault_enabled = fault_extension && fault_features.deviceFault;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -778,6 +793,25 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
+	if (graphics.device_fault_enabled) {
+		fault_features.pNext = const_cast<void*>(create_info.pNext);
+		// Preserve the supported vendor-binary feature only for the explicit diagnostic run.
+		fault_features.deviceFaultVendorBinary =
+		    diagnostics_extension ? fault_features.deviceFaultVendorBinary : VK_FALSE;
+		create_info.pNext = &fault_features;
+	}
+	vk::DeviceDiagnosticsConfigCreateInfoNV diagnostics_config {};
+	if (diagnostics_extension && diagnostics_features.diagnosticsConfig) {
+		diagnostics_features.pNext = const_cast<void*>(create_info.pNext);
+		diagnostics_config.pNext = &diagnostics_features;
+		diagnostics_config.flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+		                           vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+		                           vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting;
+		create_info.pNext = &diagnostics_config;
+		std::printf("NVIDIA fault details: resource tracking, shader debug info, shader error reporting enabled\n");
+	} else if (diagnostics_extension) {
+		std::printf("NVIDIA fault details: diagnosticsConfig feature unavailable\n");
+	}
 
 	vk::Device device = nullptr;
 
@@ -1163,6 +1197,20 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		if (Config::GraphicsDebugDumpEnabled()) {
+			if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+			}
+			if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+				graphic_ctx.diagnostic_checkpoints_enabled = true;
+			}
+			if (const char* details = std::getenv("KYTY_DEBUG_NV_FAULT_DETAILS");
+			    details != nullptr && std::strcmp(details, "1") == 0 &&
+			    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+			}
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
@@ -1186,6 +1234,12 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	if (Config::GraphicsDebugDumpEnabled()) {
+		std::printf("GPU fault diagnostics: device_fault=%s checkpoints=%s\n",
+		            graphic_ctx.device_fault_enabled ? "enabled" : "unavailable",
+		            graphic_ctx.diagnostic_checkpoints_enabled ? "enabled" : "unavailable");
+		std::fflush(stdout);
+	}
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);

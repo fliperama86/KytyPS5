@@ -28,6 +28,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               device_fault_enabled                  = false;
+	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
@@ -47,6 +49,12 @@ struct GraphicContext {
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
+	}
+
+	void RecordShaderCheckpoint(vk::CommandBuffer command, uint64_t shader_hash) const {
+		if (diagnostic_checkpoints_enabled) {
+			command.setCheckpointNV(reinterpret_cast<const void*>(static_cast<uintptr_t>(shader_hash)));
+		}
 	}
 
 	[[nodiscard]] const vk::PhysicalDeviceMemoryProperties&

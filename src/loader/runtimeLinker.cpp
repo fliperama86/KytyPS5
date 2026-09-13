@@ -19,6 +19,7 @@
 #include "loader/demonsSoulsIdle.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/elf.h"
+#include "loader/desTouchTrace.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
 #include "loader/redZonePatcher.h"
@@ -808,8 +809,130 @@ static std::string DescribeGuestCode(uint64_t vaddr) {
 	}
 	return bytes;
 }
+
+// Opt-in diagnostics for an unhandled guest exception. The normal page-fault
+// handler must get the first opportunity to service renderer memory faults.
+static void DumpGuestFaultContext(const Common::HostException::ExceptionInfo& info) {
+	const char* enabled = std::getenv("KYTY_DEBUG_GUEST_FAULT");
+	if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
+		return;
+	}
+
+	::printf("GuestFault: pc=%016" PRIx64 " (%s) thread=%d\n",
+	         info.exception_address, DescribeGuestAddress(info.exception_address).c_str(),
+	         Common::Thread::GetThreadIdUnique());
+	::printf("GuestFault: rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64
+	         " rdx=%016" PRIx64 "\n", info.rax, info.rbx, info.rcx, info.rdx);
+	::printf("GuestFault: rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64
+	         " rsp=%016" PRIx64 "\n", info.rsi, info.rdi, info.rbp, info.rsp);
+	::printf("GuestFault: r8=%016" PRIx64 " r9=%016" PRIx64 " r10=%016" PRIx64
+	         " r11=%016" PRIx64 "\n", info.r8, info.r9, info.r10, info.r11);
+	::printf("GuestFault: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64
+	         " r15=%016" PRIx64 "\n", info.r12, info.r13, info.r14, info.r15);
+
+	void* frames[32] {};
+	const int depth = WalkGuestStack(info.rbp, info.rsp, frames, static_cast<int>(std::size(frames)));
+	for (int i = 0; i < depth; ++i) {
+		const auto address = reinterpret_cast<uint64_t>(frames[i]);
+		::printf("GuestFault: frame[%d]=%016" PRIx64 " (%s)\n", i, address,
+		         DescribeGuestAddress(address).c_str());
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// ReadProcessMemory reports an unreadable diagnostic range without recursively
+	// raising a fault in this handler. Keep each dump small and do not follow links.
+	const std::pair<const char*, uint64_t> ranges[] = {
+	    {"rax", info.rax}, {"rbx", info.rbx}, {"rdi", info.rdi}, {"stack", info.rsp}};
+	for (const auto& [name, address]: ranges) {
+		uint64_t data[64] {};
+		SIZE_T copied = 0;
+		if (address < 0x10000 ||
+		    !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+		                       data, sizeof(data), &copied)) {
+			::printf("GuestFault: %s memory unavailable\n", name);
+			continue;
+		}
+		for (size_t i = 0; i < copied / sizeof(uint64_t); i += 2) {
+			::printf("GuestFault: %s+%03zx [%016" PRIx64 "]=%016" PRIx64
+			         " %016" PRIx64 "\n", name, i * sizeof(uint64_t),
+			         address + i * sizeof(uint64_t), data[i],
+			         i + 1 < copied / sizeof(uint64_t) ? data[i + 1] : uint64_t {0});
+		}
+	}
+#endif
+	std::fflush(stdout);
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static void DumpDesTouchList(const Common::HostException::ExceptionInfo& info) {
+	const char* enabled = std::getenv("KYTY_DEBUG_DES_TOUCH_LIST");
+	if (enabled == nullptr || std::strcmp(enabled, "1") != 0 ||
+	    DescribeGuestAddress(info.exception_address) != "eboot.bin+0xd8c1f5") {
+		return;
+	}
+	// The disassembled PPSA01342 01.005.000 loop keeps its list sentinel in r13
+	// and advances through node+0x18. Snapshot a bounded list before printing it.
+	const auto read = [](uint64_t address, void* data, size_t size) {
+		SIZE_T copied = 0;
+		return address >= 0x10000 &&
+		       ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+		                         data, size, &copied) && copied == size;
+	};
+	uint64_t head[4] {};
+	if (!read(info.r13, head, sizeof(head))) {
+		::printf("GuestTouch: sentinel unreadable\n");
+		return;
+	}
+	struct Node {
+		uint64_t address;
+		uint64_t data[12];
+	};
+	std::vector<Node> nodes;
+	nodes.reserve(1024);
+	uint64_t current = head[3];
+	while (current != info.r13 && nodes.size() < 1024) {
+		Node node {};
+		node.address = current;
+		if (!read(current, node.data, sizeof(node.data))) {
+			break;
+		}
+		nodes.push_back(node);
+		current = node.data[3];
+	}
+	::printf("GuestTouch: sentinel=%016" PRIx64 " first=%016" PRIx64
+	         " count=%zu end=%016" PRIx64 " closed=%d\n", info.r13, head[3], nodes.size(),
+	         current, static_cast<int>(current == info.r13));
+	for (size_t i = 0; i < nodes.size(); ++i) {
+		const auto& node = nodes[i];
+		float key = 0;
+		std::memcpy(&key, &node.data[0], sizeof(key));
+		::printf("GuestTouch: %zu addr=%016" PRIx64 " key=%.9g raw=%016" PRIx64
+		         " pair=%016" PRIx64 " prev=%016" PRIx64 " next=%016" PRIx64
+		         " flags=%016" PRIx64 " owner=%016" PRIx64 " active_next=%016" PRIx64
+		         " active_prev=%016" PRIx64 "\n", i, node.address, static_cast<double>(key),
+		         node.data[0], node.data[1], node.data[2], node.data[3], node.data[8],
+		         node.data[9], node.data[10], node.data[11]);
+	}
+	std::fflush(stdout);
+}
+#endif
+
+static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info);
+
+void InstallHostFaultHandler() {
+	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
+		EXIT("Failed to install the required vectored exception handler\n");
+	}
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (DesTouchTrace::Handle(*info)) {
+		return true;
+	}
+#endif
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
@@ -830,6 +953,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
+	DumpGuestFaultContext(*info);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DumpDesTouchList(*info);
+	DesTouchTrace::Dump(*info);
+#endif
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
@@ -1490,6 +1618,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DesTouchTrace::Install(m_programs.empty() ? nullptr : m_programs.front());
+#endif
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -2095,9 +2226,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	g_faulting_linker = program->rt;
-	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
-		EXIT("Failed to install the required vectored exception handler\n");
-	}
+	InstallHostFaultHandler();
 
 	// program->elf->SetBaseVAddr(program->base_vaddr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

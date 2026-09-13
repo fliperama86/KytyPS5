@@ -22,6 +22,9 @@
 #include <unordered_set>
 #include <vector>
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 #endif

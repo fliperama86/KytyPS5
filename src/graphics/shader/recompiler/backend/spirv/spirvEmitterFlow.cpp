@@ -1,3 +1,4 @@
+#include "common/emulatorConfig.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
@@ -527,10 +528,28 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::ValueOpcode::Reference:
 		case IR::ValueOpcode::ReferenceU32:
 		case IR::ValueOpcode::ControlNop:
-		case IR::ValueOpcode::Waitcnt:
 		case IR::ValueOpcode::Sendmsg:
 		case IR::ValueOpcode::TtraceData:
 		case IR::ValueOpcode::InstPrefetch: return true;
+		case IR::ValueOpcode::Waitcnt: {
+			// Off by default: only titles that rely on the implicit LDS ordering need it.
+			if (!Config::ShaderLdsWaitcntBarrierEnabled() || ctx.half != 0 ||
+			    ShaderWorkgroupInput(state.stage, state.input_info) == nullptr ||
+			    !std::ranges::any_of(state.program.memory_info, [](const auto& memory) {
+				    return memory.kind == IR::ResourceKind::Lds;
+			    })) {
+				return true;
+			}
+			// Guest waves exchange LDS data after S_WAITCNT without S_BARRIER.
+			// Host subgroup invocations need explicit execution and memory ordering.
+			// Keep this wave-local: other waves may take different scalar branches.
+			// Wave64 emulation emits both halves before this single barrier.
+			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeSubgroup),
+			                           ConstantU32(state, ScopeSubgroup),
+			                           ConstantU32(state, semantics)});
+			return true;
+		}
 		case IR::ValueOpcode::Barrier: {
 			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
 			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),

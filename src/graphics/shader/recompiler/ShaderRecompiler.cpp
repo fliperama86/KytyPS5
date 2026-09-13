@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -511,6 +512,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		EXIT("shader recompiler received unsupported stage %u\n",
 		     static_cast<unsigned>(options.stage));
 	}
+
+	// The barrier is emitted from the S_WAITCNT instructions that survive dead code elimination,
+	// so the option has to be visible to the IR before the passes below run.
+	IR::g_waitcnt_has_side_effects = Config::ShaderLdsWaitcntBarrierEnabled();
 
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms      = [&compile_begin]() {

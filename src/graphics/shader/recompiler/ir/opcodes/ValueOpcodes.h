@@ -68,6 +68,11 @@ static_assert(std::is_trivially_copyable_v<ExportFlags>);
 [[nodiscard]] Type              TypeOf(ValueOpcode opcode);
 [[nodiscard]] Type              ArgTypeOf(ValueOpcode opcode, size_t index);
 [[nodiscard]] size_t            NumArgsOf(ValueOpcode opcode);
+// --shader-lds-waitcnt-barrier: while it is off, S_WAITCNT has no side effect and dead code
+// elimination drops it exactly as before, so the single-store recognizers keep matching. The
+// recompiler sets this from the configuration before translating a program.
+inline bool g_waitcnt_has_side_effects = false;
+
 [[nodiscard]] bool              HasSideEffects(ValueOpcode opcode);
 [[nodiscard]] BufferAccess      BufferAccessOf(ValueOpcode opcode);
 [[nodiscard]] uint32_t          BufferComponentCount(ValueOpcode opcode);

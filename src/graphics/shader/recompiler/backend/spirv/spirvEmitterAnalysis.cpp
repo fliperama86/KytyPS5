@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -242,8 +243,45 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 		state.builder.AddFunction({OpLoad, image_type, descriptor, pointer});
 		return descriptor;
 	};
+	// --shader-storage-bounds-check (default true): a guest storage write outside the view
+	// extent is well defined on the console but undefined here, and on some drivers it faults.
+	const auto WriteAt = [&](uint32_t index) {
+		const auto descriptor = LoadAt(index);
+		if (!Config::ShaderStorageImageBoundsCheckEnabled()) {
+			state.builder.AddFunction({OpImageWrite, descriptor, coord, texel});
+			return;
+		}
+		state.builder.RequireCapability(CapabilityImageQuery);
+		const auto size = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpImageQuerySize, ImageViewSizeType(state, image.dimension), size, descriptor});
+		const auto components = ImageDimensionInfoFor(image.dimension).coordinate_components;
+		uint32_t in_bounds = 0;
+		for (uint32_t component = 0; component < components; component++) {
+			auto position = coord;
+			auto extent = size;
+			if (components > 1) {
+				position = state.builder.AllocateId();
+				extent = state.builder.AllocateId();
+				state.builder.AddFunction({OpCompositeExtract, TypeU32(state), position, coord, component});
+				state.builder.AddFunction({OpCompositeExtract, TypeU32(state), extent, size, component});
+			}
+			const auto inside = state.builder.AllocateId();
+			state.builder.AddFunction({OpULessThan, TypeBool(state), inside, position, extent});
+			if (component == 0) {
+				in_bounds = inside;
+			} else {
+				const auto combined = state.builder.AllocateId();
+				state.builder.AddFunction({OpLogicalAnd, TypeBool(state), combined, in_bounds, inside});
+				in_bounds = combined;
+			}
+		}
+		EmitIfCondition(state, in_bounds, [&] {
+			state.builder.AddFunction({OpImageWrite, descriptor, coord, texel});
+		});
+	};
 	if (image.mip_mode != IR::ImageMipMode::DynamicStorage) {
-		state.builder.AddFunction({OpImageWrite, LoadAt(array_index), coord, texel});
+		WriteAt(array_index);
 		return;
 	}
 	if (image.mip_count == 0u) {
@@ -263,7 +301,7 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 	state.builder.AddFunction(words);
 	for (uint32_t mip = 0; mip < image.mip_count; mip++) {
 		EmitLabel(state, labels[mip]);
-		state.builder.AddFunction({OpImageWrite, LoadAt(array_index + mip), coord, texel});
+		WriteAt(array_index + mip);
 		state.builder.AddFunction({OpBranch, merge_label});
 	}
 	EmitLabel(state, merge_label);

@@ -92,6 +92,9 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::MeshAllocate:
 		case ValueOpcode::Barrier: return true;
+		// Only --shader-lds-waitcnt-barrier turns S_WAITCNT into an emitted barrier; see
+		// g_waitcnt_has_side_effects.
+		case ValueOpcode::Waitcnt: return g_waitcnt_has_side_effects;
 		default: return false;
 	}
 }

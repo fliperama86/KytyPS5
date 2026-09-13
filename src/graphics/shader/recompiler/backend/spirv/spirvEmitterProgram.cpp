@@ -686,7 +686,7 @@ void EmitProgram(EmitterState& state) {
 	EmitLabel(state, state.entry_label);
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
-		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsDwordCount(state)),
+		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsStorageDwordCount(state)),
 		     state.lds_variable, StorageClassFunction});
 	}
 	if (state.requirements.function_scratch) {

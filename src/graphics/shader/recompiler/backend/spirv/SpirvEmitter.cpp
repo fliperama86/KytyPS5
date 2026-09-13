@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/FunctionLdsLayout.h"
 
 #include <algorithm>
 #include <array>
@@ -319,6 +320,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
 	state.stage = program.stage;
+	const auto function_lds  = IR::PlanFunctionLdsLayout(program);
+	state.function_lds_slots = function_lds.slots;
+	state.compact_lds_dwords = function_lds.dwords;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u

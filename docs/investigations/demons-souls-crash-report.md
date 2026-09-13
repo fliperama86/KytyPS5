@@ -4,6 +4,8 @@
 
 Local draft, 2026-09-10. Not posted externally.
 
+Resolved on 2026-09-13: see [the tutorial-load bisect](tutorial-gpu-crash-2026-09-13.md).
+
 ## Reproduction and baseline
 
 PPSA01342, version 01.005.000, on Windows build 26200, RTX 5090 (driver 616.64), Ryzen 9 9950X3D, 64 GB RAM. User advances through character creation and cinematics; the emulator fails before gameplay.

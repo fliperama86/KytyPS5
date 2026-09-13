@@ -18,6 +18,7 @@ The source for the Demon's Souls documentation lives in this repository. Add new
 
 These dated notes preserve the evidence and intermediate conclusions from earlier debugging. They include local artifact paths and historical process state; use the current guidance above for the latest status.
 
+- [Tutorial-load GPU crash, bisected against PR 599](investigations/tutorial-gpu-crash-2026-09-13.md)
 - [GPU-descriptor stage 1 crash](investigations/gpu-descriptors-stage1-crash-2026-09-11.md)
 - [Whole-process CPU profile](investigations/cpu-profile-2026-09-10.md)
 - [CPU fault investigation](investigations/cpu-fault-investigation.md)

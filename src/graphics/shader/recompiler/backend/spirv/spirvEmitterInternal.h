@@ -396,6 +396,10 @@ struct EmitterState {
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	// Compact invocation-private LDS for pixel shaders: slot per distinct dword offset.
+	uint32_t                                         compact_lds_dwords      = 0;
+	std::unordered_map<const IR::Inst*, uint32_t>      function_lds_slots;
+	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
@@ -675,6 +679,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
+uint32_t LdsStorageDwordCount(const EmitterState& state);
 
 struct MemoryResourceAccess {
 	IR::ResourceKind kind             = IR::ResourceKind::None;

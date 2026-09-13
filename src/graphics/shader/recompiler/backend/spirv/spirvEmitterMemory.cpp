@@ -285,8 +285,13 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 }
 
 uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	return Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), ByteAddress(ctx, inst, mem),
-	              ConstantU32(ctx.state, 2));
+	const auto index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state),
+	                          ByteAddress(ctx, inst, mem), ConstantU32(ctx.state, 2));
+	if (const auto slot = ctx.state.function_lds_slots.find(&inst);
+	    slot != ctx.state.function_lds_slots.end()) {
+		ctx.state.function_lds_index_slots.emplace(index, slot->second);
+	}
+	return index;
 }
 
 struct PreparedMemoryElement {

@@ -1,3 +1,4 @@
+#include "common/profiler.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
@@ -186,17 +187,20 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	KYTY_PROFILER_FUNCTION();
 	Submit(submit);
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
+	KYTY_PROFILER_FUNCTION();
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -207,6 +211,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();

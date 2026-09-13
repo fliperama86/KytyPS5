@@ -153,8 +153,11 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		}
 		download.Commit();
 		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.Finish();
-		m_scheduler.WaitPriorityOperations(completion_tick);
+		{
+			KYTY_PROFILER_BLOCK("BufferCache::DownloadDrain");
+			m_scheduler.Finish();
+			m_scheduler.WaitPriorityOperations(completion_tick);
+		}
 		cursor = 0;
 		for (const auto& copy: batch) {
 			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
@@ -297,6 +300,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_PROFILER_FUNCTION();
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}

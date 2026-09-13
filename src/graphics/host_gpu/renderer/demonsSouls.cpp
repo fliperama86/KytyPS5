@@ -19,8 +19,7 @@ bool IsSupportedGame() {
 		const bool  active = Loader::SystemContentParamSfoGetString("TITLE_ID", &title) &&
 		                    Loader::SystemContentParamSfoGetString("APP_VER", &version) &&
 		                    IsSupportedVersion(title, version);
-		LOGF("Demon's Souls profile: %s for %s %s
-", active ? "active" : "inactive",
+		LOGF("Demon's Souls profile: %s for %s %s\n", active ? "active" : "inactive",
 		     title.c_str(), version.c_str());
 		return active;
 	}();

@@ -33,8 +33,7 @@ void Install(Program* program) {
 	// This entry follows the guest's argument/stack checks and has one saved RBP.
 	// Changed module versions, relocations, or platform loader patches fail closed.
 	if (XXH3_64bits(bytes, verify_size) != 0xe654325b8be848a9ull) {
-		LOGF("Demon's Souls copy: libc memmove hash differs; retaining guest code
-");
+		LOGF("Demon's Souls copy: libc memmove hash differs; retaining guest code\n");
 		return;
 	}
 	std::memcpy(original.data(), bytes, original.size());

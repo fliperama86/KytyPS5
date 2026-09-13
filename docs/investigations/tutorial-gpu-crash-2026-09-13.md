@@ -88,3 +88,10 @@ indirect-argument syncs, 14 ms a frame together, have no counterpart in its capt
 also recorded about 40% fewer draw packets from the guest in the same scene; whether that is scene
 phase, its LOD-feedback report changing what the game submits, or its compute-boundary grouping is
 not established. Captures and CSVs: `_Build/compare-20260913/`.
+
+## The new line, measured the same way
+
+`des-on-599` at `0007a09` (PR 599 plus the fork's workaround, fault diagnostics, thread affinity,
+running cache persistence and the two gated shader flags), same script, same session: **18.49 fps**,
+12.8 CPU core equivalents, 24.2% GPU. The touch probes installed (serialization mode, 9 probes) and
+the derived CCD affinity pinned 34 threads, so the carried pieces are active at the PR's speed.

@@ -44,7 +44,8 @@ native SRT compile made each evaluation cheap, it did not change what the CPU re
   the whole capture; nothing to gain here.
 - **#562 MehmetCambaz**: finds CPU-dirty uploads from hint bits. Upload side, not the drain.
 - **#500 TarkusR, #477 LordixDemon**: shader accuracy and boot fixes for Demon's Souls, not
-  performance. #500 is a lead for the face-colour artifact, separately.
+  performance. #500's content is already in PR 599's base merge `f69e86d`, see
+  [the TarkusR port note](tarkusr-port-2026-09-13.md); it is not a lead for the face-colour artifact.
 
 ## Decision
 
